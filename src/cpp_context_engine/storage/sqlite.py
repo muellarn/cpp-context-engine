@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from cpp_context_engine.models import (
     CodeSymbol,
+    GraphDirection,
     GraphEdge,
     GraphRelation,
     OccurrenceKind,
@@ -815,40 +816,71 @@ class SQLiteStore:
         *,
         relations: frozenset[GraphRelation] | None = None,
         depth: int = 1,
+        direction: GraphDirection = GraphDirection.BOTH,
+        max_edges: int | None = None,
+        per_node_limit: int | None = None,
         project_root: Path | None = None,
     ) -> Sequence[GraphEdge]:
         if depth < 1:
             raise ValueError("graph depth must be at least one")
+        if max_edges is not None and max_edges < 1:
+            raise ValueError("graph edge limit must be at least one")
+        if per_node_limit is not None and per_node_limit < 1:
+            raise ValueError("per-node graph limit must be at least one")
         project_id = self._project_id(project_root)
         frontier = deque([(symbol_id, 0)])
         visited_symbols = {symbol_id}
         found: dict[tuple[str, str, GraphRelation], GraphEdge] = {}
         while frontier:
+            if max_edges is not None and len(found) >= max_edges:
+                break
             current, level = frontier.popleft()
             if level >= depth:
                 continue
-            parameters: list[object] = [project_id, current, current]
+            if direction == GraphDirection.OUTGOING:
+                endpoint_sql = "source_id = ?"
+                parameters: list[object] = [project_id, current]
+            elif direction == GraphDirection.INCOMING:
+                endpoint_sql = "target_id = ?"
+                parameters = [project_id, current]
+            else:
+                endpoint_sql = "(source_id = ? OR target_id = ?)"
+                parameters = [project_id, current, current]
             relation_sql = ""
             if relations:
                 placeholders = ",".join("?" for _ in relations)
                 relation_sql = f" AND relation IN ({placeholders})"
                 parameters.extend(relation.value for relation in sorted(relations, key=str))
+            limit_sql = ""
+            if per_node_limit is not None:
+                limit_sql = " LIMIT ?"
+                parameters.append(per_node_limit)
             rows = self._connection.execute(
-                """
-                SELECT DISTINCT source_id, target_id, relation FROM edges
-                WHERE project_id = ? AND (source_id = ? OR target_id = ?)
-                """
-                + relation_sql,
+                (
+                    "SELECT DISTINCT source_id, target_id, relation FROM edges "
+                    f"WHERE project_id = ? AND {endpoint_sql}"
+                    + relation_sql
+                    + " ORDER BY relation, source_id, target_id"
+                    + limit_sql
+                ),
                 parameters,
             )
             for row in rows:
                 relation = GraphRelation(row["relation"])
                 key = (row["source_id"], row["target_id"], relation)
                 found[key] = GraphEdge(*key)
-                for adjacent in (row["source_id"], row["target_id"]):
-                    if adjacent not in visited_symbols:
-                        visited_symbols.add(adjacent)
-                        frontier.append((adjacent, level + 1))
+                if max_edges is not None and len(found) >= max_edges:
+                    break
+                adjacent = (
+                    row["target_id"]
+                    if direction == GraphDirection.OUTGOING
+                    else row["source_id"]
+                    if direction == GraphDirection.INCOMING
+                    else (row["target_id"] if row["source_id"] == current else row["source_id"])
+                )
+                if adjacent not in visited_symbols:
+                    visited_symbols.add(adjacent)
+                    frontier.append((adjacent, level + 1))
         return tuple(found.values())
 
     def put_embedding(

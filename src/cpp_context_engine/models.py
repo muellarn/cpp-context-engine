@@ -34,6 +34,14 @@ class GraphRelation(StrEnum):
     INCLUDES = "includes"
 
 
+class GraphDirection(StrEnum):
+    """Traversal direction relative to the symbol at each graph hop."""
+
+    OUTGOING = "outgoing"
+    INCOMING = "incoming"
+    BOTH = "both"
+
+
 class OccurrenceKind(StrEnum):
     DECLARATION = "declaration"
     DEFINITION = "definition"

@@ -3,6 +3,7 @@
 from cpp_context_engine.models import (
     BuildConfiguration,
     CodeSymbol,
+    GraphDirection,
     GraphEdge,
     GraphRelation,
     OccurrenceKind,
@@ -17,6 +18,7 @@ from cpp_context_engine.models import (
 __all__ = [
     "BuildConfiguration",
     "CodeSymbol",
+    "GraphDirection",
     "GraphEdge",
     "GraphRelation",
     "OccurrenceKind",

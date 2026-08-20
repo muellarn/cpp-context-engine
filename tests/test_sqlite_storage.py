@@ -9,6 +9,7 @@ from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
     CodeSymbol,
+    GraphDirection,
     GraphEdge,
     GraphRelation,
     OccurrenceKind,
@@ -89,6 +90,72 @@ def test_schema_round_trip_fts_graph_and_occurrences(tmp_path: Path) -> None:
         assert store.neighbors("file-a") == (
             GraphEdge("file-a", symbol.id, GraphRelation.CONTAINS),
         )
+
+
+def test_graph_traversal_enforces_direction_depth_and_limits(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    source = root / "source.cpp"
+    beta = CodeSymbol(
+        id="symbol-beta",
+        qualified_name="beta",
+        kind=SymbolKind.FUNCTION,
+        span=SourceSpan(source, 1, 1),
+        signature="int beta()",
+    )
+    gamma = CodeSymbol(
+        id="symbol-gamma",
+        qualified_name="gamma",
+        kind=SymbolKind.FUNCTION,
+        span=SourceSpan(source, 1, 1),
+        signature="int gamma()",
+    )
+
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.put_symbols((beta, gamma))
+        store.put_edges(
+            (
+                GraphEdge("symbol-alpha", beta.id, GraphRelation.CALLS, "unit-a"),
+                GraphEdge(beta.id, gamma.id, GraphRelation.CALLS, "unit-a"),
+                GraphEdge(gamma.id, "symbol-alpha", GraphRelation.REFERENCES, "unit-a"),
+            )
+        )
+
+        assert store.neighbors(
+            beta.id,
+            relations=frozenset({GraphRelation.CALLS}),
+            direction=GraphDirection.INCOMING,
+        ) == (GraphEdge("symbol-alpha", beta.id, GraphRelation.CALLS),)
+        assert store.neighbors(
+            beta.id,
+            relations=frozenset({GraphRelation.CALLS}),
+            direction=GraphDirection.OUTGOING,
+        ) == (GraphEdge(beta.id, gamma.id, GraphRelation.CALLS),)
+        assert store.neighbors(
+            "symbol-alpha",
+            relations=frozenset({GraphRelation.CALLS}),
+            direction=GraphDirection.OUTGOING,
+            depth=2,
+        ) == (
+            GraphEdge("symbol-alpha", beta.id, GraphRelation.CALLS),
+            GraphEdge(beta.id, gamma.id, GraphRelation.CALLS),
+        )
+        assert (
+            len(
+                store.neighbors(
+                    beta.id,
+                    direction=GraphDirection.BOTH,
+                    max_edges=1,
+                    per_node_limit=1,
+                )
+            )
+            == 1
+        )
+
+        with pytest.raises(ValueError, match="edge limit"):
+            store.neighbors(beta.id, max_edges=0)
 
 
 def test_symbol_search_weights_names_above_signature_only_matches(tmp_path: Path) -> None:
