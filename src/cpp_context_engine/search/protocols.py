@@ -14,6 +14,12 @@ class LexicalSearch(Protocol):
         ...
 
 
+class SymbolSearch(Protocol):
+    def search(self, query: SearchQuery) -> Sequence[SearchHit]:
+        """Search qualified names and compiler-resolved symbols."""
+        ...
+
+
 class VectorSearch(Protocol):
     def search(self, query: SearchQuery) -> Sequence[SearchHit]:
         """Search semantically similar symbols or source regions."""

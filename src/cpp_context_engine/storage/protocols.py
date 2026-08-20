@@ -16,3 +16,9 @@ class SymbolStore(Protocol):
     def get_symbol(self, symbol_id: str) -> CodeSymbol | None:
         """Return one normalized symbol by stable identifier."""
         ...
+
+
+class SourceReader(Protocol):
+    def read_symbol(self, symbol: CodeSymbol) -> str:
+        """Read the source lines covered by a normalized symbol."""
+        ...
