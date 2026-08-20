@@ -237,6 +237,46 @@ def test_mcp_rejects_indexed_source_outside_project_without_leaking_path(tmp_pat
     anyio.run(scenario)
 
 
+def test_mcp_callers_reports_when_per_node_fanout_truncates_results(tmp_path: Path) -> None:
+    from cpp_context_engine.mcp.server import create_mcp_server
+
+    project = tmp_path / "project"
+    project.mkdir()
+    config = _config(project, tmp_path / "index.db")
+    _seed_index(config)
+    assert config.database_path is not None
+    with SQLiteStore(config.database_path, project_root=project) as store:
+        template = store.get_symbol("cxx:caller")
+        assert template is not None
+        callers = tuple(
+            replace(
+                template,
+                id=f"cxx:caller-{index}",
+                qualified_name=f"caller_{index}",
+                source_hash=f"caller-{index}",
+            )
+            for index in range(21)
+        )
+        store.put_symbols(callers)
+        store.put_edges(
+            tuple(
+                GraphEdge(symbol.id, "cxx:callee", GraphRelation.CALLS, "unit")
+                for symbol in callers
+            )
+        )
+
+    async def scenario() -> None:
+        async with Client(create_mcp_server(config), mode="legacy") as client:
+            result = await client.call_tool(
+                "callers", {"symbol_id": "cxx:callee", "max_results": 20}
+            )
+            assert not result.is_error
+            assert len(result.structured_content["edges"]) == 20
+            assert result.structured_content["truncated"] is True
+
+    anyio.run(scenario)
+
+
 def test_mcp_ask_uses_bounded_sources_and_marks_external_provider(
     tmp_path: Path, monkeypatch
 ) -> None:

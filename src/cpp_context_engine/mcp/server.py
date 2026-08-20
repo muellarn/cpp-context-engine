@@ -466,6 +466,20 @@ async def _graph_tool(
                 project_root=state.config.project_root,
             )
         )
+        truncated = len(edges) > max_results
+        if not truncated and len(edges) >= per_node_fanout:
+            # The primary query cannot reveal when its per-node SQL limit hid one more edge.
+            probe = runtime.store.neighbors(
+                symbol_id,
+                relations=frozenset(relations) if relations else None,
+                depth=depth,
+                direction=direction,
+                max_edges=max_results + 1,
+                per_node_limit=per_node_fanout + 1,
+                project_root=state.config.project_root,
+            )
+            known_edges = set(edges)
+            truncated = any(edge not in known_edges for edge in probe)
         rendered: list[GraphEdgeResult] = []
         for edge in edges[:max_results]:
             source = runtime.store.get_symbol(edge.source_id, state.config.project_root)
@@ -484,7 +498,7 @@ async def _graph_tool(
             direction=direction,
             depth=depth,
             edges=rendered,
-            truncated=len(edges) > max_results,
+            truncated=truncated,
         )
 
     return await _call_tool(
