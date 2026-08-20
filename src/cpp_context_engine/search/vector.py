@@ -1,0 +1,74 @@
+"""A provider-neutral embedding adapter over the SQLite vector repository."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Protocol
+
+from cpp_context_engine.models import SearchHit, SearchQuery
+from cpp_context_engine.storage.sqlite import SQLiteStore
+
+
+class EmbeddingProvider(Protocol):
+    """Minimal interface implemented by local or hosted embedding models."""
+
+    @property
+    def model_id(self) -> str: ...
+
+    def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]: ...
+
+
+class SQLiteVectorSearch:
+    def __init__(
+        self,
+        store: SQLiteStore,
+        provider: EmbeddingProvider,
+        *,
+        project_root: Path | None = None,
+    ) -> None:
+        self._store = store
+        self._provider = provider
+        self._project_root = project_root
+
+    def index(self, symbol_ids: Sequence[str]) -> None:
+        symbols = [
+            self._store.get_symbol(symbol_id, self._project_root) for symbol_id in symbol_ids
+        ]
+        present = [symbol for symbol in symbols if symbol is not None]
+        if not present:
+            return
+        texts = [
+            "\n".join(
+                part
+                for part in (
+                    symbol.qualified_name,
+                    symbol.signature,
+                    symbol.documentation,
+                    symbol.source_text,
+                )
+                if part
+            )
+            for symbol in present
+        ]
+        vectors = self._provider.embed(texts)
+        if len(vectors) != len(present):
+            raise ValueError("embedding provider returned a different number of vectors than texts")
+        for symbol, vector in zip(present, vectors, strict=True):
+            self._store.put_embedding(
+                symbol.id,
+                self._provider.model_id,
+                vector,
+                self._project_root,
+            )
+
+    def search(self, query: SearchQuery) -> Sequence[SearchHit]:
+        vectors = self._provider.embed([query.text])
+        if len(vectors) != 1:
+            raise ValueError("embedding provider must return exactly one vector for one query")
+        return self._store.search_vector(
+            vectors[0],
+            model=self._provider.model_id,
+            limit=query.limit,
+            project_root=self._project_root,
+        )

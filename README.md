@@ -5,22 +5,23 @@ codebases. It is intended to combine exact symbols and code relationships with
 lexical and vector search so that an LLM can load a small, connected set of
 relevant source locations instead of the entire repository.
 
-The current repository deliberately contains only the stable architecture and a
-diagnostic CLI. Concrete Clang/SCIP ingestion, persistence, search indexes,
-retrieval ranking, LLM integrations, and an HTTP transport can be implemented
-independently behind typed protocols.
+The repository provides Clang-based C++ ingestion, transactional SQLite storage,
+FTS5 lexical search, and a provider-neutral local cosine-vector index. Retrieval
+ranking, LLM integrations, and HTTP transports remain independent behind typed
+protocols.
 
 ## Requirements
 
 - Python 3.11 or newer
-- A C++ compilation database (`compile_commands.json`) for future ingestion
+- A C++ compilation database (`compile_commands.json`)
+- libclang 18 and the optional `clang` Python extra for compiler-aware ingestion
 
 ## Development setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,clang]'
 cpp-context --help
 cpp-context doctor
 ```
@@ -43,9 +44,9 @@ pytest
 
 The package is split along the intended processing pipeline:
 
-- `ingestion`: C++/compiler index adapters producing normalized symbols
-- `storage`: durable symbol, source, and metadata persistence
-- `search`: lexical and vector candidate generation
+- `ingestion`: validated compilation databases, libclang analysis, and incremental indexing
+- `storage`: SQLite symbols, occurrences, graph edges, dependency state, FTS5, and vectors
+- `search`: lexical and provider-neutral vector candidate generation
 - `graph`: code relationship storage and traversal
 - `retrieval`: candidate fusion, graph expansion, and context packing
 - `llm`: model-provider adapters
@@ -56,10 +57,5 @@ environment-driven settings live in `config.py`. The modules currently expose
 Python `Protocol` interfaces, keeping implementations replaceable and tests easy
 to isolate.
 
-## Planned first vertical slice
-
-1. Read a compilation database and ingest symbols through a Clang/SCIP adapter.
-2. Persist symbols and relationships in SQLite with FTS5 lexical search.
-3. Add a local embedding index as a separate `VectorSearch` implementation.
-4. Fuse candidates, expand call/type relationships, and pack bounded context.
-5. Expose retrieval through the API service and an LLM tool interface.
+See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,
+incremental behavior, libclang configuration, and current guarantees.

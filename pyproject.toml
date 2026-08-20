@@ -18,6 +18,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+clang = [
+  "clang>=18,<19",
+]
 dev = [
   "pytest>=8,<9",
   "ruff>=0.6,<1",
@@ -35,6 +38,9 @@ cpp_context_engine = ["py.typed"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+  "clang: requires the optional clang bindings and a compatible libclang",
+]
 
 [tool.ruff]
 line-length = 100

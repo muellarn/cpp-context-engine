@@ -6,12 +6,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from cpp_context_engine.models import CodeSymbol, GraphEdge
+from cpp_context_engine.models import (
+    BuildConfiguration,
+    CodeSymbol,
+    GraphEdge,
+    SymbolOccurrence,
+    TranslationUnit,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class IngestionBatch:
+    build_configurations: tuple[BuildConfiguration, ...]
+    translation_units: tuple[TranslationUnit, ...]
     symbols: tuple[CodeSymbol, ...]
+    occurrences: tuple[SymbolOccurrence, ...]
     edges: tuple[GraphEdge, ...]
 
 

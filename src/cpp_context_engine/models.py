@@ -11,6 +11,7 @@ from typing import Any
 
 
 class SymbolKind(StrEnum):
+    FILE = "file"
     FUNCTION = "function"
     METHOD = "method"
     CLASS = "class"
@@ -33,6 +34,15 @@ class GraphRelation(StrEnum):
     INCLUDES = "includes"
 
 
+class OccurrenceKind(StrEnum):
+    DECLARATION = "declaration"
+    DEFINITION = "definition"
+    REFERENCE = "reference"
+    CALL = "call"
+    TYPE = "type"
+    MACRO_EXPANSION = "macro_expansion"
+
+
 @dataclass(frozen=True, slots=True)
 class SourceSpan:
     path: Path
@@ -49,6 +59,30 @@ class SourceSpan:
 
 
 @dataclass(frozen=True, slots=True)
+class BuildConfiguration:
+    """One normalized entry from a JSON compilation database."""
+
+    id: str
+    source_path: Path
+    directory: Path
+    arguments: tuple[str, ...]
+    command_hash: str
+    output: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationUnit:
+    """The durable fingerprint and diagnostics for one compiler invocation."""
+
+    id: str
+    build_configuration_id: str
+    source_path: Path
+    content_hash: str
+    dependencies: tuple[tuple[Path, str], ...] = ()
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class CodeSymbol:
     id: str
     qualified_name: str
@@ -57,6 +91,9 @@ class CodeSymbol:
     signature: str = ""
     documentation: str = ""
     source_hash: str = ""
+    source_text: str = ""
+    build_configuration_id: str = ""
+    translation_unit_id: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -72,6 +109,23 @@ class GraphEdge:
     source_id: str
     target_id: str
     relation: GraphRelation
+    translation_unit_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolOccurrence:
+    id: str
+    symbol_id: str
+    span: SourceSpan
+    kind: OccurrenceKind
+    enclosing_symbol_id: str | None = None
+    translation_unit_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.id.strip():
+            raise ValueError("occurrence id must not be empty")
+        if not self.symbol_id.strip():
+            raise ValueError("occurrence symbol id must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
