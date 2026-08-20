@@ -26,10 +26,14 @@ class SQLiteVectorSearch:
         provider: EmbeddingProvider,
         *,
         project_root: Path | None = None,
+        max_text_chars: int = 32_000,
     ) -> None:
         self._store = store
         self._provider = provider
         self._project_root = project_root
+        if max_text_chars <= 0:
+            raise ValueError("max embedding text size must be positive")
+        self._max_text_chars = max_text_chars
 
     def index(self, symbol_ids: Sequence[str]) -> None:
         symbols = [
@@ -48,7 +52,7 @@ class SQLiteVectorSearch:
                     symbol.source_text,
                 )
                 if part
-            )
+            )[: self._max_text_chars]
             for symbol in present
         ]
         vectors = self._provider.embed(texts)

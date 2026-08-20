@@ -25,6 +25,11 @@ api = [
   "fastapi>=0.110,<1",
   "uvicorn>=0.30,<1",
 ]
+all = [
+  "clang>=18,<19",
+  "fastapi>=0.110,<1",
+  "uvicorn>=0.30,<1",
+]
 dev = [
   "fastapi>=0.110,<1",
   "httpx>=0.27,<1",

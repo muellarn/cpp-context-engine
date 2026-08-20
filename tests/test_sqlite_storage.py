@@ -84,6 +84,7 @@ def test_schema_round_trip_fts_graph_and_occurrences(tmp_path: Path) -> None:
         assert symbol.source_text == "int alpha() { return 7; }"
         assert store.search(SearchQuery("important answer"))[0].symbol.id == symbol.id
         assert store.search(SearchQuery("alpha return"))[0].symbol.id == symbol.id
+        assert store.search_symbols(SearchQuery("alpha"))[0].symbol.id == symbol.id
         assert store.occurrences(symbol.id)[0].kind == OccurrenceKind.DEFINITION
         assert store.neighbors("file-a") == (
             GraphEdge("file-a", symbol.id, GraphRelation.CONTAINS),
@@ -99,6 +100,9 @@ def test_cosine_search_is_mathematically_ordered_and_validated(tmp_path: Path) -
         store.apply_ingestion(root, batch)
         store.put_embedding("symbol-alpha", "fixture", [1.0, 1.0])
         store.put_embedding("file-a", "fixture", [-1.0, 0.0])
+
+        assert store.missing_embedding_symbol_ids("fixture") == ()
+        assert store.embedding_count("fixture") == 2
 
         hits = store.search_vector([2.0, 2.0], model="fixture")
 
@@ -126,6 +130,22 @@ def test_changed_source_invalidates_its_stored_embedding(tmp_path: Path) -> None
         store.apply_ingestion(root, changed_batch)
 
         assert store.search_vector([1.0, 0.0], model="fixture") == ()
+
+
+def test_changed_embedding_input_invalidates_vector_even_when_source_hash_is_same(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.put_embedding("symbol-alpha", "fixture", [1.0, 0.0])
+        documented = replace(batch.symbols[1], documentation="New semantic description")
+        store.apply_ingestion(root, replace(batch, symbols=(batch.symbols[0], documented)))
+
+        assert "symbol-alpha" in store.missing_embedding_symbol_ids("fixture")
 
 
 def test_stale_unit_removal_cascades_symbols_and_search_rows(tmp_path: Path) -> None:

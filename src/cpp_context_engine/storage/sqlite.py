@@ -11,8 +11,8 @@ from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     CodeSymbol,
     GraphEdge,
@@ -25,7 +25,10 @@ from cpp_context_engine.models import (
     SymbolOccurrence,
 )
 
-SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from cpp_context_engine.ingestion.protocols import IngestionBatch
+
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +47,9 @@ class SQLiteStore:
         self.path = path
         self.project_root = project_root.resolve(strict=False) if project_root else None
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(path)
+        # FastAPI executes synchronous handlers in worker threads; SQLite's serialized
+        # mode safely supports this read-heavy connection when the thread guard is off.
+        self._connection = sqlite3.connect(path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
@@ -214,7 +219,13 @@ class SQLiteStore:
                     CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
                         DELETE FROM embeddings
                         WHERE project_id = old.project_id AND symbol_id = old.id
-                          AND old.source_hash <> new.source_hash;
+                          AND (
+                            old.source_hash <> new.source_hash OR
+                            old.qualified_name <> new.qualified_name OR
+                            old.signature <> new.signature OR
+                            old.documentation <> new.documentation OR
+                            old.source_text <> new.source_text
+                          );
                         DELETE FROM symbol_fts
                         WHERE project_id = old.project_id AND symbol_id = old.id;
                         INSERT INTO symbol_fts(
@@ -229,7 +240,35 @@ class SQLiteStore:
                     CREATE INDEX edges_source ON edges(project_id, source_id, relation);
                     CREATE INDEX edges_target ON edges(project_id, target_id, relation);
                     CREATE INDEX occurrences_symbol ON occurrences(project_id, symbol_id);
-                    PRAGMA user_version = 1;
+                    PRAGMA user_version = 2;
+                    """
+                )
+        elif current == 1:
+            with self._connection:
+                self._connection.executescript(
+                    """
+                    DROP TRIGGER symbols_au;
+                    CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                        DELETE FROM embeddings
+                        WHERE project_id = old.project_id AND symbol_id = old.id
+                          AND (
+                            old.source_hash <> new.source_hash OR
+                            old.qualified_name <> new.qualified_name OR
+                            old.signature <> new.signature OR
+                            old.documentation <> new.documentation OR
+                            old.source_text <> new.source_text
+                          );
+                        DELETE FROM symbol_fts
+                        WHERE project_id = old.project_id AND symbol_id = old.id;
+                        INSERT INTO symbol_fts(
+                            project_id, symbol_id, qualified_name, signature,
+                            documentation, source_text
+                        ) VALUES (
+                            new.project_id, new.id, new.qualified_name, new.signature,
+                            new.documentation, new.source_text
+                        );
+                    END;
+                    PRAGMA user_version = 2;
                     """
                 )
 
@@ -363,6 +402,13 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"project is not indexed: {root}")
         return row[0]
+
+    def has_project(self, project_root: Path | None = None) -> bool:
+        try:
+            self._project_id(project_root)
+        except (KeyError, ValueError):
+            return False
+        return True
 
     def _delete_translation_units(self, project_id: int, unit_ids: Iterable[str]) -> None:
         self._connection.executemany(
@@ -718,6 +764,44 @@ class SQLiteStore:
             for row in rows
         )
 
+    def search_symbols(
+        self, query: SearchQuery, project_root: Path | None = None
+    ) -> Sequence[SearchHit]:
+        """Search only compiler-resolved names and signatures through FTS5."""
+
+        project_id = self._project_id(project_root)
+        terms = re.findall(r"[\w:]+", query.text, flags=re.UNICODE)
+        if not terms:
+            return ()
+        escaped = [f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms]
+        expression = (
+            f"qualified_name : ({' OR '.join(escaped)}) OR signature : ({' OR '.join(escaped)})"
+        )
+        rows = self._connection.execute(
+            """
+            SELECT symbols.*, bm25(symbol_fts, 12.0, 6.0, 0.0, 0.0) AS rank
+            FROM symbol_fts
+            JOIN symbols
+              ON symbols.project_id = CAST(symbol_fts.project_id AS INTEGER)
+             AND symbols.id = symbol_fts.symbol_id
+            WHERE symbol_fts MATCH ? AND symbols.project_id = ?
+            ORDER BY rank, symbols.qualified_name
+            LIMIT ?
+            """,
+            (expression, project_id, query.limit),
+        ).fetchall()
+        query_text = query.text.casefold().strip()
+        return tuple(
+            SearchHit(
+                symbol=self._row_to_symbol(row),
+                score=-float(row["rank"])
+                + (2.0 if row["qualified_name"].casefold() == query_text else 0.0)
+                + (1.0 if row["qualified_name"].casefold().endswith(f"::{query_text}") else 0.0),
+                source="sqlite-symbol",
+            )
+            for row in rows
+        )
+
     def put_edges(self, edges: Iterable[GraphEdge]) -> None:
         project_id = self._project_id()
         with self._connection:
@@ -804,6 +888,37 @@ class SQLiteStore:
                 """,
                 (project_id, symbol_id, model, len(normalized), magnitude, encoded),
             )
+
+    def missing_embedding_symbol_ids(
+        self, model: str, project_root: Path | None = None
+    ) -> tuple[str, ...]:
+        """Return stable IDs whose current source snapshot has no vector for ``model``."""
+
+        project_id = self._project_id(project_root)
+        return tuple(
+            row[0]
+            for row in self._connection.execute(
+                """
+                SELECT symbols.id FROM symbols
+                LEFT JOIN embeddings
+                  ON embeddings.project_id = symbols.project_id
+                 AND embeddings.symbol_id = symbols.id
+                 AND embeddings.model = ?
+                WHERE symbols.project_id = ? AND embeddings.symbol_id IS NULL
+                ORDER BY symbols.id
+                """,
+                (model, project_id),
+            )
+        )
+
+    def embedding_count(self, model: str, project_root: Path | None = None) -> int:
+        project_id = self._project_id(project_root)
+        return int(
+            self._connection.execute(
+                "SELECT count(*) FROM embeddings WHERE project_id = ? AND model = ?",
+                (project_id, model),
+            ).fetchone()[0]
+        )
 
     def search_vector(
         self,
