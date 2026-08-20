@@ -91,6 +91,36 @@ def test_schema_round_trip_fts_graph_and_occurrences(tmp_path: Path) -> None:
         )
 
 
+def test_symbol_search_weights_names_above_signature_only_matches(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    source = root / "source.cpp"
+    name_match = CodeSymbol(
+        id="name-match",
+        qualified_name="zzz::needle::handler",
+        kind=SymbolKind.FUNCTION,
+        span=SourceSpan(source, 1, 1),
+        signature="void handler()",
+    )
+    signature_match = CodeSymbol(
+        id="signature-match",
+        qualified_name="aaa",
+        kind=SymbolKind.FUNCTION,
+        span=SourceSpan(source, 1, 1),
+        signature="needle",
+    )
+
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.put_symbols((name_match, signature_match))
+
+        hits = store.search_symbols(SearchQuery("needle"))
+
+    assert [hit.symbol.id for hit in hits[:2]] == ["name-match", "signature-match"]
+    assert hits[0].score > hits[1].score
+
+
 def test_cosine_search_is_mathematically_ordered_and_validated(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()

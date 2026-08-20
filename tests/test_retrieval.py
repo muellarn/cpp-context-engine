@@ -12,6 +12,7 @@ from cpp_context_engine.models import (
     SourceSpan,
     SymbolKind,
 )
+from cpp_context_engine.retrieval import ContextPathStep
 from cpp_context_engine.retrieval.hybrid import HybridRetriever, RetrievalConfig
 from cpp_context_engine.storage.source import FilesystemSourceReader, SourceReadError
 
@@ -109,6 +110,25 @@ def test_rrf_deduplicates_and_expands_a_connected_component() -> None:
     assert "selected as a fused search seed" in bundle.items[0].reason
 
 
+def test_inverse_graph_expansion_preserves_the_compiler_edge_direction() -> None:
+    caller = symbol("caller")
+    callee = symbol("callee")
+    retriever = HybridRetriever(
+        lexical_search=SearchStub([callee]),
+        symbol_search=SearchStub([]),
+        vector_search=SearchStub([]),
+        symbol_store=StoreStub([caller, callee]),
+        source_reader=SourceStub(),
+        graph=GraphStub([GraphEdge("caller", "callee", GraphRelation.CALLS)]),
+        config=RetrievalConfig(seed_limit=1, graph_depth=1),
+    )
+
+    bundle = retriever.retrieve("callee", max_tokens=1_000)
+
+    caller_item = next(item for item in bundle.items if item.hit.symbol.id == "caller")
+    assert caller_item.path == (ContextPathStep("caller", "callee", GraphRelation.CALLS),)
+
+
 def test_graph_hub_is_penalized_and_expansion_respects_node_budget() -> None:
     root = symbol("root")
     neighbors = [symbol(f"child-{index}") for index in range(20)]
@@ -136,6 +156,32 @@ def test_graph_hub_is_penalized_and_expansion_respects_node_budget() -> None:
     assert all("hub degree 20" in item.reason for item in graph_items)
     assert all(item.hit.score < bundle.items[0].hit.score for item in graph_items)
     assert "graph expansion stopped at configured budget" in bundle.diagnostics
+
+
+def test_graph_budget_selection_is_independent_of_adapter_edge_order() -> None:
+    root = symbol("root")
+    first = symbol("child-a")
+    second = symbol("child-b")
+    retriever = HybridRetriever(
+        lexical_search=SearchStub([root]),
+        symbol_search=SearchStub([]),
+        vector_search=SearchStub([]),
+        symbol_store=StoreStub([root, first, second]),
+        source_reader=SourceStub(),
+        graph=GraphStub(
+            [
+                GraphEdge("root", second.id, GraphRelation.REFERENCES),
+                GraphEdge("root", first.id, GraphRelation.REFERENCES),
+            ]
+        ),
+        config=RetrievalConfig(seed_limit=1, graph_depth=1, per_node_edge_budget=1),
+    )
+
+    bundle = retriever.retrieve("root", max_tokens=1_000)
+
+    assert [item.hit.symbol.id for item in bundle.items if item.hit.source == "graph"] == [
+        "child-a"
+    ]
 
 
 def test_context_packing_enforces_character_derived_token_budget() -> None:

@@ -61,6 +61,24 @@ def test_openai_embedding_provider_orders_results_and_hides_secret() -> None:
     assert "top-secret" not in repr(provider)
 
 
+def test_openai_embedding_provider_rejects_duplicate_response_indexes() -> None:
+    provider = OpenAICompatibleEmbeddingProvider(
+        "http://localhost:11434/v1",
+        "code-model",
+        _opener=lambda _request, timeout: _Response(
+            {
+                "data": [
+                    {"index": 0, "embedding": [1, 0]},
+                    {"index": 0, "embedding": [0, 1]},
+                ]
+            }
+        ),
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="invalid response"):
+        provider.embed(["one", "two"])
+
+
 def test_openai_embedding_provider_sanitizes_network_failure() -> None:
     def opener(_request: Request, *, timeout: float):
         raise URLError("contains-sensitive-upstream-details")

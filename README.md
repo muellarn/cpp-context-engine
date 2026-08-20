@@ -19,7 +19,7 @@ On Ubuntu, `clang-18` and `libclang-18-dev` provide the native compiler pieces.
 Install the engine with compiler and HTTP support:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[all]'
 ```

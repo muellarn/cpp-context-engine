@@ -109,7 +109,13 @@ class OpenAICompatibleEmbeddingProvider:
         try:
             document = json.loads(raw)
             data = document["data"]
-            indexed = sorted(data, key=lambda item: item.get("index", 0))
+            # Duplicate or missing indexes silently attach vectors to the wrong symbols.
+            indexes = [item["index"] for item in data]
+            if any(type(index) is not int for index in indexes) or sorted(indexes) != list(
+                range(len(texts))
+            ):
+                raise ValueError("invalid embedding indexes")
+            indexed = sorted(data, key=lambda item: item["index"])
             vectors = tuple(tuple(float(value) for value in item["embedding"]) for item in indexed)
         except (AttributeError, JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise EmbeddingProviderError("embedding endpoint returned an invalid response") from exc

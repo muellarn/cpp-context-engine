@@ -742,9 +742,10 @@ class SQLiteStore:
         if not terms:
             return ()
         expression = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+        # FTS5 weights include the two leading UNINDEXED identity columns.
         rows = self._connection.execute(
             """
-            SELECT symbols.*, bm25(symbol_fts, 8.0, 4.0, 2.0, 1.0) AS rank
+            SELECT symbols.*, bm25(symbol_fts, 0.0, 0.0, 8.0, 4.0, 2.0, 1.0) AS rank
             FROM symbol_fts
             JOIN symbols
               ON symbols.project_id = CAST(symbol_fts.project_id AS INTEGER)
@@ -777,9 +778,10 @@ class SQLiteStore:
         expression = (
             f"qualified_name : ({' OR '.join(escaped)}) OR signature : ({' OR '.join(escaped)})"
         )
+        # Keep the leading identity columns at zero so name/signature weights land correctly.
         rows = self._connection.execute(
             """
-            SELECT symbols.*, bm25(symbol_fts, 12.0, 6.0, 0.0, 0.0) AS rank
+            SELECT symbols.*, bm25(symbol_fts, 0.0, 0.0, 12.0, 6.0, 0.0, 0.0) AS rank
             FROM symbol_fts
             JOIN symbols
               ON symbols.project_id = CAST(symbol_fts.project_id AS INTEGER)

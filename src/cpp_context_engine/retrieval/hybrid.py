@@ -213,7 +213,11 @@ class HybridRetriever:
                 )
                 continue
 
-            relevant = [edge for edge in raw_edges if edge.relation in self._config.relations]
+            # Adapter row/insertion order must not decide which neighbors survive a hard budget.
+            relevant = sorted(
+                (edge for edge in raw_edges if edge.relation in self._config.relations),
+                key=lambda edge: (edge.relation.value, edge.source_id, edge.target_id),
+            )
             degree = len(relevant)
             if degree > self._config.per_node_edge_budget:
                 budget_exhausted = True
@@ -239,7 +243,9 @@ class HybridRetriever:
                     continue
                 visited.add(neighbor_id)
                 expanded_nodes += 1
-                step = ContextPathStep(current.symbol.id, neighbor_id, edge.relation)
+                # Neighbor traversal is bidirectional, but provenance must retain the
+                # compiler-derived edge orientation instead of inventing a reverse edge.
+                step = ContextPathStep(edge.source_id, edge.target_id, edge.relation)
                 path = (*current.path, step)
                 graph_score = current.hit.score * self._config.graph_decay
                 candidate = candidates.get(neighbor_id)
