@@ -57,6 +57,19 @@ def _parser() -> argparse.ArgumentParser:
     _add_llm_options(serve)
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
+
+    mcp = commands.add_parser("mcp", help="serve the configured project over MCP")
+    _add_project_options(mcp, positional=False, include_compile_commands=True)
+    _add_embedding_options(mcp)
+    _add_llm_options(mcp)
+    mcp.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http"),
+        default="stdio",
+        help="MCP transport (default: stdio)",
+    )
+    mcp.add_argument("--host", help="HTTP bind address (default: configured localhost)")
+    mcp.add_argument("--port", type=int, help="HTTP port")
     return parser
 
 
@@ -302,6 +315,19 @@ def _run_serve(config: AppConfig) -> int:
     return 0
 
 
+def _run_mcp(config: AppConfig, args: argparse.Namespace) -> int:
+    try:
+        from cpp_context_engine.mcp.server import run_server
+    except ImportError as exc:
+        raise RuntimeError("mcp requires 'pip install cpp-context-engine[mcp]'") from exc
+    return run_server(
+        config,
+        transport=args.transport,
+        host=args.host,
+        port=args.port,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI, rendering expected setup/provider failures without a traceback."""
 
@@ -322,6 +348,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_ask(config, args)
         if args.command == "serve":
             return _run_serve(config)
+        if args.command == "mcp":
+            return _run_mcp(config, args)
     except (KeyError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

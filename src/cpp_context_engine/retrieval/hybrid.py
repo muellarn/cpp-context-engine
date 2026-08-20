@@ -388,10 +388,18 @@ class HybridRetriever:
             truncated=truncated,
         )
 
-    @staticmethod
-    def _render_shell(candidate: _Candidate, reason: str) -> tuple[str, str]:
+    def _render_shell(self, candidate: _Candidate, reason: str) -> tuple[str, str]:
         symbol = candidate.symbol
         span = symbol.span
+        display_path = span.path.as_posix()
+        project_root = getattr(self._source_reader, "project_root", None)
+        if project_root is not None:
+            root = project_root.resolve(strict=False)
+            resolved = (span.path if span.path.is_absolute() else root / span.path).resolve(
+                strict=False
+            )
+            if resolved.is_relative_to(root):
+                display_path = resolved.relative_to(root).as_posix()
         if candidate.path:
             path = " -> ".join(
                 f"{step.source_id} -[{step.relation.value}]-> {step.target_id}"
@@ -402,7 +410,7 @@ class HybridRetriever:
         prefix = (
             f"### {symbol.qualified_name}\n"
             f"Symbol-ID: {symbol.id}\n"
-            f"Location: {span.path}:{span.start_line}-{span.end_line}\n"
+            f"Location: {display_path}:{span.start_line}-{span.end_line}\n"
             f"Selected: {reason}\n"
             f"Path: {path}\n"
             "```cpp\n"

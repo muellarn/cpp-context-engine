@@ -16,7 +16,7 @@ an LLM without loading the whole repository.
 
 Requirements are Python 3.11+, Clang/libclang 18, and a C++ compilation database.
 On Ubuntu, `clang-18` and `libclang-18-dev` provide the native compiler pieces.
-Install the engine with compiler and HTTP support:
+Install the engine with compiler, HTTP, and MCP support:
 
 ```bash
 python3 -m venv .venv
@@ -108,6 +108,81 @@ cpp-context serve --host 127.0.0.1 --port 8000
 The answer route returns HTTP 503 when the server was started without LLM
 configuration; local context search continues to work.
 
+## MCP server
+
+Install the optional official MCP Python SDK v2 integration without the HTTP API:
+
+```bash
+python -m pip install -e '.[clang,mcp]'
+```
+
+The MCP server is permanently bound to paths and providers selected by its operator.
+Tools cannot supply a project root, database, compilation database, or arbitrary file
+path. Configure those values when launching the process, then use stdio (the default):
+
+```bash
+export CPP_CONTEXT_PROJECT_ROOT=/path/to/project
+export CPP_CONTEXT_DATABASE=/path/to/project/.cpp-context/index.db
+export CPP_CONTEXT_COMPILE_COMMANDS=/path/to/project/build/compile_commands.json
+cpp-context-mcp
+```
+
+The equivalent main CLI command accepts non-secret operator options:
+
+```bash
+cpp-context mcp \
+  --project /path/to/project \
+  --db /path/to/project/.cpp-context/index.db \
+  --compile-commands /path/to/project/build/compile_commands.json
+```
+
+The server may start before an index exists. An MCP client can call `index_project`,
+then `search_code`, `read_symbol`, `neighbors`, `callers`, and `callees`. `ask_code`
+is available when an LLM endpoint is configured. Every tool has a Pydantic structured
+output schema. Locations contain exact symbol IDs, project-relative POSIX paths, and
+one-based line ranges. Query length, result count, graph depth/fanout, packed context,
+source size, and answer steps all have hard server-side limits.
+
+For Codex or another stdio-capable MCP client, add a local server using the generic
+command/environment shape below. The exact settings file or UI varies by client:
+
+```json
+{
+  "mcpServers": {
+    "cpp-context": {
+      "command": "/absolute/path/to/cpp-context-mcp",
+      "env": {
+        "CPP_CONTEXT_PROJECT_ROOT": "/path/to/project",
+        "CPP_CONTEXT_DATABASE": "/path/to/project/.cpp-context/index.db",
+        "CPP_CONTEXT_COMPILE_COMMANDS": "/path/to/project/build/compile_commands.json"
+      }
+    }
+  }
+}
+```
+
+Streamable HTTP is optional and binds to localhost by default:
+
+```bash
+cpp-context mcp --transport streamable-http --host 127.0.0.1 --port 8765
+# MCP endpoint: http://127.0.0.1:8765/mcp
+```
+
+The built-in Streamable HTTP mode does not add application authentication. Keep it on
+localhost unless a trusted deployment adds TLS, authentication, authorization, and
+network controls. Binding a non-loopback address emits a warning.
+
+### External data disclosure
+
+Local feature-hash embeddings and all graph/source tools are network-free. If
+`CPP_CONTEXT_EMBEDDING_PROVIDER=openai` is configured, `index_project` sends bounded
+symbol text and `search_code` sends its query to that OpenAI-compatible endpoint. If
+an LLM is configured, `ask_code` sends the question and selected source excerpts to
+that endpoint. Do not enable hosted providers for code that their data-handling terms
+do not permit you to transmit. Provider secrets are read only from the environment;
+there are no secret CLI flags, and sanitized MCP errors omit provider messages and
+absolute host paths.
+
 ## Configuration
 
 CLI path/provider flags override these environment variables. Secrets have no CLI
@@ -131,12 +206,12 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_LLM_MODEL` | chat model | unset |
 | `CPP_CONTEXT_LLM_API_KEY` | chat API secret | unset |
 | `CPP_CONTEXT_PROVIDER_TIMEOUT` | HTTP timeout in seconds | `30` |
-| `CPP_CONTEXT_SERVE_HOST` / `CPP_CONTEXT_SERVE_PORT` | bind address | `127.0.0.1` / `8000` |
+| `CPP_CONTEXT_SERVE_HOST` / `CPP_CONTEXT_SERVE_PORT` | HTTP API/MCP bind address | `127.0.0.1` / `8000` |
 
 ## Development
 
 ```bash
-python -m pip install -e '.[dev,clang,api]'
+python -m pip install -e '.[dev,clang,api,mcp]'
 ruff format --check .
 ruff check .
 pytest
@@ -161,6 +236,8 @@ The package is split along the intended processing pipeline:
   deterministic network-free test provider
 - `api`: transport-neutral retrieval/answer services and an optional FastAPI
   transport
+- `mcp`: an optional official-SDK v2 server with project-bound, structured,
+  bounded tools over stdio or Streamable HTTP
 
 Shared immutable domain types live in `models.py`. Application paths and
 environment-driven settings live in `config.py`. Python `Protocol` interfaces
@@ -242,3 +319,6 @@ import time.
   provider-specific tokenizer.
 - Model answers still require review. Compiler-derived locations and graph paths
   improve provenance but do not prove behavioral correctness.
+- One MCP process serves one configured project. It serializes indexing and shared
+  SQLite access for correctness; long indexing calls therefore temporarily queue
+  search and graph calls.
