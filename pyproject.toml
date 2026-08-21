@@ -46,6 +46,7 @@ dev = [
 
 [project.scripts]
 cpp-context = "cpp_context_engine.cli:main"
+cpp-context-benchmark = "cpp_context_engine.benchmark:main"
 cpp-context-mcp = "cpp_context_engine.mcp.server:main"
 
 [tool.setuptools.packages.find]

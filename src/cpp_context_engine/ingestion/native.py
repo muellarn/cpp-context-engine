@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -362,10 +363,34 @@ class NativeClangIngestor:
     ) -> IngestionBatch:
         root = project_root.resolve(strict=False)
         self.client.probe()
-        batches = [
-            _FactBatchBuilder(root, configuration).build(self.client.analyze(root, configuration))
-            for configuration in configurations
-        ]
+        selected = tuple(configurations)
+
+        def analyze(configuration: BuildConfiguration) -> IngestionBatch:
+            return _FactBatchBuilder(root, configuration).build(
+                self.client.analyze(root, configuration)
+            )
+
+        # Each configuration is a separate companion process. Consume futures in
+        # submission order so durable IDs and fact aggregation remain deterministic.
+        # Seven companions keep the measured aggregate process tree below the
+        # 2-GiB benchmark budget while retaining bounded TU parallelism.
+        worker_count = min(7, max(1, len(selected)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(analyze, configuration) for configuration in selected[:worker_count]
+            ]
+            batches = []
+            next_configuration = worker_count
+            try:
+                for future in futures:
+                    batches.append(future.result())
+                    if next_configuration < len(selected):
+                        futures.append(executor.submit(analyze, selected[next_configuration]))
+                        next_configuration += 1
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
         callsites = tuple(site for batch in batches for site in batch.callsites)
         call_targets = tuple(target for batch in batches for target in batch.call_targets)
         all_edges = tuple(edge for batch in batches for edge in batch.edges)
@@ -450,6 +475,7 @@ class _FactBatchBuilder:
         self.function_summary_ids: dict[str, str] = {}
         self.function_summary_analysis_ids: dict[str, str] = {}
         self.function_summary_parameter_counts: dict[str, int] = {}
+        self.path_cache: dict[str, Path] = {}
 
     def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
         for fact in facts:
@@ -1573,9 +1599,13 @@ class _FactBatchBuilder:
             raise AnalyzerProtocolError("analyzer fact references an unknown symbol") from error
 
     def _path(self, raw: str) -> Path:
+        cached = self.path_cache.get(raw)
+        if cached is not None:
+            return cached
         path = Path(raw).resolve(strict=False)
         if not _within(path, self.root) or not path.is_file():
             raise AnalyzerProtocolError("analyzer returned a path outside the project")
+        self.path_cache[raw] = path
         return path
 
     def _span(self, raw: Mapping[str, Any]) -> SourceSpan:

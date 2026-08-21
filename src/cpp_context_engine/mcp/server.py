@@ -160,7 +160,11 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         instructions=(
             "This server is bound to one operator-configured project. Tool callers cannot select "
             "project, database, compilation database, or filesystem paths. Start with search_code, "
-            "then use read_symbol and graph tools for exact connected context. "
+            "then use read_symbol and graph tools for exact connected context. On call edges, "
+            "certainty is a compiler-evidence class, confidence is only a deterministic ranking "
+            "signal (not a runtime probability), and target_set_complete says whether the analyzer "
+            "proved the target set closed for that callsite. Treat false or missing completeness "
+            "as open-world evidence, never as proof that no other target exists. "
             "If hosted embeddings or an LLM are configured, queries, indexed symbol text, or "
             "selected code excerpts are "
             "sent to that external provider."
@@ -434,7 +438,11 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
 
     @server.tool(
         title="Find callers",
-        description="Return bounded incoming compiler-derived CALLS edges for one exact symbol ID.",
+        description=(
+            "Return bounded incoming compiler-derived CALLS edges for one exact symbol ID. "
+            "Certainty is an evidence class, confidence is ranking-only, and false "
+            "target_set_complete means additional runtime targets may exist."
+        ),
         annotations=local_read,
     )
     async def callers(
@@ -457,7 +465,11 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
 
     @server.tool(
         title="Find callees",
-        description="Return bounded outgoing compiler-derived CALLS edges for one exact symbol ID.",
+        description=(
+            "Return bounded outgoing compiler-derived CALLS edges for one exact symbol ID. "
+            "Certainty is an evidence class, confidence is ranking-only, and false "
+            "target_set_complete means additional runtime targets may exist."
+        ),
         annotations=local_read,
     )
     async def callees(

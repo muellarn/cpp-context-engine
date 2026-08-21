@@ -30,7 +30,7 @@ cpp-context index /workspace/project \
   --clang-analyzer build/clang-analyzer/cpp-context-clang-analyzer
 ```
 
-Protocol 4 is newline-delimited JSON. A process must receive `hello` first and
+Protocol 5 is newline-delimited JSON. A process must receive `hello` first and
 returns `hello` with analyzer version, Clang major, and capabilities. An analysis
 then returns `begin`, zero or more `fact` records, and `complete`. Fact records
 are `file`, `symbol`, `occurrence`, `edge`, `include`, and the versioned
@@ -85,8 +85,8 @@ calls likewise remain explicit and never gain a certain target.
 
 `SQLiteStore.callsites`, `get_callsite`, and `call_targets` are build-scoped,
 bounded internal reads with deterministic ordering and explicit truncation.
-They are not exposed through CLI, HTTP, or MCP until the dedicated advanced
-interface work.
+The analysis service exposes bounded caller/callee evidence through CLI, HTTP,
+and MCP while retaining certainty, confidence, completeness, and provenance.
 
 ### Function control-flow graphs
 
@@ -117,8 +117,8 @@ edges depend on the pinned Clang version and concrete build configuration.
 
 `SQLiteStore.cfg_graphs`, `cfg_blocks`, `cfg_elements`, and `cfg_edges` are
 bounded, build-scoped reads with deterministic ordering and an explicit
-`truncated` flag. Dedicated CLI/API/MCP CFG tools belong to the later interface
-issue.
+`truncated` flag. CLI, HTTP, and MCP CFG tools apply aggregate graph, block,
+element, and edge budgets across the selected build scope.
 
 ### Intraprocedural data flow and points-to facts
 
@@ -141,8 +141,13 @@ the analyzer does not label code dead, redundant, or buggy.
 
 Data-flow rows retain the same build/configuration/TU provenance as their CFG and
 cascade atomically when a translation unit or build variant is replaced. Public
-CLI, HTTP, and MCP queries are intentionally reserved for the advanced-interface
-work.
+CLI, HTTP, and MCP queries apply aggregate analysis, location, access, and evidence
+budgets across the selected build scope.
+
+These completeness flags describe the documented static-analysis model, not every
+possible C++ execution. The [soundness and completeness matrix](soundness-and-completeness.md)
+defines how to interpret certainty, confidence, target-set completeness, unknown
+effects, dynamic behavior, and build variants.
 
 The libclang path remains a baseline fallback. Baseline symbols and occurrences
 are explicitly marked `analysis_backend=libclang-baseline` and
@@ -243,6 +248,11 @@ Named builds are solved independently. On TU replacement, reverse call-graph
 invalidation selects the changed functions and their transitive callers, then adds
 only the callees required to solve those affected summaries; unrelated summary
 solution hashes remain unchanged.
+
+Schema v9 adds lookup indexes for canonical-symbol refresh, foreign-key checks,
+and translation-unit replacement. Schema v10 removes the redundant symbol snapshot
+from translation-unit membership rows; canonical symbols continue to be derived
+from the versioned build/TU `symbol_variants` snapshots.
 
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by model ID and dimension. `SQLiteVectorSearch` accepts any provider
