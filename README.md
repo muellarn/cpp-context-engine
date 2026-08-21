@@ -312,8 +312,14 @@ devirtualized, lambda/functor, template, and macro-generated calls use separate
 schema-v6 callsite/target evidence with explicit certainty and completeness.
 Schema v7 adds bounded intraprocedural definitions, uses, reaching definitions,
 overwrites, access paths, alias evidence, and local function/member-pointer target
-sets. It emits evidence only: dead-code and redundant-call judgments remain the
-LLM's responsibility. Dedicated CLI/API/MCP CFG, callsite, and data-flow reads are
+sets. Schema v8 adds body-variant function summaries and bounded interprocedural
+argument, return, reference/pointer writeback, field, and global-effect evidence.
+The deterministic solver is isolated per named build, handles recursive call-graph
+components with hard limits, keeps possible dispatch possible, and marks unknown,
+external, or budget-limited paths incomplete. Incremental updates recompute only
+changed summaries and their transitive callers plus required callees. It emits
+evidence only: dead-code and redundant-call judgments remain the LLM's
+responsibility. Dedicated CLI/API/MCP CFG, callsite, and data-flow reads are
 intentionally deferred to the interface issue.
 
 See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,

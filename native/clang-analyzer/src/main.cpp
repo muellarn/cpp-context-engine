@@ -41,7 +41,7 @@ namespace {
 static_assert(CLANG_VERSION_MAJOR == 18, "cpp-context-clang-analyzer requires Clang 18");
 
 constexpr llvm::StringLiteral kProtocol = "cpp-context-clang-facts";
-constexpr std::int64_t kProtocolVersion = 4;
+constexpr std::int64_t kProtocolVersion = 5;
 constexpr std::int64_t kClangMajor = 18;
 
 const std::vector<std::string> kCapabilities = {
@@ -52,7 +52,8 @@ const std::vector<std::string> kCapabilities = {
     "source_manager",     "symbols",           "template_metadata",
     "uses_type",          "callsites_v1",     "dispatch_targets_v1",
     "macro_expansion_stack", "template_relationships_v1",
-    "intraprocedural_dataflow_v1", "points_to_v1"};
+    "intraprocedural_dataflow_v1", "points_to_v1", "function_summaries_v1",
+    "interprocedural_bindings_v1"};
 
 void emit(llvm::json::Object object) {
   llvm::outs() << llvm::formatv("{0}\n", llvm::json::Value(std::move(object)));
@@ -372,6 +373,14 @@ struct IndirectCallRecord {
   std::string blockKey;
   const clang::Expr *calleeExpression = nullptr;
   unsigned sequence = 0;
+};
+
+struct SummaryCallRecord {
+  std::string callsiteKey;
+  std::vector<std::string> argumentLocations;
+  std::vector<bool> writebackCandidates;
+  std::string resultLocation;
+  std::string resultAccess;
 };
 
 class PreprocessorCollector final : public clang::PPCallbacks {
@@ -1079,7 +1088,10 @@ private:
     std::map<std::string, std::vector<DataAccessRecord>> accessesByBlock;
     std::map<std::string, unsigned> sequences;
     std::vector<IndirectCallRecord> indirectCalls;
+    std::vector<SummaryCallRecord> summaryCalls;
     std::set<const clang::Expr *> handledExpressions;
+    std::vector<std::string> parameterLocations;
+    std::vector<std::string> parameterModes;
 
     const std::string unknownKey = analysisKey + ":memory:unknown";
     locations.emplace(unknownKey,
@@ -1097,6 +1109,18 @@ private:
       if (type->getAs<clang::PointerType>())
         return true;
       return false;
+    };
+    const auto parameterMode = [](clang::QualType type) {
+      if (type->isRValueReferenceType())
+        return std::string("rvalue_reference");
+      if (type->isReferenceType())
+        return type.getNonReferenceType().isConstQualified()
+                   ? std::string("const_reference")
+                   : std::string("reference");
+      if (type->isPointerType())
+        return type->getPointeeType().isConstQualified() ? std::string("const_pointer")
+                                                         : std::string("pointer");
+      return std::string("value");
     };
     const auto qualifyLocation = [&](MemoryLocationRecord &record, clang::QualType type) {
       if (type.isNull())
@@ -1248,6 +1272,33 @@ private:
       return unknownKey;
     };
 
+    std::function<std::string(const clang::Expr *)> summaryLocationForExpr;
+    summaryLocationForExpr = [&](const clang::Expr *raw) -> std::string {
+      if (!raw)
+        return unknownKey;
+      const auto *expression = raw->IgnoreParenImpCasts();
+      if (const auto *address = llvm::dyn_cast<clang::UnaryOperator>(expression);
+          address && address->getOpcode() == clang::UO_AddrOf)
+        return locationForLValue(address->getSubExpr());
+      if (llvm::isa<clang::DeclRefExpr, clang::MemberExpr>(expression) ||
+          (llvm::isa<clang::UnaryOperator>(expression) &&
+           llvm::cast<clang::UnaryOperator>(expression)->getOpcode() == clang::UO_Deref))
+        return locationForLValue(expression);
+      std::string result;
+      for (const auto *child : expression->children()) {
+        const auto *childExpression = llvm::dyn_cast_or_null<clang::Expr>(child);
+        if (!childExpression)
+          continue;
+        const auto candidate = summaryLocationForExpr(childExpression);
+        if (candidate == unknownKey)
+          continue;
+        if (!result.empty() && result != candidate)
+          return unknownKey;
+        result = candidate;
+      }
+      return result.empty() ? unknownKey : result;
+    };
+
     const auto cfgElementKey = [&](const clang::CFGBlock &block, unsigned index) {
       return blockKey(block) + ":element:" + std::to_string(index);
     };
@@ -1285,6 +1336,8 @@ private:
 
     for (const auto *parameter : function->parameters()) {
       const auto location = locationForDecl(parameter);
+      parameterLocations.push_back(location);
+      parameterModes.push_back(parameterMode(parameter->getType()));
       auto &access =
           addAccess(entryBlockKey, "", location, "parameter_definition", nullptr);
       if (locations.at(location).tracksPointsTo) {
@@ -1411,6 +1464,16 @@ private:
           continue;
         }
         if (const auto *call = llvm::dyn_cast<clang::CallExpr>(statement)) {
+          const auto ownerKind = symbolKind(function).value_or("function");
+          const auto ownerKey = source_.declKey(function, ownerKind);
+          const auto callRange = call->getSourceRange();
+          const auto callsiteKey =
+              "callsite:" + ownerKey + ":" + call->getStmtClassName() + ":" +
+              std::to_string(source_.offset(callRange.getBegin(), true)) + ":" +
+              std::to_string(source_.offset(callRange.getBegin(), false)) + ":" +
+              std::to_string(source_.offset(callRange.getEnd(), false));
+          SummaryCallRecord summaryCall;
+          summaryCall.callsiteKey = callsiteKey;
           for (const auto *argument : call->arguments())
             addReads(argument, "call_argument", currentBlockKey, elementKey, statement);
           if (!call->getType()->isVoidType()) {
@@ -1420,7 +1483,10 @@ private:
                 "return", "$call-return@" +
                               std::to_string(source_.offset(call->getExprLoc(), false)),
                 call->getType(), "", {});
-            addAccess(currentBlockKey, elementKey, callLocation, "call_return", statement);
+            auto &result =
+                addAccess(currentBlockKey, elementKey, callLocation, "call_return", statement);
+            summaryCall.resultLocation = callLocation;
+            summaryCall.resultAccess = result.key;
           }
           if (!call->getDirectCallee()) {
             addReads(call->getCallee(), "read", currentBlockKey, elementKey, statement);
@@ -1456,6 +1522,21 @@ private:
                   !parameterType.getNonReferenceType().isConstQualified())
                 escapedStorage = argument;
             }
+            const clang::Expr *boundStorage = argument;
+            if (const auto *address = llvm::dyn_cast<clang::UnaryOperator>(stripped);
+                address && address->getOpcode() == clang::UO_AddrOf)
+              boundStorage = address->getSubExpr();
+            const auto boundLocation = summaryLocationForExpr(boundStorage);
+            summaryCall.argumentLocations.push_back(boundLocation);
+            bool writebackCandidate = false;
+            if (callee && argumentIndex < callee->getNumParams()) {
+              const auto mode = parameterMode(callee->getParamDecl(argumentIndex)->getType());
+              writebackCandidate = mode == "reference" || mode == "rvalue_reference" ||
+                                   mode == "pointer";
+            } else {
+              writebackCandidate = type->isPointerType() || type->isReferenceType();
+            }
+            summaryCall.writebackCandidates.push_back(writebackCandidate);
             if (!effectFree && escapedStorage) {
               const auto escapedLocation = locationForLValue(escapedStorage);
               const auto found = locations.find(escapedLocation);
@@ -1467,6 +1548,7 @@ private:
             }
             ++argumentIndex;
           }
+          summaryCalls.push_back(std::move(summaryCall));
           if (!effectFree &&
               (escapingArgument || !callee || !source_.relative(callee->getLocation()))) {
             addAccess(currentBlockKey, elementKey, unknownKey, "unknown_clobber", statement);
@@ -1883,6 +1965,239 @@ private:
                    {"evidence_span", std::move(*source_.span(range, false))}});
       }
     }
+
+    const auto functionKind = symbolKind(function).value_or("function");
+    const auto functionKey = source_.declKey(function, functionKind);
+    const std::string summaryKey = "function-summary:" + graphKey;
+    const auto rootParameterIndex = [&](const std::string &rawLocation)
+        -> std::optional<unsigned> {
+      std::string location = rawLocation;
+      std::set<std::string> visited;
+      while (!location.empty() && visited.insert(location).second) {
+        const auto parameter = std::find(parameterLocations.begin(), parameterLocations.end(),
+                                         location);
+        if (parameter != parameterLocations.end())
+          return static_cast<unsigned>(std::distance(parameterLocations.begin(), parameter));
+        const auto found = locations.find(location);
+        if (found == locations.end())
+          break;
+        location = found->second.baseKey;
+      }
+      return std::nullopt;
+    };
+    const auto pathArray = [](const std::vector<std::string> &path) {
+      llvm::json::Array result;
+      for (const auto &component : path)
+        result.push_back(component);
+      return result;
+    };
+
+    std::set<std::string> summaryIncompleteReasons;
+    const std::set<std::string> summaryCriticalReasons{
+        "access_path_cap_exceeded", "alias_target_cap_exceeded", "atomic_access",
+        "inline_assembly",          "iteration_cap_exceeded",  "location_cap_exceeded",
+        "union_storage",            "volatile_access"};
+    for (const auto &reason : incompleteReasons)
+      if (summaryCriticalReasons.count(reason))
+        summaryIncompleteReasons.insert(reason);
+
+    llvm::json::Array modesJson;
+    llvm::json::Array parameterLocationsJson;
+    for (const auto &mode : parameterModes)
+      modesJson.push_back(mode);
+    for (const auto &location : parameterLocations)
+      parameterLocationsJson.push_back(location);
+
+    for (const auto &[block, records] : accessesByBlock) {
+      (void)block;
+      for (const auto &access : records) {
+        if (access.kind == "parameter_definition" || access.kind == "call_return")
+          continue;
+        const auto found = locations.find(access.locationKey);
+        if (found == locations.end()) {
+          summaryIncompleteReasons.insert("unknown_summary_location");
+          continue;
+        }
+        const auto parameterIndex = rootParameterIndex(access.locationKey);
+        const bool retainedLocation =
+            parameterIndex.has_value() || found->second.kind == "global" ||
+            found->second.kind == "field" || found->second.kind == "dereference";
+        if (!retainedLocation)
+          continue;
+        llvm::StringRef effectKind = isDefinition(access.kind) ? "write" : "read";
+        if (access.kind == "unknown_clobber")
+          effectKind = "escape";
+        const auto effectKey = summaryKey + ":effect:" + effectKind.str() + ":" + access.key;
+        llvm::json::Object effect{{"fact", "summary_effect_v1"},
+                                  {"key", effectKey},
+                                  {"summary_key", summaryKey},
+                                  {"kind", effectKind.str()},
+                                  {"location_kind", found->second.kind},
+                                  {"certainty", "certain"},
+                                  {"reason", "Clang CFG access contributes local summary evidence"},
+                                  {"access_path", pathArray(found->second.accessPath)},
+                                  {"location_key", access.locationKey},
+                                  {"source_access_key", access.key}};
+        if (parameterIndex)
+          effect["parameter_index"] = static_cast<std::int64_t>(*parameterIndex);
+        sink_.add("summary-effect:" + effectKey, std::move(effect));
+        if (access.kind == "call_argument" && parameterIndex &&
+            parameterModes[*parameterIndex] != "value" &&
+            parameterModes[*parameterIndex] != "const_reference" &&
+            parameterModes[*parameterIndex] != "const_pointer") {
+          const auto escapeKey = summaryKey + ":effect:escape:" + access.key;
+          sink_.add("summary-effect:" + escapeKey,
+                    {{"fact", "summary_effect_v1"},
+                     {"key", escapeKey},
+                     {"summary_key", summaryKey},
+                     {"kind", "escape"},
+                     {"location_kind", found->second.kind},
+                     {"certainty", "possible"},
+                     {"reason", "mutable indirection is passed across a call boundary"},
+                     {"parameter_index", static_cast<std::int64_t>(*parameterIndex)},
+                     {"access_path", pathArray(found->second.accessPath)},
+                     {"location_key", access.locationKey},
+                     {"source_access_key", access.key}});
+        }
+      }
+    }
+
+    std::set<std::string> emittedReturnOrigins;
+    std::function<void(const clang::Expr *, const DataAccessRecord &)> emitReturnOrigins;
+    emitReturnOrigins = [&](const clang::Expr *raw, const DataAccessRecord &access) {
+      if (!raw)
+        return;
+      const auto *expression = raw->IgnoreParenImpCasts();
+      if (const auto *call = llvm::dyn_cast<clang::CallExpr>(expression)) {
+        const auto range = call->getSourceRange();
+        const auto callsiteKey =
+            "callsite:" + functionKey + ":" + call->getStmtClassName() + ":" +
+            std::to_string(source_.offset(range.getBegin(), true)) + ":" +
+            std::to_string(source_.offset(range.getBegin(), false)) + ":" +
+            std::to_string(source_.offset(range.getEnd(), false));
+        const auto key = summaryKey + ":return:call:" + callsiteKey;
+        if (emittedReturnOrigins.insert(key).second)
+          sink_.add("summary-return:" + key,
+                    {{"fact", "summary_return_origin_v1"},
+                     {"key", key},
+                     {"summary_key", summaryKey},
+                     {"kind", "call_result"},
+                     {"certainty", "certain"},
+                     {"reason", "function returns a value derived from this call result"},
+                     {"access_path", llvm::json::Array{}},
+                     {"callsite_key", callsiteKey}});
+        return;
+      }
+      if (llvm::isa<clang::IntegerLiteral, clang::FloatingLiteral,
+                    clang::CXXBoolLiteralExpr, clang::CharacterLiteral>(expression)) {
+        const auto key = summaryKey + ":return:constant:" + access.key;
+        if (emittedReturnOrigins.insert(key).second)
+          sink_.add("summary-return:" + key,
+                    {{"fact", "summary_return_origin_v1"},
+                     {"key", key},
+                     {"summary_key", summaryKey},
+                     {"kind", "constant"},
+                     {"certainty", "certain"},
+                     {"reason", "function return expression contains a literal value"},
+                     {"access_path", llvm::json::Array{}}});
+        return;
+      }
+      const bool locationExpression =
+          llvm::isa<clang::DeclRefExpr, clang::MemberExpr>(expression) ||
+          (llvm::isa<clang::UnaryOperator>(expression) &&
+           llvm::cast<clang::UnaryOperator>(expression)->getOpcode() == clang::UO_Deref);
+      if (locationExpression) {
+        const auto locationKey = locationForLValue(expression);
+        const auto found = locations.find(locationKey);
+        if (found == locations.end()) {
+          summaryIncompleteReasons.insert("unknown_return_origin");
+          return;
+        }
+        const auto parameterIndex = rootParameterIndex(locationKey);
+        const auto key = summaryKey + ":return:location:" + access.key + ":" + locationKey;
+        if (emittedReturnOrigins.insert(key).second) {
+          llvm::json::Object fact{{"fact", "summary_return_origin_v1"},
+                                  {"key", key},
+                                  {"summary_key", summaryKey},
+                                  {"kind", "location"},
+                                  {"certainty", "certain"},
+                                  {"reason", "function return expression reads this storage"},
+                                  {"location_kind", found->second.kind},
+                                  {"access_path", pathArray(found->second.accessPath)},
+                                  {"location_key", locationKey}};
+          if (parameterIndex)
+            fact["parameter_index"] = static_cast<std::int64_t>(*parameterIndex);
+          sink_.add("summary-return:" + key, std::move(fact));
+        }
+        return;
+      }
+      bool foundChild = false;
+      for (const auto *child : expression->children()) {
+        if (const auto *childExpression = llvm::dyn_cast_or_null<clang::Expr>(child)) {
+          foundChild = true;
+          emitReturnOrigins(childExpression, access);
+        }
+      }
+      if (!foundChild)
+        summaryIncompleteReasons.insert("unknown_return_origin");
+    };
+    for (const auto &[block, records] : accessesByBlock) {
+      (void)block;
+      for (const auto &access : records)
+        if (access.locationKey == returnLocation() && access.assignedExpression)
+          emitReturnOrigins(access.assignedExpression, access);
+    }
+
+    for (const auto &call : summaryCalls) {
+      for (std::size_t index = 0; index < call.argumentLocations.size(); ++index) {
+        const auto &locationKey = call.argumentLocations[index];
+        const auto found = locations.find(locationKey);
+        const bool complete = found != locations.end() && locationKey != unknownKey;
+        const auto parameterIndex = complete ? rootParameterIndex(locationKey) : std::nullopt;
+        llvm::json::Object fact{{"fact", "call_argument_binding_v1"},
+                                {"key", summaryKey + ":argument:" + call.callsiteKey + ":" +
+                                            std::to_string(index)},
+                                {"summary_key", summaryKey},
+                                {"callsite_key", call.callsiteKey},
+                                {"argument_index", static_cast<std::int64_t>(index)},
+                                {"location_kind", complete ? found->second.kind : "unknown"},
+                                {"access_path", complete
+                                                    ? pathArray(found->second.accessPath)
+                                                    : llvm::json::Array{}},
+                                {"writeback_candidate", call.writebackCandidates[index]},
+                                {"complete", complete},
+                                {"incomplete_reason", complete ? "" : "unknown_argument_storage"}};
+        if (complete)
+          fact["location_key"] = locationKey;
+        if (parameterIndex)
+          fact["parameter_index"] = static_cast<std::int64_t>(*parameterIndex);
+        sink_.add("call-argument-binding:" + call.callsiteKey + ":" +
+                      std::to_string(index),
+                  std::move(fact));
+      }
+      if (!call.resultLocation.empty() && !call.resultAccess.empty())
+        sink_.add("call-result-binding:" + call.callsiteKey,
+                  {{"fact", "call_result_binding_v1"},
+                   {"key", summaryKey + ":result:" + call.callsiteKey},
+                   {"summary_key", summaryKey},
+                   {"callsite_key", call.callsiteKey},
+                   {"location_key", call.resultLocation},
+                   {"definition_access_key", call.resultAccess}});
+    }
+
+    llvm::json::Array summaryReasons;
+    for (const auto &reason : summaryIncompleteReasons)
+      summaryReasons.push_back(reason);
+    sink_.add("function-summary:" + summaryKey,
+              {{"fact", "function_summary_v1"},
+               {"key", summaryKey},
+               {"function_key", functionKey},
+               {"graph_key", graphKey},
+               {"analysis_key", analysisKey},
+               {"parameter_modes", std::move(modesJson)},
+               {"parameter_location_keys", std::move(parameterLocationsJson)},
+               {"local_complete", summaryIncompleteReasons.empty()},
+               {"local_incomplete_reasons", std::move(summaryReasons)}});
 
     for (const auto &[key, location] : locations) {
       llvm::json::Array accessPath;

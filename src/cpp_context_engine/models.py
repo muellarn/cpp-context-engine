@@ -135,6 +135,25 @@ class DataFlowCertainty(StrEnum):
     POSSIBLE = "possible"
 
 
+class SummaryEffectKind(StrEnum):
+    READ = "read"
+    WRITE = "write"
+    ESCAPE = "escape"
+
+
+class SummaryReturnOriginKind(StrEnum):
+    LOCATION = "location"
+    CALL_RESULT = "call_result"
+    CONSTANT = "constant"
+    UNKNOWN = "unknown"
+
+
+class InterproceduralFlowKind(StrEnum):
+    ARGUMENT_TO_PARAMETER = "argument_to_parameter"
+    RETURN_TO_CALLER = "return_to_caller"
+    WRITEBACK = "writeback"
+
+
 @dataclass(frozen=True, slots=True)
 class SourceSpan:
     path: Path
@@ -573,6 +592,197 @@ class DataFlowEvidence:
         location_pair = self.source_location_id is not None and self.target_location_id is not None
         if access_pair == location_pair:
             raise ValueError("data-flow evidence requires exactly one access or location pair")
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionSummary:
+    """Bounded local and transitive effects for one concrete function body variant."""
+
+    id: str
+    function_symbol_id: str
+    graph_id: str
+    analysis_id: str
+    parameter_modes: tuple[str, ...]
+    parameter_location_ids: tuple[str, ...]
+    local_complete: bool
+    local_incomplete_reasons: tuple[str, ...]
+    complete: bool
+    incomplete_reasons: tuple[str, ...]
+    recursive: bool
+    iteration_count: int
+    max_scc_iterations: int
+    max_scc_size: int
+    max_summary_effects: int
+    solution_hash: str = ""
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not all((self.id.strip(), self.function_symbol_id.strip(), self.graph_id.strip())):
+            raise ValueError("function summary identifiers must not be empty")
+        if (
+            self.iteration_count < 0
+            or min(self.max_scc_iterations, self.max_scc_size, self.max_summary_effects) <= 0
+        ):
+            raise ValueError("function summary limits must be positive")
+        local_reasons = tuple(dict.fromkeys(x for x in self.local_incomplete_reasons if x))
+        reasons = tuple(dict.fromkeys(x for x in self.incomplete_reasons if x))
+        if self.local_complete == bool(local_reasons):
+            raise ValueError("local summary completeness and reasons disagree")
+        if self.complete == bool(reasons):
+            raise ValueError("summary completeness and reasons disagree")
+        object.__setattr__(self, "local_incomplete_reasons", local_reasons)
+        object.__setattr__(self, "incomplete_reasons", reasons)
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryEffect:
+    """One read, write, or escape retained as evidence rather than a verdict."""
+
+    id: str
+    summary_id: str
+    kind: SummaryEffectKind
+    location_kind: MemoryLocationKind
+    certainty: DataFlowCertainty
+    reason: str
+    parameter_index: int | None = None
+    access_path: tuple[str, ...] = ()
+    location_id: str | None = None
+    source_access_id: str | None = None
+    is_local: bool = True
+    via_callsite_id: str | None = None
+    target_symbol_id: str | None = None
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.summary_id.strip() or not self.reason.strip():
+            raise ValueError("summary effects require identifiers and a reason")
+        if self.parameter_index is not None and self.parameter_index < 0:
+            raise ValueError("summary parameter indexes must be non-negative")
+        if not self.is_local and (not self.via_callsite_id or not self.target_symbol_id):
+            raise ValueError("propagated summary effects require call-target provenance")
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryReturnOrigin:
+    id: str
+    summary_id: str
+    kind: SummaryReturnOriginKind
+    certainty: DataFlowCertainty
+    reason: str
+    location_kind: MemoryLocationKind | None = None
+    parameter_index: int | None = None
+    access_path: tuple[str, ...] = ()
+    location_id: str | None = None
+    callsite_id: str | None = None
+    is_local: bool = True
+    via_callsite_id: str | None = None
+    target_symbol_id: str | None = None
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.summary_id.strip() or not self.reason.strip():
+            raise ValueError("summary return origins require identifiers and a reason")
+        if self.parameter_index is not None and self.parameter_index < 0:
+            raise ValueError("summary parameter indexes must be non-negative")
+        if self.kind == SummaryReturnOriginKind.CALL_RESULT and not self.callsite_id:
+            raise ValueError("call-result return origins require a callsite")
+        if not self.is_local and (not self.via_callsite_id or not self.target_symbol_id):
+            raise ValueError("propagated return origins require call-target provenance")
+
+
+@dataclass(frozen=True, slots=True)
+class CallArgumentBinding:
+    id: str
+    caller_summary_id: str
+    callsite_id: str
+    argument_index: int
+    location_id: str | None
+    location_kind: MemoryLocationKind
+    parameter_index: int | None
+    access_path: tuple[str, ...]
+    writeback_candidate: bool
+    complete: bool
+    incomplete_reason: str = ""
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not all((self.id.strip(), self.caller_summary_id.strip(), self.callsite_id.strip())):
+            raise ValueError("call argument binding identifiers must not be empty")
+        if self.argument_index < 0:
+            raise ValueError("call argument indexes must be non-negative")
+        if self.parameter_index is not None and self.parameter_index < 0:
+            raise ValueError("caller parameter indexes must be non-negative")
+        if self.complete == bool(self.incomplete_reason):
+            raise ValueError("call argument binding completeness and reason disagree")
+
+
+@dataclass(frozen=True, slots=True)
+class CallResultBinding:
+    id: str
+    caller_summary_id: str
+    callsite_id: str
+    location_id: str
+    definition_access_id: str
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.id.strip(),
+                self.caller_summary_id.strip(),
+                self.callsite_id.strip(),
+                self.location_id.strip(),
+                self.definition_access_id.strip(),
+            )
+        ):
+            raise ValueError("call result binding identifiers must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class InterproceduralFlow:
+    """One cross-call evidence edge with concrete target and compiler provenance."""
+
+    id: str
+    kind: InterproceduralFlowKind
+    caller_summary_id: str
+    callee_summary_id: str
+    callsite_id: str
+    target_symbol_id: str
+    target_certainty: CallTargetCertainty
+    certainty: DataFlowCertainty
+    reason: str
+    argument_index: int | None = None
+    caller_location_id: str | None = None
+    callee_location_id: str | None = None
+    caller_access_id: str | None = None
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        required = (
+            self.id,
+            self.caller_summary_id,
+            self.callee_summary_id,
+            self.callsite_id,
+            self.target_symbol_id,
+            self.reason,
+            self.translation_unit_id,
+            self.build_configuration_id,
+            self.build_variant,
+        )
+        if not all(value.strip() for value in required):
+            raise ValueError("interprocedural flows require identifiers and provenance")
 
 
 CfgFact = TypeVar("CfgFact")

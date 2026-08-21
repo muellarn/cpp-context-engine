@@ -233,6 +233,17 @@ keys to CFGs, blocks, elements, symbols, and translation units. Old native rows
 are marked incomplete so the normal incremental path refreshes them with protocol
 v4 facts. The migration and every TU replacement are atomic.
 
+Schema v8 stores a function summary for each build/configuration/TU body variant,
+plus local and propagated effects, return origins, call argument/result bindings,
+and cross-call flow evidence. Protocol v5 retains callsite, concrete target
+certainty, and full build provenance on every cross-call flow. The solver processes
+call-graph SCCs under deterministic iteration, SCC-size, and effect-count limits;
+unknown or external targets and exhausted limits are explicit incomplete reasons.
+Named builds are solved independently. On TU replacement, reverse call-graph
+invalidation selects the changed functions and their transitive callers, then adds
+only the callees required to solve those affected summaries; unrelated summary
+solution hashes remain unchanged.
+
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by model ID and dimension. `SQLiteVectorSearch` accepts any provider
 implementing `EmbeddingProvider`; `SQLiteStore.search_vector` computes true cosine

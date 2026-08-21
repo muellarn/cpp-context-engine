@@ -14,12 +14,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from cpp_context_engine.analysis.interprocedural import solve_interprocedural
 from cpp_context_engine.models import (
     DEFAULT_BUILD_VARIANT,
     BoundedCfgResult,
     BuildScope,
     BuildVariant,
+    CallArgumentBinding,
     CallDispatchKind,
+    CallResultBinding,
     CallSite,
     CallTarget,
     CallTargetCertainty,
@@ -32,16 +35,24 @@ from cpp_context_engine.models import (
     CodeSymbol,
     DataAccess,
     DataFlowAnalysis,
+    DataFlowCertainty,
     DataFlowEvidence,
+    FunctionSummary,
     GraphDirection,
     GraphEdge,
     GraphRelation,
+    InterproceduralFlow,
     MacroExpansionFrame,
     MemoryLocation,
+    MemoryLocationKind,
     OccurrenceKind,
     SearchHit,
     SearchQuery,
     SourceSpan,
+    SummaryEffect,
+    SummaryEffectKind,
+    SummaryReturnOrigin,
+    SummaryReturnOriginKind,
     SymbolKind,
     SymbolOccurrence,
 )
@@ -49,7 +60,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_CFG_PAGE_SIZE = 10_000
 MAX_CALL_PAGE_SIZE = 10_000
 
@@ -314,6 +325,8 @@ class SQLiteStore:
             self._migrate_v6()
         if current <= 6:
             self._migrate_v7()
+        if current <= 7:
+            self._migrate_v8()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -923,6 +936,217 @@ class SQLiteStore:
         else:
             self._connection.commit()
 
+    def _migrate_v8(self) -> None:
+        """Add body-variant summaries and cross-call evidence atomically."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            _execute_script(
+                self._connection,
+                """
+                CREATE TABLE function_summaries (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    function_symbol_id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    analysis_id TEXT NOT NULL,
+                    parameter_modes_json TEXT NOT NULL,
+                    parameter_location_ids_json TEXT NOT NULL,
+                    local_complete INTEGER NOT NULL,
+                    local_incomplete_reasons_json TEXT NOT NULL,
+                    complete INTEGER NOT NULL,
+                    incomplete_reasons_json TEXT NOT NULL,
+                    recursive INTEGER NOT NULL,
+                    iteration_count INTEGER NOT NULL,
+                    max_scc_iterations INTEGER NOT NULL,
+                    max_scc_size INTEGER NOT NULL,
+                    max_summary_effects INTEGER NOT NULL,
+                    solution_hash TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, graph_id),
+                    FOREIGN KEY (project_id, function_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, analysis_id)
+                        REFERENCES data_flow_analyses(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE summary_effects (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    summary_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    location_kind TEXT NOT NULL,
+                    certainty TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    parameter_index INTEGER,
+                    access_path_json TEXT NOT NULL,
+                    location_id TEXT,
+                    source_access_id TEXT,
+                    is_local INTEGER NOT NULL,
+                    via_callsite_id TEXT,
+                    target_symbol_id TEXT,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, summary_id)
+                        REFERENCES function_summaries(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, source_access_id)
+                        REFERENCES data_accesses(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, via_callsite_id)
+                        REFERENCES callsites(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE summary_return_origins (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    summary_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    certainty TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    location_kind TEXT,
+                    parameter_index INTEGER,
+                    access_path_json TEXT NOT NULL,
+                    location_id TEXT,
+                    callsite_id TEXT,
+                    is_local INTEGER NOT NULL,
+                    via_callsite_id TEXT,
+                    target_symbol_id TEXT,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, summary_id)
+                        REFERENCES function_summaries(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, callsite_id)
+                        REFERENCES callsites(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, via_callsite_id)
+                        REFERENCES callsites(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE call_argument_bindings (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    caller_summary_id TEXT NOT NULL,
+                    callsite_id TEXT NOT NULL,
+                    argument_index INTEGER NOT NULL,
+                    location_id TEXT,
+                    location_kind TEXT NOT NULL,
+                    parameter_index INTEGER,
+                    access_path_json TEXT NOT NULL,
+                    writeback_candidate INTEGER NOT NULL,
+                    complete INTEGER NOT NULL,
+                    incomplete_reason TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, caller_summary_id, callsite_id, argument_index),
+                    FOREIGN KEY (project_id, caller_summary_id)
+                        REFERENCES function_summaries(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, callsite_id)
+                        REFERENCES callsites(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE call_result_bindings (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    caller_summary_id TEXT NOT NULL,
+                    callsite_id TEXT NOT NULL,
+                    location_id TEXT NOT NULL,
+                    definition_access_id TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, caller_summary_id, callsite_id),
+                    FOREIGN KEY (project_id, caller_summary_id)
+                        REFERENCES function_summaries(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, callsite_id)
+                        REFERENCES callsites(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, definition_access_id)
+                        REFERENCES data_accesses(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE interprocedural_flows (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    caller_summary_id TEXT NOT NULL,
+                    callee_summary_id TEXT NOT NULL,
+                    callsite_id TEXT NOT NULL,
+                    target_symbol_id TEXT NOT NULL,
+                    target_certainty TEXT NOT NULL,
+                    certainty TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    argument_index INTEGER,
+                    caller_location_id TEXT,
+                    callee_location_id TEXT,
+                    caller_access_id TEXT,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, caller_summary_id)
+                        REFERENCES function_summaries(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, callee_summary_id)
+                        REFERENCES function_summaries(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, callsite_id)
+                        REFERENCES callsites(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, caller_location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, callee_location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, caller_access_id)
+                        REFERENCES data_accesses(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX function_summaries_scope
+                    ON function_summaries(project_id, build_variant, function_symbol_id, id);
+                CREATE INDEX summary_effects_summary_order
+                    ON summary_effects(project_id, summary_id, is_local DESC, kind, id);
+                CREATE INDEX summary_return_origins_summary_order
+                    ON summary_return_origins(project_id, summary_id, is_local DESC, kind, id);
+                CREATE INDEX call_argument_bindings_site_order
+                    ON call_argument_bindings(project_id, callsite_id, argument_index, id);
+                CREATE INDEX interprocedural_flows_caller_order
+                    ON interprocedural_flows(project_id, caller_summary_id, kind, id);
+                CREATE INDEX interprocedural_flows_callee_order
+                    ON interprocedural_flows(project_id, callee_summary_id, kind, id);
+                """,
+            )
+            self._connection.execute(
+                "UPDATE translation_units SET advanced_facts_complete = 0 "
+                "WHERE analysis_backend = 'clang-libtooling'"
+            )
+            self._connection.execute("PRAGMA user_version = 8")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
     def _rebuild_variant_fts(self) -> None:
         self._connection.execute("DELETE FROM symbol_variant_fts")
         rows = self._connection.execute(
@@ -959,7 +1183,7 @@ class SQLiteStore:
         *,
         current_translation_unit_ids: frozenset[str] | None = None,
         build_variant: BuildVariant | None = None,
-    ) -> None:
+    ) -> int:
         """Atomically replace changed units and optionally remove stale units."""
 
         root = str(project_root.resolve(strict=False))
@@ -991,6 +1215,10 @@ class SQLiteStore:
             )
             replaced_ids = removed_ids | changed_ids
             affected_symbols = self._symbols_from_units(project_id, replaced_ids)
+            affected_functions = self._summary_functions_from_units(project_id, replaced_ids)
+            affected_functions |= self._reverse_summary_callers(
+                project_id, selected_variant.name, affected_functions
+            )
             self._delete_translation_units(project_id, replaced_ids)
 
             for configuration in batch.build_configurations:
@@ -1086,7 +1314,25 @@ class SQLiteStore:
                 batch.data_accesses,
                 batch.data_flow_evidence,
             )
+            self._put_summary_facts(
+                project_id,
+                batch.function_summaries,
+                batch.summary_effects,
+                batch.summary_return_origins,
+                batch.call_argument_bindings,
+                batch.call_result_bindings,
+                batch.interprocedural_flows,
+            )
             self._refresh_indexed_override_candidates(project_id, selected_variant.name)
+            affected_functions |= {
+                summary.function_symbol_id for summary in batch.function_summaries
+            }
+            affected_functions |= self._reverse_summary_callers(
+                project_id, selected_variant.name, affected_functions
+            )
+            invalidated_summaries = self._refresh_summary_solutions(
+                project_id, selected_variant.name, affected_functions
+            )
             self._refresh_symbols(
                 project_id, affected_symbols | {symbol.id for symbol in batch.symbols}
             )
@@ -1098,6 +1344,7 @@ class SQLiteStore:
                 """,
                 (project_id, selected_variant.name),
             )
+            return invalidated_summaries
 
     def _put_build_variant(self, project_id: int, variant: BuildVariant) -> None:
         self._connection.execute(
@@ -1255,6 +1502,21 @@ class SQLiteStore:
             for row in self._connection.execute(
                 f"""
                 SELECT DISTINCT symbol_id FROM translation_unit_symbols
+                WHERE project_id = ? AND translation_unit_id IN ({placeholders})
+                """,
+                (project_id, *sorted(unit_ids)),
+            )
+        }
+
+    def _summary_functions_from_units(self, project_id: int, unit_ids: set[str]) -> set[str]:
+        if not unit_ids:
+            return set()
+        placeholders = ",".join("?" for _ in unit_ids)
+        return {
+            row[0]
+            for row in self._connection.execute(
+                f"""
+                SELECT DISTINCT function_symbol_id FROM function_summaries
                 WHERE project_id = ? AND translation_unit_id IN ({placeholders})
                 """,
                 (project_id, *sorted(unit_ids)),
@@ -1866,6 +2128,524 @@ class SQLiteStore:
                 )
                 for item in evidence
             ),
+        )
+
+    def _put_summary_facts(
+        self,
+        project_id: int,
+        summaries: Iterable[FunctionSummary],
+        effects: Iterable[SummaryEffect],
+        origins: Iterable[SummaryReturnOrigin],
+        argument_bindings: Iterable[CallArgumentBinding],
+        result_bindings: Iterable[CallResultBinding],
+        flows: Iterable[InterproceduralFlow],
+    ) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO function_summaries(
+                project_id, id, function_symbol_id, graph_id, analysis_id,
+                parameter_modes_json, parameter_location_ids_json,
+                local_complete, local_incomplete_reasons_json, complete,
+                incomplete_reasons_json, recursive, iteration_count,
+                max_scc_iterations, max_scc_size, max_summary_effects,
+                solution_hash, translation_unit_id, build_configuration_id,
+                build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    item.id,
+                    item.function_symbol_id,
+                    item.graph_id,
+                    item.analysis_id,
+                    json.dumps(item.parameter_modes),
+                    json.dumps(item.parameter_location_ids),
+                    int(item.local_complete),
+                    json.dumps(item.local_incomplete_reasons),
+                    int(item.complete),
+                    json.dumps(item.incomplete_reasons),
+                    int(item.recursive),
+                    item.iteration_count,
+                    item.max_scc_iterations,
+                    item.max_scc_size,
+                    item.max_summary_effects,
+                    item.solution_hash,
+                    item.translation_unit_id,
+                    item.build_configuration_id,
+                    item.build_variant,
+                )
+                for item in summaries
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO summary_effects(
+                project_id, id, summary_id, kind, location_kind, certainty,
+                reason, parameter_index, access_path_json, location_id,
+                source_access_id, is_local, via_callsite_id, target_symbol_id,
+                translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    item.id,
+                    item.summary_id,
+                    item.kind.value,
+                    item.location_kind.value,
+                    item.certainty.value,
+                    item.reason,
+                    item.parameter_index,
+                    json.dumps(item.access_path),
+                    item.location_id,
+                    item.source_access_id,
+                    int(item.is_local),
+                    item.via_callsite_id,
+                    item.target_symbol_id,
+                    item.translation_unit_id,
+                    item.build_configuration_id,
+                    item.build_variant,
+                )
+                for item in effects
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO summary_return_origins(
+                project_id, id, summary_id, kind, certainty, reason,
+                location_kind, parameter_index, access_path_json, location_id,
+                callsite_id, is_local, via_callsite_id, target_symbol_id,
+                translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    item.id,
+                    item.summary_id,
+                    item.kind.value,
+                    item.certainty.value,
+                    item.reason,
+                    item.location_kind.value if item.location_kind else None,
+                    item.parameter_index,
+                    json.dumps(item.access_path),
+                    item.location_id,
+                    item.callsite_id,
+                    int(item.is_local),
+                    item.via_callsite_id,
+                    item.target_symbol_id,
+                    item.translation_unit_id,
+                    item.build_configuration_id,
+                    item.build_variant,
+                )
+                for item in origins
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO call_argument_bindings(
+                project_id, id, caller_summary_id, callsite_id, argument_index,
+                location_id, location_kind, parameter_index, access_path_json,
+                writeback_candidate, complete, incomplete_reason,
+                translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    item.id,
+                    item.caller_summary_id,
+                    item.callsite_id,
+                    item.argument_index,
+                    item.location_id,
+                    item.location_kind.value,
+                    item.parameter_index,
+                    json.dumps(item.access_path),
+                    int(item.writeback_candidate),
+                    int(item.complete),
+                    item.incomplete_reason,
+                    item.translation_unit_id,
+                    item.build_configuration_id,
+                    item.build_variant,
+                )
+                for item in argument_bindings
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO call_result_bindings(
+                project_id, id, caller_summary_id, callsite_id, location_id,
+                definition_access_id, translation_unit_id,
+                build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    item.id,
+                    item.caller_summary_id,
+                    item.callsite_id,
+                    item.location_id,
+                    item.definition_access_id,
+                    item.translation_unit_id,
+                    item.build_configuration_id,
+                    item.build_variant,
+                )
+                for item in result_bindings
+            ),
+        )
+        self._put_interprocedural_flows(project_id, flows)
+
+    def _put_interprocedural_flows(
+        self, project_id: int, flows: Iterable[InterproceduralFlow]
+    ) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO interprocedural_flows(
+                project_id, id, kind, caller_summary_id, callee_summary_id,
+                callsite_id, target_symbol_id, target_certainty, certainty,
+                reason, argument_index, caller_location_id, callee_location_id,
+                caller_access_id, translation_unit_id, build_configuration_id,
+                build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    item.id,
+                    item.kind.value,
+                    item.caller_summary_id,
+                    item.callee_summary_id,
+                    item.callsite_id,
+                    item.target_symbol_id,
+                    item.target_certainty.value,
+                    item.certainty.value,
+                    item.reason,
+                    item.argument_index,
+                    item.caller_location_id,
+                    item.callee_location_id,
+                    item.caller_access_id,
+                    item.translation_unit_id,
+                    item.build_configuration_id,
+                    item.build_variant,
+                )
+                for item in flows
+            ),
+        )
+
+    def _reverse_summary_callers(
+        self, project_id: int, build_variant: str, function_ids: set[str]
+    ) -> set[str]:
+        closure = set(function_ids)
+        frontier = set(function_ids)
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            callers = {
+                row[0]
+                for row in self._connection.execute(
+                    f"""
+                    SELECT DISTINCT sites.owner_symbol_id
+                    FROM call_targets targets
+                    JOIN callsites sites
+                      ON sites.project_id = targets.project_id
+                     AND sites.id = targets.callsite_id
+                    WHERE targets.project_id = ? AND targets.build_variant = ?
+                      AND targets.target_symbol_id IN ({placeholders})
+                    """,
+                    (project_id, build_variant, *sorted(frontier)),
+                )
+            }
+            frontier = callers - closure
+            closure.update(frontier)
+        return closure - function_ids
+
+    def _forward_summary_callees(
+        self, project_id: int, build_variant: str, function_ids: set[str]
+    ) -> set[str]:
+        closure = set(function_ids)
+        frontier = set(function_ids)
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            callees = {
+                row[0]
+                for row in self._connection.execute(
+                    f"""
+                    SELECT DISTINCT targets.target_symbol_id
+                    FROM callsites sites
+                    JOIN call_targets targets
+                      ON targets.project_id = sites.project_id
+                     AND targets.callsite_id = sites.id
+                    WHERE sites.project_id = ? AND sites.build_variant = ?
+                      AND sites.owner_symbol_id IN ({placeholders})
+                    """,
+                    (project_id, build_variant, *sorted(frontier)),
+                )
+            }
+            frontier = callees - closure
+            closure.update(frontier)
+        return closure
+
+    def _refresh_summary_solutions(
+        self, project_id: int, build_variant: str, affected_functions: set[str]
+    ) -> int:
+        if not affected_functions:
+            return 0
+        selected_functions = self._forward_summary_callees(
+            project_id, build_variant, affected_functions
+        )
+        placeholders = ",".join("?" for _ in selected_functions)
+        summary_rows = self._connection.execute(
+            f"""
+            SELECT * FROM function_summaries
+            WHERE project_id = ? AND build_variant = ?
+              AND function_symbol_id IN ({placeholders})
+            ORDER BY id
+            """,
+            (project_id, build_variant, *sorted(selected_functions)),
+        ).fetchall()
+        summaries = tuple(self._row_to_function_summary(row) for row in summary_rows)
+        if not summaries:
+            return 0
+        summary_ids = {item.id for item in summaries}
+        summary_placeholders = ",".join("?" for _ in summary_ids)
+        effects = tuple(
+            self._row_to_summary_effect(row)
+            for row in self._connection.execute(
+                f"""
+                SELECT * FROM summary_effects
+                WHERE project_id = ? AND is_local = 1
+                  AND summary_id IN ({summary_placeholders}) ORDER BY id
+                """,
+                (project_id, *sorted(summary_ids)),
+            )
+        )
+        origins = tuple(
+            self._row_to_summary_return_origin(row)
+            for row in self._connection.execute(
+                f"""
+                SELECT * FROM summary_return_origins
+                WHERE project_id = ? AND is_local = 1
+                  AND summary_id IN ({summary_placeholders}) ORDER BY id
+                """,
+                (project_id, *sorted(summary_ids)),
+            )
+        )
+        arguments = tuple(
+            self._row_to_call_argument_binding(row)
+            for row in self._connection.execute(
+                f"""
+                SELECT * FROM call_argument_bindings
+                WHERE project_id = ? AND caller_summary_id IN ({summary_placeholders})
+                ORDER BY id
+                """,
+                (project_id, *sorted(summary_ids)),
+            )
+        )
+        results = tuple(
+            self._row_to_call_result_binding(row)
+            for row in self._connection.execute(
+                f"""
+                SELECT * FROM call_result_bindings
+                WHERE project_id = ? AND caller_summary_id IN ({summary_placeholders})
+                ORDER BY id
+                """,
+                (project_id, *sorted(summary_ids)),
+            )
+        )
+        sites = tuple(
+            self._row_to_callsite(row)
+            for row in self._connection.execute(
+                f"""
+                SELECT * FROM callsites
+                WHERE project_id = ? AND build_variant = ?
+                  AND owner_symbol_id IN ({placeholders}) ORDER BY id
+                """,
+                (project_id, build_variant, *sorted(selected_functions)),
+            )
+        )
+        site_ids = {item.id for item in sites}
+        if site_ids:
+            site_placeholders = ",".join("?" for _ in site_ids)
+            targets = tuple(
+                self._row_to_call_target(row)
+                for row in self._connection.execute(
+                    f"""
+                    SELECT * FROM call_targets WHERE project_id = ?
+                      AND callsite_id IN ({site_placeholders}) ORDER BY id
+                    """,
+                    (project_id, *sorted(site_ids)),
+                )
+            )
+        else:
+            targets = ()
+        solution = solve_interprocedural(
+            summaries, effects, origins, arguments, results, sites, targets
+        )
+        impacted_ids = {
+            item.id for item in summaries if item.function_symbol_id in affected_functions
+        }
+        if not impacted_ids:
+            return 0
+        impacted_placeholders = ",".join("?" for _ in impacted_ids)
+        parameters = (project_id, *sorted(impacted_ids))
+        self._connection.execute(
+            f"DELETE FROM interprocedural_flows WHERE project_id = ? "
+            f"AND caller_summary_id IN ({impacted_placeholders})",
+            parameters,
+        )
+        self._connection.execute(
+            f"DELETE FROM summary_effects WHERE project_id = ? AND is_local = 0 "
+            f"AND summary_id IN ({impacted_placeholders})",
+            parameters,
+        )
+        self._connection.execute(
+            f"DELETE FROM summary_return_origins WHERE project_id = ? AND is_local = 0 "
+            f"AND summary_id IN ({impacted_placeholders})",
+            parameters,
+        )
+        solved = [item for item in solution.summaries if item.id in impacted_ids]
+        self._connection.executemany(
+            """
+            UPDATE function_summaries SET
+                complete = ?, incomplete_reasons_json = ?, recursive = ?,
+                iteration_count = ?, max_scc_iterations = ?, max_scc_size = ?,
+                max_summary_effects = ?, solution_hash = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (
+                (
+                    int(item.complete),
+                    json.dumps(item.incomplete_reasons),
+                    int(item.recursive),
+                    item.iteration_count,
+                    item.max_scc_iterations,
+                    item.max_scc_size,
+                    item.max_summary_effects,
+                    item.solution_hash,
+                    project_id,
+                    item.id,
+                )
+                for item in solved
+            ),
+        )
+        self._put_summary_facts(
+            project_id,
+            (),
+            (
+                item
+                for item in solution.effects
+                if item.summary_id in impacted_ids and not item.is_local
+            ),
+            (
+                item
+                for item in solution.return_origins
+                if item.summary_id in impacted_ids and not item.is_local
+            ),
+            (),
+            (),
+            (item for item in solution.flows if item.caller_summary_id in impacted_ids),
+        )
+        return len(impacted_ids)
+
+    @staticmethod
+    def _row_to_function_summary(row: sqlite3.Row) -> FunctionSummary:
+        return FunctionSummary(
+            id=row["id"],
+            function_symbol_id=row["function_symbol_id"],
+            graph_id=row["graph_id"],
+            analysis_id=row["analysis_id"],
+            parameter_modes=tuple(json.loads(row["parameter_modes_json"])),
+            parameter_location_ids=tuple(json.loads(row["parameter_location_ids_json"])),
+            local_complete=bool(row["local_complete"]),
+            local_incomplete_reasons=tuple(json.loads(row["local_incomplete_reasons_json"])),
+            complete=bool(row["complete"]),
+            incomplete_reasons=tuple(json.loads(row["incomplete_reasons_json"])),
+            recursive=bool(row["recursive"]),
+            iteration_count=row["iteration_count"],
+            max_scc_iterations=row["max_scc_iterations"],
+            max_scc_size=row["max_scc_size"],
+            max_summary_effects=row["max_summary_effects"],
+            solution_hash=row["solution_hash"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_summary_effect(row: sqlite3.Row) -> SummaryEffect:
+        return SummaryEffect(
+            id=row["id"],
+            summary_id=row["summary_id"],
+            kind=SummaryEffectKind(row["kind"]),
+            location_kind=MemoryLocationKind(row["location_kind"]),
+            certainty=DataFlowCertainty(row["certainty"]),
+            reason=row["reason"],
+            parameter_index=row["parameter_index"],
+            access_path=tuple(json.loads(row["access_path_json"])),
+            location_id=row["location_id"],
+            source_access_id=row["source_access_id"],
+            is_local=bool(row["is_local"]),
+            via_callsite_id=row["via_callsite_id"],
+            target_symbol_id=row["target_symbol_id"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_summary_return_origin(row: sqlite3.Row) -> SummaryReturnOrigin:
+        return SummaryReturnOrigin(
+            id=row["id"],
+            summary_id=row["summary_id"],
+            kind=SummaryReturnOriginKind(row["kind"]),
+            certainty=DataFlowCertainty(row["certainty"]),
+            reason=row["reason"],
+            location_kind=(
+                MemoryLocationKind(row["location_kind"]) if row["location_kind"] else None
+            ),
+            parameter_index=row["parameter_index"],
+            access_path=tuple(json.loads(row["access_path_json"])),
+            location_id=row["location_id"],
+            callsite_id=row["callsite_id"],
+            is_local=bool(row["is_local"]),
+            via_callsite_id=row["via_callsite_id"],
+            target_symbol_id=row["target_symbol_id"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_call_argument_binding(row: sqlite3.Row) -> CallArgumentBinding:
+        return CallArgumentBinding(
+            id=row["id"],
+            caller_summary_id=row["caller_summary_id"],
+            callsite_id=row["callsite_id"],
+            argument_index=row["argument_index"],
+            location_id=row["location_id"],
+            location_kind=MemoryLocationKind(row["location_kind"]),
+            parameter_index=row["parameter_index"],
+            access_path=tuple(json.loads(row["access_path_json"])),
+            writeback_candidate=bool(row["writeback_candidate"]),
+            complete=bool(row["complete"]),
+            incomplete_reason=row["incomplete_reason"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_call_result_binding(row: sqlite3.Row) -> CallResultBinding:
+        return CallResultBinding(
+            id=row["id"],
+            caller_summary_id=row["caller_summary_id"],
+            callsite_id=row["callsite_id"],
+            location_id=row["location_id"],
+            definition_access_id=row["definition_access_id"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
         )
 
     def _refresh_indexed_override_candidates(self, project_id: int, build_variant: str) -> None:

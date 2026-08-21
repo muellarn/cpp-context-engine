@@ -38,6 +38,13 @@ class IndexingResult:
     indexed_memory_locations: int = 0
     indexed_data_accesses: int = 0
     indexed_data_flow_evidence: int = 0
+    indexed_function_summaries: int = 0
+    indexed_summary_effects: int = 0
+    indexed_summary_return_origins: int = 0
+    indexed_call_argument_bindings: int = 0
+    indexed_call_result_bindings: int = 0
+    indexed_interprocedural_flows: int = 0
+    invalidated_function_summaries: int = 0
 
 
 class ProjectIndexer:
@@ -95,9 +102,15 @@ class ProjectIndexer:
                 memory_locations=batch.memory_locations,
                 data_accesses=batch.data_accesses,
                 data_flow_evidence=batch.data_flow_evidence,
+                function_summaries=batch.function_summaries,
+                summary_effects=batch.summary_effects,
+                summary_return_origins=batch.summary_return_origins,
+                call_argument_bindings=batch.call_argument_bindings,
+                call_result_bindings=batch.call_result_bindings,
+                interprocedural_flows=batch.interprocedural_flows,
             )
         removed = len(set(previous) - current_ids)
-        self._store.apply_ingestion(
+        invalidated_summaries = self._store.apply_ingestion(
             project_root,
             batch,
             current_translation_unit_ids=current_ids,
@@ -120,6 +133,13 @@ class ProjectIndexer:
             indexed_memory_locations=len(batch.memory_locations),
             indexed_data_accesses=len(batch.data_accesses),
             indexed_data_flow_evidence=len(batch.data_flow_evidence),
+            indexed_function_summaries=len(batch.function_summaries),
+            indexed_summary_effects=len(batch.summary_effects),
+            indexed_summary_return_origins=len(batch.summary_return_origins),
+            indexed_call_argument_bindings=len(batch.call_argument_bindings),
+            indexed_call_result_bindings=len(batch.call_result_bindings),
+            indexed_interprocedural_flows=len(batch.interprocedural_flows),
+            invalidated_function_summaries=invalidated_summaries,
         )
 
     @staticmethod

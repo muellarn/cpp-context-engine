@@ -61,7 +61,7 @@ def test_native_handshake_matches_protocol_golden() -> None:
     request = {
         "type": "hello",
         "protocol": "cpp-context-clang-facts",
-        "protocol_version": 4,
+        "protocol_version": 5,
         "required_clang_major": 18,
     }
     completed = subprocess.run(  # noqa: S603 - repository-built test binary
@@ -454,7 +454,7 @@ def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
     valid = {
         "type": "hello",
         "protocol": "cpp-context-clang-facts",
-        "protocol_version": 4,
+        "protocol_version": 5,
         "analyzer_version": "test",
         "clang_major": 18,
         "capabilities": [
@@ -478,6 +478,8 @@ def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
             "template_relationships_v1",
             "intraprocedural_dataflow_v1",
             "points_to_v1",
+            "function_summaries_v1",
+            "interprocedural_bindings_v1",
         ],
     }
     script = _script(
@@ -565,16 +567,19 @@ def test_doctor_checks_real_companion(capsys: pytest.CaptureFixture[str]) -> Non
     )
     report = json.loads(capsys.readouterr().out)
     assert report["clang_analyzer_executable"] is True
-    assert report["clang_analyzer_protocol"] == 4
+    assert report["clang_analyzer_protocol"] == 5
     assert report["clang_analyzer_clang_major"] == 18
     assert report["advanced_facts_complete"] is True
     assert report["cfg_facts_available"] is True
     assert report["call_facts_available"] is True
     assert report["data_flow_facts_available"] is True
+    assert report["function_summary_facts_available"] is True
     assert "function_cfg_v1" in report["clang_analyzer_capabilities"]
     assert "macro_provenance" in report["clang_analyzer_capabilities"]
     assert "callsites_v1" in report["clang_analyzer_capabilities"]
     assert "intraprocedural_dataflow_v1" in report["clang_analyzer_capabilities"]
+    assert "function_summaries_v1" in report["clang_analyzer_capabilities"]
+    assert "interprocedural_bindings_v1" in report["clang_analyzer_capabilities"]
 
 
 def test_cli_index_reports_companion_coverage(

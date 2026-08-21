@@ -9,6 +9,8 @@ from typing import Protocol
 from cpp_context_engine.models import (
     BuildConfiguration,
     BuildVariant,
+    CallArgumentBinding,
+    CallResultBinding,
     CallSite,
     CallTarget,
     CfgBlock,
@@ -19,8 +21,12 @@ from cpp_context_engine.models import (
     DataAccess,
     DataFlowAnalysis,
     DataFlowEvidence,
+    FunctionSummary,
     GraphEdge,
+    InterproceduralFlow,
     MemoryLocation,
+    SummaryEffect,
+    SummaryReturnOrigin,
     SymbolOccurrence,
     TranslationUnit,
 )
@@ -44,6 +50,12 @@ class IngestionBatch:
     memory_locations: tuple[MemoryLocation, ...] = ()
     data_accesses: tuple[DataAccess, ...] = ()
     data_flow_evidence: tuple[DataFlowEvidence, ...] = ()
+    function_summaries: tuple[FunctionSummary, ...] = ()
+    summary_effects: tuple[SummaryEffect, ...] = ()
+    summary_return_origins: tuple[SummaryReturnOrigin, ...] = ()
+    call_argument_bindings: tuple[CallArgumentBinding, ...] = ()
+    call_result_bindings: tuple[CallResultBinding, ...] = ()
+    interprocedural_flows: tuple[InterproceduralFlow, ...] = ()
 
 
 class Ingestor(Protocol):
