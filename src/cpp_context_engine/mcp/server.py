@@ -721,32 +721,43 @@ async def _graph_tool(
         evidence_pairs = {
             (edge.source_id, edge.target_id, edge.build_variant) for edge in evidence_edges
         }
-        edges = tuple(
+        legacy_and_non_call_edges = tuple(
             edge
             for edge in edges
             if edge.relation != GraphRelation.CALLS
             or (edge.source_id, edge.target_id, edge.build_variant) not in evidence_pairs
-        ) + tuple(evidence_edges)
-        truncated |= len(edges) > max_results
-        edges = tuple(
-            sorted(
-                edges,
-                key=lambda edge: (
-                    0
-                    if (
-                        detail := details_by_id.get(edge.id)
-                        or call_details.get((edge.source_id, edge.target_id, edge.build_variant))
-                    )
-                    and detail.certainty.value == "certain"
-                    else 1,
-                    edge.relation.value,
-                    edge.source_id,
-                    edge.target_id,
-                    edge.build_variant,
-                    edge.id,
-                ),
-            )
         )
+        origin_edges = [
+            edge
+            for edge in (*legacy_and_non_call_edges, *evidence_edges)
+            if origin.id in {edge.source_id, edge.target_id}
+        ]
+        deeper_edges = [
+            edge
+            for edge in legacy_and_non_call_edges
+            if origin.id not in {edge.source_id, edge.target_id}
+        ]
+
+        def edge_sort_key(edge: GraphEdge) -> tuple[object, ...]:
+            detail = details_by_id.get(edge.id) or call_details.get(
+                (edge.source_id, edge.target_id, edge.build_variant)
+            )
+            return (
+                0 if detail is not None and detail.certainty.value == "certain" else 1,
+                edge.relation.value,
+                edge.source_id,
+                edge.target_id,
+                edge.build_variant,
+                edge.id,
+            )
+
+        origin_edges.sort(key=edge_sort_key)
+        if len(origin_edges) > per_node_fanout:
+            # Advanced callsite facts augment legacy edges but still share the public fanout budget.
+            truncated = True
+        edges = tuple((*deeper_edges, *origin_edges[:per_node_fanout]))
+        truncated |= len(edges) > max_results
+        edges = tuple(sorted(edges, key=edge_sort_key))
         rendered: list[GraphEdgeResult] = []
         for edge in edges[:max_results]:
             edge_scope = (edge.build_variant,)

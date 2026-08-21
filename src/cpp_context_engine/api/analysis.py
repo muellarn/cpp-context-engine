@@ -303,9 +303,9 @@ class AnalysisQueryService:
 
     def control_flow(self, request: CfgRequest) -> ControlFlowResult:
         scope = self.resolve_scope(request.builds)
-        self._require_symbol(request.function_symbol_id, scope)
+        function_symbol_id = self._require_symbol(request.function_symbol_id, scope)
         graphs = self.store.cfg_graphs(
-            request.function_symbol_id,
+            function_symbol_id,
             self.project_root,
             build_scope=scope,
             limit=request.max_graphs,
@@ -395,7 +395,7 @@ class AnalysisQueryService:
                 truncated |= len(rendered) < len(graphs.items)
                 break
         return ControlFlowResult(
-            function_symbol_id=request.function_symbol_id,
+            function_symbol_id=function_symbol_id,
             scope=self._scope_result(scope),
             graphs=rendered,
             truncated=truncated,
@@ -403,9 +403,9 @@ class AnalysisQueryService:
 
     def data_flow(self, request: FlowRequest) -> DataFlowResult:
         scope = self.resolve_scope(request.builds)
-        self._require_symbol(request.function_symbol_id, scope)
+        function_symbol_id = self._require_symbol(request.function_symbol_id, scope)
         graphs = self.store.cfg_graphs(
-            request.function_symbol_id,
+            function_symbol_id,
             self.project_root,
             build_scope=scope,
             limit=request.max_analyses,
@@ -415,7 +415,7 @@ class AnalysisQueryService:
         remaining_evidence = request.max_evidence
         rendered: list[DataFlowAnalysisResult] = []
         summaries = self.store.function_summaries(
-            request.function_symbol_id,
+            function_symbol_id,
             self.project_root,
             build_scope=scope,
             limit=request.max_analyses,
@@ -458,6 +458,7 @@ class AnalysisQueryService:
             effects = ()
             return_origins = ()
             cross_flows = ()
+            summary_sections_skipped = False
             if summary is not None and remaining_evidence > 0:
                 effects = self.store.summary_effects(
                     summary.id,
@@ -466,6 +467,8 @@ class AnalysisQueryService:
                     limit=max(1, remaining_evidence),
                 )
                 remaining_evidence -= len(effects.items)
+            elif summary is not None:
+                summary_sections_skipped = True
             if summary is not None and remaining_evidence > 0:
                 return_origins = self.store.summary_return_origins(
                     summary.id,
@@ -474,6 +477,8 @@ class AnalysisQueryService:
                     limit=max(1, remaining_evidence),
                 )
                 remaining_evidence -= len(return_origins.items)
+            elif summary is not None:
+                summary_sections_skipped = True
             if summary is not None and remaining_evidence > 0:
                 cross_flows = self.store.interprocedural_flows(
                     summary.id,
@@ -482,6 +487,8 @@ class AnalysisQueryService:
                     limit=max(1, remaining_evidence),
                 )
                 remaining_evidence -= len(cross_flows.items)
+            elif summary is not None:
+                summary_sections_skipped = True
             truncated |= any(item.truncated for item in (analyses, locations, accesses, evidence))
             if effects:
                 truncated |= effects.truncated
@@ -594,10 +601,11 @@ class AnalysisQueryService:
                 )
             )
             if min(remaining_locations, remaining_accesses, remaining_evidence) == 0:
-                truncated = True
+                # Exhausting a budget is not truncation when every bounded query fit exactly.
+                truncated |= len(rendered) < len(graphs.items) or summary_sections_skipped
                 break
         return DataFlowResult(
-            function_symbol_id=request.function_symbol_id,
+            function_symbol_id=function_symbol_id,
             scope=self._scope_result(scope),
             analyses=rendered,
             truncated=truncated,
@@ -607,16 +615,16 @@ class AnalysisQueryService:
         if request.direction not in {GraphDirection.INCOMING, GraphDirection.OUTGOING}:
             raise ValueError("call direction must be incoming or outgoing")
         scope = self.resolve_scope(request.builds)
-        self._require_symbol(request.symbol_id, scope)
+        symbol_id = self._require_symbol(request.symbol_id, scope)
         evidence = self.store.call_evidence(
-            request.symbol_id,
+            symbol_id,
             incoming=request.direction == GraphDirection.INCOMING,
             project_root=self.project_root,
             build_scope=scope,
             limit=request.max_results,
         )
         return CallGraphResult(
-            symbol_id=request.symbol_id,
+            symbol_id=symbol_id,
             direction=request.direction,
             scope=self._scope_result(scope),
             calls=[
@@ -656,9 +664,12 @@ class AnalysisQueryService:
             raise ValueError("build scope is not indexed: " + ", ".join(sorted(missing)))
         return scope
 
-    def _require_symbol(self, symbol_id: str, scope: BuildScope) -> None:
-        if self.store.get_symbol(symbol_id, self.project_root, build_scope=scope) is None:
+    def _require_symbol(self, symbol_id: str, scope: BuildScope) -> str:
+        symbol = self.store.get_symbol(symbol_id, self.project_root, build_scope=scope)
+        if symbol is None:
             raise ValueError("requested symbol ID is not present in the selected build scope")
+        # Variant IDs are public handles, but compiler fact tables reference canonical symbol IDs.
+        return symbol.id
 
     @staticmethod
     def _scope_result(scope: BuildScope) -> ScopeResult:

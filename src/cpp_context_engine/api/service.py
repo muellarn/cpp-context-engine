@@ -58,7 +58,10 @@ class ContextRetrievalService:
             raise ValueError(f"max_context_tokens must be in [1, {self.max_context_tokens}]")
         if request.builds is not None and tuple(request.builds) != self.build_scope.variants:
             raise ValueError("query build scope does not match the retrieval service scope")
-        selected_results = request.max_results or self.default_max_results
+        # Zero is an invalid public limit, not a request to fall back to the default.
+        selected_results = (
+            self.default_max_results if request.max_results is None else request.max_results
+        )
         if selected_results is not None and not 1 <= selected_results <= self.max_results:
             raise ValueError(f"max_results must be in [1, {self.max_results}]")
         if selected_results is None:

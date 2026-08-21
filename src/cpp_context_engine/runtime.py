@@ -212,9 +212,8 @@ def build_runtime(
     )
     try:
         if not store.has_project(config.project_root):
-            raise ValueError(
-                f"project is not indexed in {config.database_path}; run 'cpp-context index' first"
-            )
+            # Public CLI/API composition must not reveal the operator's absolute database path.
+            raise ValueError("project is not indexed; run 'cpp-context index' first")
         available = {variant.name for variant in store.build_variants(config.project_root)}
         missing_builds = set(config.build_scope.variants) - available
         if missing_builds:

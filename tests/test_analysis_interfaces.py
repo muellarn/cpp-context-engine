@@ -372,6 +372,88 @@ def test_union_and_single_build_queries_are_bounded_and_evidence_ranked(tmp_path
         CfgRequest(function_symbol_id="cxx:analyze", max_edges=2_001)
 
 
+def test_exact_data_flow_budgets_do_not_report_truncation(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = _config(project, tmp_path / "index.db")
+    _seed(config)
+
+    with build_runtime(config) as runtime:
+        result = runtime.analysis_service.data_flow(
+            FlowRequest(
+                function_symbol_id="cxx:analyze",
+                builds=["alpha"],
+                max_analyses=1,
+                max_locations=1,
+                max_accesses=2,
+                max_evidence=1,
+            )
+        )
+
+    assert len(result.analyses) == 1
+    assert len(result.analyses[0].locations) == 1
+    assert len(result.analyses[0].accesses) == 2
+    assert len(result.analyses[0].evidence) == 1
+    assert not result.truncated
+
+
+def test_analysis_queries_accept_build_variant_symbol_ids(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = _config(project, tmp_path / "index.db")
+    _seed(config)
+
+    with build_runtime(config) as runtime:
+        symbol = runtime.store.get_symbol(
+            "cxx:analyze", project, build_scope=BuildScope.single("alpha")
+        )
+        assert symbol is not None
+        assert symbol.variant_id
+
+        cfg = runtime.analysis_service.control_flow(
+            CfgRequest(function_symbol_id=symbol.variant_id, builds=["alpha"])
+        )
+        flow = runtime.analysis_service.data_flow(
+            FlowRequest(function_symbol_id=symbol.variant_id, builds=["alpha"])
+        )
+        calls = runtime.analysis_service.calls(
+            CallRequest(
+                symbol_id=symbol.variant_id,
+                direction=GraphDirection.OUTGOING,
+                builds=["alpha"],
+            )
+        )
+
+    assert [item.graph_id for item in cfg.graphs] == ["graph-alpha"]
+    assert [item.graph_id for item in flow.analyses] == ["graph-alpha"]
+    assert [item.callsite_id for item in calls.calls] == ["callsite-alpha"]
+
+
+def test_build_listing_sanitizes_an_empty_index_error(tmp_path: Path, capsys) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    database = tmp_path / "index.db"
+
+    assert (
+        main(
+            [
+                "builds",
+                "--project",
+                str(project),
+                "--db",
+                str(database),
+                "--json",
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "project is not indexed" in captured.err
+    assert str(project) not in captured.err
+    assert str(database) not in captured.err
+
+
 def test_cfg_contract_is_identical_across_service_cli_http_and_mcp(tmp_path: Path, capsys) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -549,6 +631,18 @@ def test_mcp_build_filters_do_not_leak_and_call_evidence_is_ranked(tmp_path: Pat
                 "possible",
             ]
             assert all(item["callsite_id"] for item in neighbors.structured_content["edges"])
+            bounded_neighbors = await mcp.call_tool(
+                "neighbors",
+                {
+                    "symbol_id": "cxx:analyze",
+                    "relations": ["calls"],
+                    "direction": "both",
+                    "max_results": 10,
+                    "per_node_fanout": 1,
+                },
+            )
+            assert len(bounded_neighbors.structured_content["edges"]) == 1
+            assert bounded_neighbors.structured_content["truncated"]
 
     anyio.run(scenario)
 
