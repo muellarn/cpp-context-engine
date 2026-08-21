@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -598,6 +598,14 @@ class ClangIngestor:
             occurrences=tuple(occurrences),
             edges=tuple(edges),
         )
+
+    def iter_configuration_batches(
+        self, project_root: Path, configurations: Iterable[BuildConfiguration]
+    ) -> Iterator[IngestionBatch]:
+        """Yield baseline libclang results one TU at a time for bounded persistence."""
+
+        for configuration in configurations:
+            yield self.ingest_configurations(project_root, (configuration,))
 
     @staticmethod
     def _format_diagnostic(diagnostic: Any) -> str:
