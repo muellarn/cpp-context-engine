@@ -34,6 +34,10 @@ class IndexingResult:
     indexed_cfg_edges: int = 0
     indexed_callsites: int = 0
     indexed_call_targets: int = 0
+    indexed_data_flow_analyses: int = 0
+    indexed_memory_locations: int = 0
+    indexed_data_accesses: int = 0
+    indexed_data_flow_evidence: int = 0
 
 
 class ProjectIndexer:
@@ -87,6 +91,10 @@ class ProjectIndexer:
                 cfg_edges=batch.cfg_edges,
                 callsites=batch.callsites,
                 call_targets=batch.call_targets,
+                data_flow_analyses=batch.data_flow_analyses,
+                memory_locations=batch.memory_locations,
+                data_accesses=batch.data_accesses,
+                data_flow_evidence=batch.data_flow_evidence,
             )
         removed = len(set(previous) - current_ids)
         self._store.apply_ingestion(
@@ -108,6 +116,10 @@ class ProjectIndexer:
             indexed_cfg_edges=len(batch.cfg_edges),
             indexed_callsites=len(batch.callsites),
             indexed_call_targets=len(batch.call_targets),
+            indexed_data_flow_analyses=len(batch.data_flow_analyses),
+            indexed_memory_locations=len(batch.memory_locations),
+            indexed_data_accesses=len(batch.data_accesses),
+            indexed_data_flow_evidence=len(batch.data_flow_evidence),
         )
 
     @staticmethod

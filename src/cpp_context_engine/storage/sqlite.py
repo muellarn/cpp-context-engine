@@ -30,10 +30,14 @@ from cpp_context_engine.models import (
     CfgElement,
     CfgGraph,
     CodeSymbol,
+    DataAccess,
+    DataFlowAnalysis,
+    DataFlowEvidence,
     GraphDirection,
     GraphEdge,
     GraphRelation,
     MacroExpansionFrame,
+    MemoryLocation,
     OccurrenceKind,
     SearchHit,
     SearchQuery,
@@ -45,7 +49,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_CFG_PAGE_SIZE = 10_000
 MAX_CALL_PAGE_SIZE = 10_000
 
@@ -308,6 +312,8 @@ class SQLiteStore:
             self._migrate_v5()
         if current <= 5:
             self._migrate_v6()
+        if current <= 6:
+            self._migrate_v7()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -755,7 +761,162 @@ class SQLiteStore:
                 "UPDATE translation_units SET advanced_facts_complete = 0 "
                 "WHERE analysis_backend = 'clang-libtooling'"
             )
-            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            # Pin this migration's boundary: a later migration may still roll back.
+            self._connection.execute("PRAGMA user_version = 6")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _migrate_v7(self) -> None:
+        """Add bounded intraprocedural data-flow evidence atomically."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            _execute_script(
+                self._connection,
+                """
+                CREATE TABLE data_flow_analyses (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    complete INTEGER NOT NULL,
+                    incomplete_reasons_json TEXT NOT NULL,
+                    iteration_count INTEGER NOT NULL,
+                    max_iterations INTEGER NOT NULL,
+                    max_alias_targets INTEGER NOT NULL,
+                    max_access_path_depth INTEGER NOT NULL,
+                    max_locations INTEGER NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, graph_id),
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE memory_locations (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    analysis_id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    type_name TEXT NOT NULL,
+                    declaration_symbol_id TEXT,
+                    base_location_id TEXT,
+                    access_path_json TEXT NOT NULL,
+                    is_volatile INTEGER NOT NULL,
+                    is_atomic INTEGER NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, analysis_id)
+                        REFERENCES data_flow_analyses(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, declaration_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, base_location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE data_accesses (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    analysis_id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    block_id TEXT NOT NULL,
+                    cfg_element_id TEXT,
+                    location_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    span_json TEXT,
+                    expression TEXT NOT NULL,
+                    pointee_symbol_ids_json TEXT NOT NULL,
+                    points_to_complete INTEGER NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, analysis_id)
+                        REFERENCES data_flow_analyses(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, block_id)
+                        REFERENCES cfg_blocks(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, cfg_element_id)
+                        REFERENCES cfg_elements(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE data_flow_evidence (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    analysis_id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    certainty TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    source_access_id TEXT,
+                    target_access_id TEXT,
+                    source_location_id TEXT,
+                    target_location_id TEXT,
+                    evidence_span_json TEXT,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    CHECK (
+                        (source_access_id IS NOT NULL AND target_access_id IS NOT NULL
+                         AND source_location_id IS NULL AND target_location_id IS NULL)
+                        OR
+                        (source_access_id IS NULL AND target_access_id IS NULL
+                         AND source_location_id IS NOT NULL AND target_location_id IS NOT NULL)
+                    ),
+                    FOREIGN KEY (project_id, analysis_id)
+                        REFERENCES data_flow_analyses(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, source_access_id)
+                        REFERENCES data_accesses(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_access_id)
+                        REFERENCES data_accesses(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, source_location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_location_id)
+                        REFERENCES memory_locations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX data_flow_analyses_scope
+                    ON data_flow_analyses(project_id, build_variant, graph_id);
+                CREATE INDEX memory_locations_analysis_order
+                    ON memory_locations(project_id, analysis_id, kind, name, id);
+                CREATE INDEX data_accesses_analysis_order
+                    ON data_accesses(project_id, analysis_id, block_id, sequence, id);
+                CREATE INDEX data_flow_evidence_analysis_order
+                    ON data_flow_evidence(project_id, analysis_id, relation, id);
+                """,
+            )
+            # Protocol-v3 native rows have no def-use or points-to facts and must be
+            # refreshed through the normal incremental path after this migration.
+            self._connection.execute(
+                "UPDATE translation_units SET advanced_facts_complete = 0 "
+                "WHERE analysis_backend = 'clang-libtooling'"
+            )
+            self._connection.execute("PRAGMA user_version = 7")
         except BaseException:
             self._connection.rollback()
             raise
@@ -918,6 +1079,13 @@ class SQLiteStore:
                 batch.cfg_edges,
             )
             self._put_call_facts(project_id, batch.callsites, batch.call_targets)
+            self._put_data_flow_facts(
+                project_id,
+                batch.data_flow_analyses,
+                batch.memory_locations,
+                batch.data_accesses,
+                batch.data_flow_evidence,
+            )
             self._refresh_indexed_override_candidates(project_id, selected_variant.name)
             self._refresh_symbols(
                 project_id, affected_symbols | {symbol.id for symbol in batch.symbols}
@@ -1569,6 +1737,134 @@ class SQLiteStore:
                     target.build_variant,
                 )
                 for target in targets
+            ),
+        )
+
+    def _put_data_flow_facts(
+        self,
+        project_id: int,
+        analyses: Iterable[DataFlowAnalysis],
+        locations: Iterable[MemoryLocation],
+        accesses: Iterable[DataAccess],
+        evidence: Iterable[DataFlowEvidence],
+    ) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO data_flow_analyses(
+                project_id, id, graph_id, complete, incomplete_reasons_json,
+                iteration_count, max_iterations, max_alias_targets,
+                max_access_path_depth, max_locations, translation_unit_id,
+                build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    analysis.id,
+                    analysis.graph_id,
+                    int(analysis.complete),
+                    json.dumps(analysis.incomplete_reasons),
+                    analysis.iteration_count,
+                    analysis.max_iterations,
+                    analysis.max_alias_targets,
+                    analysis.max_access_path_depth,
+                    analysis.max_locations,
+                    analysis.translation_unit_id,
+                    analysis.build_configuration_id,
+                    analysis.build_variant,
+                )
+                for analysis in analyses
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO memory_locations(
+                project_id, id, analysis_id, graph_id, kind, name, type_name,
+                declaration_symbol_id, base_location_id, access_path_json,
+                is_volatile, is_atomic, translation_unit_id,
+                build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    location.id,
+                    location.analysis_id,
+                    location.graph_id,
+                    location.kind.value,
+                    location.name,
+                    location.type_name,
+                    location.declaration_symbol_id,
+                    location.base_location_id,
+                    json.dumps(location.access_path),
+                    int(location.is_volatile),
+                    int(location.is_atomic),
+                    location.translation_unit_id,
+                    location.build_configuration_id,
+                    location.build_variant,
+                )
+                for location in sorted(locations, key=lambda item: (len(item.access_path), item.id))
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO data_accesses(
+                project_id, id, analysis_id, graph_id, block_id,
+                cfg_element_id, location_id, kind, sequence, span_json,
+                expression, pointee_symbol_ids_json, points_to_complete,
+                translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    access.id,
+                    access.analysis_id,
+                    access.graph_id,
+                    access.block_id,
+                    access.cfg_element_id,
+                    access.location_id,
+                    access.kind.value,
+                    access.sequence,
+                    _span_json(access.span),
+                    access.expression,
+                    json.dumps(access.pointee_symbol_ids),
+                    int(access.points_to_complete),
+                    access.translation_unit_id,
+                    access.build_configuration_id,
+                    access.build_variant,
+                )
+                for access in accesses
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO data_flow_evidence(
+                project_id, id, analysis_id, graph_id, relation, certainty,
+                reason, source_access_id, target_access_id,
+                source_location_id, target_location_id, evidence_span_json,
+                translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    item.id,
+                    item.analysis_id,
+                    item.graph_id,
+                    item.relation.value,
+                    item.certainty.value,
+                    item.reason,
+                    item.source_access_id,
+                    item.target_access_id,
+                    item.source_location_id,
+                    item.target_location_id,
+                    _span_json(item.evidence_span),
+                    item.translation_unit_id,
+                    item.build_configuration_id,
+                    item.build_variant,
+                )
+                for item in evidence
             ),
         )
 

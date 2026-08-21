@@ -318,6 +318,10 @@ def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP TABLE data_flow_evidence;
+        DROP TABLE data_accesses;
+        DROP TABLE memory_locations;
+        DROP TABLE data_flow_analyses;
         DROP TABLE call_targets;
         DROP TABLE callsites;
         DROP TABLE cfg_edges;
@@ -346,6 +350,10 @@ def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
             "cfg_edges",
             "callsites",
             "call_targets",
+            "data_flow_analyses",
+            "memory_locations",
+            "data_accesses",
+            "data_flow_evidence",
         } <= tables
 
 

@@ -9,7 +9,7 @@ import subprocess
 import threading
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +32,17 @@ from cpp_context_engine.models import (
     CfgElement,
     CfgGraph,
     CodeSymbol,
+    DataAccess,
+    DataAccessKind,
+    DataFlowAnalysis,
+    DataFlowCertainty,
+    DataFlowEvidence,
+    DataFlowRelation,
     GraphEdge,
     GraphRelation,
     MacroExpansionFrame,
+    MemoryLocation,
+    MemoryLocationKind,
     OccurrenceKind,
     SourceSpan,
     SymbolKind,
@@ -43,7 +51,7 @@ from cpp_context_engine.models import (
 )
 
 PROTOCOL = "cpp-context-clang-facts"
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 REQUIRED_CLANG_MAJOR = 18
 REQUIRED_CAPABILITIES = frozenset(
     {
@@ -65,6 +73,8 @@ REQUIRED_CAPABILITIES = frozenset(
         "dispatch_targets_v1",
         "macro_expansion_stack",
         "template_relationships_v1",
+        "intraprocedural_dataflow_v1",
+        "points_to_v1",
     }
 )
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -364,6 +374,16 @@ class NativeClangIngestor:
             cfg_edges=tuple(edge for batch in batches for edge in batch.cfg_edges),
             callsites=callsites,
             call_targets=call_targets,
+            data_flow_analyses=tuple(
+                analysis for batch in batches for analysis in batch.data_flow_analyses
+            ),
+            memory_locations=tuple(
+                location for batch in batches for location in batch.memory_locations
+            ),
+            data_accesses=tuple(access for batch in batches for access in batch.data_accesses),
+            data_flow_evidence=tuple(
+                evidence for batch in batches for evidence in batch.data_flow_evidence
+            ),
         )
 
 
@@ -377,7 +397,16 @@ class _FactBatchBuilder:
         self.files: dict[str, Path] = {}
         self.cfg_graph_ids: dict[str, str] = {}
         self.cfg_block_ids: dict[str, str] = {}
+        self.cfg_element_ids: dict[str, str] = {}
+        self.cfg_block_graph_ids: dict[str, str] = {}
+        self.cfg_element_graph_ids: dict[str, str] = {}
         self.callsite_ids: dict[str, str] = {}
+        self.data_flow_analysis_ids: dict[str, str] = {}
+        self.data_flow_analysis_graph_ids: dict[str, str] = {}
+        self.memory_location_ids: dict[str, str] = {}
+        self.memory_location_analysis_ids: dict[str, str] = {}
+        self.data_access_ids: dict[str, str] = {}
+        self.data_access_analysis_ids: dict[str, str] = {}
 
     def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
         for fact in facts:
@@ -400,6 +429,7 @@ class _FactBatchBuilder:
                     edges[edge.id] = edge
         cfg_graphs, cfg_blocks, cfg_elements, cfg_edges = self._cfg_facts(facts)
         callsites, call_targets = self._call_facts(facts)
+        analyses, locations, accesses, evidence = self._data_flow_facts(facts)
         dependencies = tuple(
             (path, _hash_bytes(path.read_bytes())) for path in sorted(set(self.files.values()))
         )
@@ -425,7 +455,278 @@ class _FactBatchBuilder:
             cfg_edges=cfg_edges,
             callsites=callsites,
             call_targets=call_targets,
+            data_flow_analyses=analyses,
+            memory_locations=locations,
+            data_accesses=accesses,
+            data_flow_evidence=evidence,
         )
+
+    def _data_flow_facts(
+        self, facts: Sequence[Mapping[str, Any]]
+    ) -> tuple[
+        tuple[DataFlowAnalysis, ...],
+        tuple[MemoryLocation, ...],
+        tuple[DataAccess, ...],
+        tuple[DataFlowEvidence, ...],
+    ]:
+        analysis_facts = [fact for fact in facts if fact.get("fact") == "data_flow_analysis_v1"]
+        location_facts = [fact for fact in facts if fact.get("fact") == "memory_location_v1"]
+        access_facts = [fact for fact in facts if fact.get("fact") == "data_access_v1"]
+        for fact in analysis_facts:
+            key = _string(fact, "key")
+            graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+            self.data_flow_analysis_ids[key] = "data_flow_" + _hash_text(graph_id)[:32]
+            self.data_flow_analysis_graph_ids[key] = graph_id
+        for fact in location_facts:
+            key = _string(fact, "key")
+            analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+            self.memory_location_ids[key] = "memory_" + _hash_text(analysis_id, key)[:32]
+            self.memory_location_analysis_ids[key] = analysis_id
+        for fact in access_facts:
+            key = _string(fact, "key")
+            analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+            self.data_access_ids[key] = "access_" + _hash_text(analysis_id, key)[:32]
+            self.data_access_analysis_ids[key] = analysis_id
+
+        for fact in (*location_facts, *access_facts):
+            analysis_key = _string(fact, "analysis_key")
+            graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+            if self.data_flow_analysis_graph_ids.get(analysis_key) != graph_id:
+                raise AnalyzerProtocolError(
+                    "analyzer data-flow facts have inconsistent graph references"
+                )
+        # Individual SQLite FKs cannot prove that referenced rows belong to this analysis.
+        for fact in location_facts:
+            analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+            base_key = fact.get("base_key")
+            if base_key and self.memory_location_analysis_ids.get(str(base_key)) != analysis_id:
+                raise AnalyzerProtocolError(
+                    "analyzer data-flow facts have inconsistent analysis references"
+                )
+        for fact in access_facts:
+            analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+            if self.memory_location_analysis_ids.get(_string(fact, "location_key")) != analysis_id:
+                raise AnalyzerProtocolError(
+                    "analyzer data-flow facts have inconsistent analysis references"
+                )
+            graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+            if self.cfg_block_graph_ids.get(_string(fact, "block_key")) != graph_id:
+                raise AnalyzerProtocolError(
+                    "analyzer data-flow facts have inconsistent graph references"
+                )
+            element_key = fact.get("cfg_element_key")
+            if element_key and self.cfg_element_graph_ids.get(str(element_key)) != graph_id:
+                raise AnalyzerProtocolError(
+                    "analyzer data-flow facts have inconsistent graph references"
+                )
+
+        try:
+            analyses = tuple(
+                sorted(
+                    (self._data_flow_analysis_fact(fact) for fact in analysis_facts),
+                    key=lambda item: item.id,
+                )
+            )
+            locations = tuple(
+                sorted(
+                    (self._memory_location_fact(fact) for fact in location_facts),
+                    key=lambda item: (item.analysis_id, item.kind.value, item.name, item.id),
+                )
+            )
+            accesses = tuple(
+                sorted(
+                    (self._data_access_fact(fact) for fact in access_facts),
+                    key=lambda item: (item.analysis_id, item.block_id, item.sequence, item.id),
+                )
+            )
+            evidence = tuple(
+                sorted(
+                    (
+                        self._data_flow_evidence_fact(fact)
+                        for fact in facts
+                        if fact.get("fact") == "data_flow_evidence_v1"
+                    ),
+                    key=lambda item: (item.analysis_id, item.relation.value, item.id),
+                )
+            )
+        except ValueError as error:
+            # Invalid enums and model invariants are malformed protocol-v4 facts.
+            raise AnalyzerProtocolError("analyzer returned an invalid data-flow fact") from error
+        return analyses, locations, accesses, evidence
+
+    def _data_flow_analysis_fact(self, fact: Mapping[str, Any]) -> DataFlowAnalysis:
+        raw_reasons = fact.get("incomplete_reasons")
+        if not isinstance(raw_reasons, list) or not all(
+            isinstance(reason, str) for reason in raw_reasons
+        ):
+            raise AnalyzerProtocolError("analyzer data-flow reasons must be strings")
+        limits = _mapping(fact, "limits")
+        return DataFlowAnalysis(
+            id=self._known_data_flow_analysis(_string(fact, "key")),
+            graph_id=self._known_cfg_graph(_string(fact, "graph_key")),
+            complete=_boolean(fact, "complete"),
+            incomplete_reasons=tuple(raw_reasons),
+            iteration_count=_non_negative_integer(fact, "iteration_count"),
+            max_iterations=_positive_mapping_integer(limits, "max_iterations"),
+            max_alias_targets=_positive_mapping_integer(limits, "max_alias_targets"),
+            max_access_path_depth=_positive_mapping_integer(limits, "max_access_path_depth"),
+            max_locations=_positive_mapping_integer(limits, "max_locations"),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _memory_location_fact(self, fact: Mapping[str, Any]) -> MemoryLocation:
+        raw_path = fact.get("access_path", [])
+        if not isinstance(raw_path, list) or not all(
+            isinstance(component, str) for component in raw_path
+        ):
+            raise AnalyzerProtocolError("analyzer memory access path is invalid")
+        declaration_key = fact.get("declaration_key")
+        base_key = fact.get("base_key")
+        if declaration_key is not None and not isinstance(declaration_key, str):
+            raise AnalyzerProtocolError("analyzer memory declaration key is invalid")
+        if base_key is not None and not isinstance(base_key, str):
+            raise AnalyzerProtocolError("analyzer memory base key is invalid")
+        analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+        graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+        return MemoryLocation(
+            id=self._known_memory_location(_string(fact, "key")),
+            analysis_id=analysis_id,
+            graph_id=graph_id,
+            kind=MemoryLocationKind(_string(fact, "kind")),
+            name=_string(fact, "name"),
+            type_name=_optional_string(fact, "type_name"),
+            declaration_symbol_id=(self._known_id(declaration_key) if declaration_key else None),
+            base_location_id=(self._known_memory_location(base_key) if base_key else None),
+            access_path=tuple(raw_path),
+            is_volatile=_boolean(fact, "is_volatile"),
+            is_atomic=_boolean(fact, "is_atomic"),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _data_access_fact(self, fact: Mapping[str, Any]) -> DataAccess:
+        raw_pointees = fact.get("pointee_keys", [])
+        if not isinstance(raw_pointees, list) or not all(
+            isinstance(key, str) for key in raw_pointees
+        ):
+            raise AnalyzerProtocolError("analyzer points-to targets are invalid")
+        element_key = fact.get("cfg_element_key")
+        if element_key is not None and not isinstance(element_key, str):
+            raise AnalyzerProtocolError("analyzer data access CFG element is invalid")
+        return DataAccess(
+            id=self._known_data_access(_string(fact, "key")),
+            analysis_id=self._known_data_flow_analysis(_string(fact, "analysis_key")),
+            graph_id=self._known_cfg_graph(_string(fact, "graph_key")),
+            block_id=self._known_cfg_block(_string(fact, "block_key")),
+            cfg_element_id=(self._known_cfg_element(element_key) if element_key else None),
+            location_id=self._known_memory_location(_string(fact, "location_key")),
+            kind=DataAccessKind(_string(fact, "kind")),
+            sequence=_non_negative_integer(fact, "sequence"),
+            span=self._optional_span(fact, "span"),
+            expression=_optional_string(fact, "expression"),
+            pointee_symbol_ids=tuple(self._known_id(key) for key in raw_pointees),
+            points_to_complete=_boolean(fact, "points_to_complete"),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _data_flow_evidence_fact(self, fact: Mapping[str, Any]) -> DataFlowEvidence:
+        source_access_key = fact.get("source_access_key")
+        target_access_key = fact.get("target_access_key")
+        source_location_key = fact.get("source_location_key")
+        target_location_key = fact.get("target_location_key")
+        for value in (
+            source_access_key,
+            target_access_key,
+            source_location_key,
+            target_location_key,
+        ):
+            if value is not None and not isinstance(value, str):
+                raise AnalyzerProtocolError("analyzer data-flow evidence key is invalid")
+        key = _string(fact, "key")
+        analysis_key = _string(fact, "analysis_key")
+        analysis_id = self._known_data_flow_analysis(analysis_key)
+        graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+        if self.data_flow_analysis_graph_ids.get(analysis_key) != graph_id:
+            raise AnalyzerProtocolError(
+                "analyzer data-flow facts have inconsistent graph references"
+            )
+        relation = DataFlowRelation(_string(fact, "relation"))
+        access_keys = (source_access_key, target_access_key)
+        location_keys = (source_location_key, target_location_key)
+        if relation in {
+            DataFlowRelation.REACHING_DEFINITION,
+            DataFlowRelation.OVERWRITES,
+        }:
+            valid_pair = all(access_keys) and not any(location_keys)
+        else:
+            valid_pair = all(location_keys) and not any(access_keys)
+        if not valid_pair:
+            raise AnalyzerProtocolError("analyzer data-flow evidence relation is invalid")
+        if any(
+            self.data_access_analysis_ids.get(str(value)) != analysis_id
+            for value in access_keys
+            if value
+        ) or any(
+            self.memory_location_analysis_ids.get(str(value)) != analysis_id
+            for value in location_keys
+            if value
+        ):
+            raise AnalyzerProtocolError(
+                "analyzer data-flow facts have inconsistent analysis references"
+            )
+        return DataFlowEvidence(
+            id="evidence_" + _hash_text(analysis_id, key)[:32],
+            analysis_id=analysis_id,
+            graph_id=graph_id,
+            relation=relation,
+            certainty=DataFlowCertainty(_string(fact, "certainty")),
+            reason=_string(fact, "reason"),
+            source_access_id=(
+                self._known_data_access(source_access_key) if source_access_key else None
+            ),
+            target_access_id=(
+                self._known_data_access(target_access_key) if target_access_key else None
+            ),
+            source_location_id=(
+                self._known_memory_location(source_location_key) if source_location_key else None
+            ),
+            target_location_id=(
+                self._known_memory_location(target_location_key) if target_location_key else None
+            ),
+            evidence_span=self._optional_span(fact, "evidence_span"),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _known_data_flow_analysis(self, key: str) -> str:
+        try:
+            return self.data_flow_analysis_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError(
+                "analyzer data-flow fact references an unknown analysis"
+            ) from error
+
+    def _known_memory_location(self, key: str) -> str:
+        try:
+            return self.memory_location_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError(
+                "analyzer data-flow fact references an unknown memory location"
+            ) from error
+
+    def _known_data_access(self, key: str) -> str:
+        try:
+            return self.data_access_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError(
+                "analyzer data-flow evidence references an unknown access"
+            ) from error
 
     def _call_facts(
         self, facts: Sequence[Mapping[str, Any]]
@@ -456,9 +757,27 @@ class _FactBatchBuilder:
                     key,
                 )[:32]
             )
-        sites = tuple(
-            sorted((self._callsite_fact(fact) for fact in site_facts), key=lambda x: x.id)
-        )
+        sites_by_key = {_string(fact, "key"): self._callsite_fact(fact) for fact in site_facts}
+        for fact in facts:
+            if fact.get("fact") != "callsite_resolution_v1":
+                continue
+            key = _string(fact, "callsite_key")
+            try:
+                site = sites_by_key[key]
+            except KeyError as error:
+                raise AnalyzerProtocolError(
+                    "analyzer resolution references an unknown callsite"
+                ) from error
+            complete = _boolean(fact, "target_set_complete")
+            reason = _optional_string(fact, "unresolved_reason")
+            if complete == bool(reason):
+                raise AnalyzerProtocolError("analyzer callsite resolution completeness is invalid")
+            sites_by_key[key] = replace(
+                site,
+                target_set_complete=complete,
+                unresolved_reason=reason,
+            )
+        sites = tuple(sorted(sites_by_key.values(), key=lambda x: x.id))
         targets = tuple(
             sorted(
                 (
@@ -571,7 +890,18 @@ class _FactBatchBuilder:
             index = _non_negative_integer(fact, "index")
             block_key = _string(fact, "key")
             block_graph_ids[block_key] = graph_id
+            self.cfg_block_graph_ids[block_key] = graph_id
             self.cfg_block_ids[block_key] = "cfg_block_" + _hash_text(graph_id, str(index))[:32]
+        for fact in facts:
+            if fact.get("fact") != "cfg_element_v1":
+                continue
+            graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+            block_id = self._known_cfg_block(_string(fact, "block_key"))
+            index = _non_negative_integer(fact, "index")
+            self.cfg_element_ids[_string(fact, "key")] = (
+                "cfg_element_" + _hash_text(graph_id, block_id, str(index))[:32]
+            )
+            self.cfg_element_graph_ids[_string(fact, "key")] = graph_id
 
         # A compromised or mismatched companion must not be able to persist a CFG
         # relation that crosses graph boundaries while still satisfying SQLite FKs.
@@ -690,7 +1020,7 @@ class _FactBatchBuilder:
         index = _non_negative_integer(fact, "index")
         metadata = _mapping(fact, "metadata")
         return CfgElement(
-            id="cfg_element_" + _hash_text(graph_id, block_id, str(index))[:32],
+            id=self._known_cfg_element(_string(fact, "key")),
             graph_id=graph_id,
             block_id=block_id,
             index=index,
@@ -752,6 +1082,14 @@ class _FactBatchBuilder:
             return self.cfg_block_ids[key]
         except KeyError as error:
             raise AnalyzerProtocolError("analyzer CFG fact references an unknown block") from error
+
+    def _known_cfg_element(self, key: str) -> str:
+        try:
+            return self.cfg_element_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError(
+                "analyzer data-flow fact references an unknown CFG element"
+            ) from error
 
     def _file_fact(self, fact: Mapping[str, Any]) -> None:
         key = _string(fact, "key")
@@ -974,6 +1312,13 @@ def _integer(record: Mapping[str, Any], name: str) -> int:
 def _non_negative_integer(record: Mapping[str, Any], name: str) -> int:
     value = _integer(record, name)
     if value < 0:
+        raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+    return value
+
+
+def _positive_mapping_integer(record: Mapping[str, Any], name: str) -> int:
+    value = _integer(record, name)
+    if value <= 0:
         raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
     return value
 
