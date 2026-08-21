@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -126,7 +127,12 @@ class NativeAnalyzerClient:
         )
         if len(records) != 1 or records[0].get("type") != "hello":
             raise AnalyzerProtocolError("analyzer handshake returned an invalid response")
-        record = records[0]
+        info = self._validate_handshake(records[0])
+        self._info = info
+        return info
+
+    @staticmethod
+    def _validate_handshake(record: Mapping[str, Any]) -> AnalyzerInfo:
         capabilities_raw = record.get("capabilities")
         if not isinstance(capabilities_raw, list) or not all(
             isinstance(item, str) for item in capabilities_raw
@@ -152,7 +158,6 @@ class NativeAnalyzerClient:
             raise AnalyzerProtocolError(
                 "analyzer is missing required capabilities: " + ", ".join(sorted(missing))
             )
-        self._info = info
         return info
 
     def analyze(
@@ -171,6 +176,8 @@ class NativeAnalyzerClient:
         records = self._invoke((self._hello(), request), output_limit=self.max_output_bytes)
         if not records or records[0].get("type") != "hello":
             raise AnalyzerProtocolError("analyzer did not repeat its validated handshake")
+        if self._validate_handshake(records[0]) != self._info:
+            raise AnalyzerProtocolError("analyzer handshake changed between invocations")
         if len(records) < 3 or records[1] != {"request_id": unit_id, "type": "begin"}:
             raise AnalyzerProtocolError("analyzer response has no matching begin record")
         complete = records[-1]
@@ -233,27 +240,45 @@ class NativeAnalyzerClient:
                     return
 
         readers = (
-            threading.Thread(target=read_bounded, args=(process.stdout, stdout, output_limit)),
+            threading.Thread(
+                target=read_bounded,
+                args=(process.stdout, stdout, output_limit),
+                daemon=True,
+            ),
             threading.Thread(
                 target=read_bounded,
                 args=(process.stderr, stderr, self.max_stderr_bytes),
+                daemon=True,
             ),
         )
         for reader in readers:
             reader.start()
+
+        def write_input() -> None:
+            # Keep a blocked or broken stdin write under the same deadline as the process.
+            try:
+                process.stdin.write(payload)
+            except BrokenPipeError:
+                pass
+            finally:
+                with suppress(BrokenPipeError):
+                    process.stdin.close()
+
+        writer = threading.Thread(target=write_input, daemon=True)
+        writer.start()
+        timed_out = False
         try:
-            process.stdin.write(payload)
-            process.stdin.close()
             process.wait(timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired as error:
+        except subprocess.TimeoutExpired:
+            timed_out = True
             process.kill()
             process.wait()
-            raise AnalyzerLimitError("analyzer exceeded the configured timeout") from error
-        except BrokenPipeError:
-            process.wait()
         finally:
+            writer.join(timeout=2)
             for reader in readers:
                 reader.join(timeout=2)
+        if timed_out:
+            raise AnalyzerLimitError("analyzer exceeded the configured timeout")
         if exceeded.is_set():
             raise AnalyzerLimitError("analyzer exceeded a configured output limit")
         try:

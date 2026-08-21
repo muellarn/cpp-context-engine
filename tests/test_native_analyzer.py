@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from cpp_context_engine.ingestion import (
     NativeClangIngestor,
 )
 from cpp_context_engine.ingestion.clang import ClangIngestor, ClangUnavailableError
+from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
 from cpp_context_engine.models import GraphRelation, OccurrenceKind
 from cpp_context_engine.storage import SQLiteStore
@@ -85,7 +87,7 @@ def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
         for occurrence in batch.occurrences
         if occurrence.symbol_id == macro.id and occurrence.kind == OccurrenceKind.MACRO_EXPANSION
     ]
-    assert expansions
+    assert len(expansions) == 2
     assert any(
         occurrence.metadata["spelling_span"] != occurrence.metadata["expansion_span"]
         for occurrence in expansions
@@ -99,6 +101,30 @@ def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
     assert len(lambdas) == 1
     assert lambdas[0].metadata["stable_lambda_key"].startswith("lambda:")
     assert all(symbol.metadata["advanced_facts_complete"] for symbol in batch.symbols)
+
+    definition = next(
+        symbol
+        for symbol in batch.symbols
+        if symbol.qualified_name == "analyzer_fixture::Derived::evaluate"
+        and symbol.metadata["is_definition"]
+    )
+    source = definition.span.path.read_bytes()
+    assert (
+        source[
+            definition.metadata["start_offset"] : definition.metadata["end_offset_exclusive"]
+        ].decode()
+        == definition.source_text
+    )
+
+    constructor = next(
+        symbol
+        for symbol in batch.symbols
+        if symbol.qualified_name == "analyzer_fixture::Derived::Derived"
+    )
+    assert any(
+        occurrence.symbol_id == constructor.id and occurrence.kind == OccurrenceKind.CALL
+        for occurrence in batch.occurrences
+    )
 
 
 @pytest.mark.clang
@@ -163,6 +189,71 @@ for line in sys.stdin:
 
     assert not marker.exists()
     assert str(tmp_path) not in str(captured.value)
+
+
+def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
+    launches = tmp_path / "launches"
+    valid = {
+        "type": "hello",
+        "protocol": "cpp-context-clang-facts",
+        "protocol_version": 1,
+        "analyzer_version": "test",
+        "clang_major": 18,
+        "capabilities": [
+            "direct_calls",
+            "full_ast",
+            "includes",
+            "inherits",
+            "lambda_metadata",
+            "macro_provenance",
+            "occurrences",
+            "overrides",
+            "pp_callbacks",
+            "source_manager",
+            "symbols",
+            "template_metadata",
+            "uses_type",
+        ],
+    }
+    script = _script(
+        tmp_path,
+        f"""import json, pathlib, sys
+counter = pathlib.Path({str(launches)!r})
+launch = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(launch))
+json.loads(sys.stdin.readline())
+hello = {valid!r}
+if launch == 2:
+    hello["protocol_version"] = 99
+print(json.dumps(hello), flush=True)
+if launch == 2:
+    request = json.loads(sys.stdin.readline())
+    print(json.dumps({{"type": "begin", "request_id": request["request_id"]}}))
+    print(json.dumps({{"type": "complete", "request_id": request["request_id"],
+                      "success": True}}))
+""",
+    )
+    client = NativeAnalyzerClient(script)
+    configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
+
+    client.probe()
+    with pytest.raises(AnalyzerProtocolError, match="protocol mismatch"):
+        client.analyze(FIXTURE, configuration)
+
+
+def test_broken_analyzer_stdin_still_obeys_timeout(tmp_path: Path) -> None:
+    script = _script(
+        tmp_path,
+        "import os, time\nos.close(0)\ntime.sleep(2)\n",
+    )
+    client = NativeAnalyzerClient(script, timeout_seconds=0.05)
+    request = {"payload": "x" * 200_000}
+
+    started = time.monotonic()
+    with pytest.raises(AnalyzerLimitError, match="timeout"):
+        client._invoke((request,), output_limit=1024)
+
+    assert time.monotonic() - started < 1
 
 
 def test_timeout_and_output_limits_are_hard(tmp_path: Path) -> None:

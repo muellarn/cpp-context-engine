@@ -138,12 +138,28 @@ public:
                                            : sourceManager_.getExpansionLoc(range.getBegin());
     clang::SourceLocation end = spelling ? sourceManager_.getSpellingLoc(range.getEnd())
                                          : sourceManager_.getExpansionLoc(range.getEnd());
-    auto candidate = path(begin, spelling);
-    if (!candidate || !isProjectPath(*candidate) || begin.isInvalid() || end.isInvalid())
+    if (begin.isInvalid() || end.isInvalid())
       return std::nullopt;
-    auto endToken = clang::Lexer::getLocForEndOfToken(end, 0, sourceManager_, langOptions_);
-    if (endToken.isValid())
-      end = endToken;
+    bool endIsExclusive = false;
+    if (!sourceManager_.isWrittenInSameFile(begin, end)) {
+      // A declaration ending in a macro can otherwise combine source and definition files.
+      auto fileRange = clang::Lexer::makeFileCharRange(
+          clang::CharSourceRange::getTokenRange(range), sourceManager_, langOptions_);
+      fileRange = clang::Lexer::getAsCharRange(fileRange, sourceManager_, langOptions_);
+      if (fileRange.isInvalid())
+        return std::nullopt;
+      begin = fileRange.getBegin();
+      end = fileRange.getEnd();
+      endIsExclusive = true;
+    }
+    auto candidate = path(begin, spelling);
+    if (!candidate || !isProjectPath(*candidate))
+      return std::nullopt;
+    if (!endIsExclusive) {
+      auto endToken = clang::Lexer::getLocForEndOfToken(end, 0, sourceManager_, langOptions_);
+      if (endToken.isValid())
+        end = endToken;
+    }
     return llvm::json::Object{
         {"path", canonical(*candidate).string()},
         {"start_line", static_cast<std::int64_t>(sourceManager_.getSpellingLineNumber(begin))},
@@ -160,11 +176,25 @@ public:
     return invalid ? std::string{} : text.str();
   }
 
-  std::int64_t offset(clang::SourceLocation location) const {
-    auto resolved = sourceManager_.getSpellingLoc(location);
+  std::int64_t offset(clang::SourceLocation location, bool spelling = true) const {
+    auto resolved = spelling ? sourceManager_.getSpellingLoc(location)
+                             : sourceManager_.getExpansionLoc(location);
     return resolved.isValid()
                ? static_cast<std::int64_t>(sourceManager_.getFileOffset(resolved))
                : 0;
+  }
+
+  std::pair<std::int64_t, std::int64_t> offsets(clang::SourceRange range) const {
+    auto fileRange = clang::Lexer::makeFileCharRange(
+        clang::CharSourceRange::getTokenRange(range), sourceManager_, langOptions_);
+    fileRange = clang::Lexer::getAsCharRange(fileRange, sourceManager_, langOptions_);
+    if (fileRange.isInvalid()) {
+      auto end = sourceManager_.getSpellingLoc(range.getEnd());
+      auto endToken = clang::Lexer::getLocForEndOfToken(end, 0, sourceManager_, langOptions_);
+      return {offset(range.getBegin()), offset(endToken.isValid() ? endToken : end)};
+    }
+    return {static_cast<std::int64_t>(sourceManager_.getFileOffset(fileRange.getBegin())),
+            static_cast<std::int64_t>(sourceManager_.getFileOffset(fileRange.getEnd()))};
   }
 
   std::string fileKey(const std::filesystem::path &path) const {
@@ -200,7 +230,8 @@ public:
       return "usr:" + usr.str().str();
     auto candidate = path(location).value_or(projectRoot_ / "unknown");
     return "macro:" + fileKey(candidate) + ":" + name.str() + ":" +
-           std::to_string(location.getRawEncoding());
+           std::to_string(sourceManager_.getSpellingLineNumber(location)) + ":" +
+           std::to_string(sourceManager_.getSpellingColumnNumber(location));
   }
 
 private:
@@ -235,7 +266,9 @@ public:
       if (source_.isProjectPath(target)) {
         fact["target_key"] = source_.fileKey(target);
         fact["resolved_path"] = target.string();
-        sink_.add("include:" + target.string(), std::move(fact));
+        sink_.add("include:" + from->string() + ":" + target.string() + ":" +
+                      std::to_string(source_.offset(hashLoc, false)),
+                  std::move(fact));
       }
     }
   }
@@ -288,7 +321,8 @@ public:
     auto expansion = source_.span(range, false);
     if (!spelling || !expansion)
       return;
-    sink_.add("macro-expansion:" + key + ":" + usePath->string(),
+    sink_.add("macro-expansion:" + key + ":" + usePath->string() + ":" +
+                  std::to_string(source_.offset(range.getBegin(), false)),
               {{"fact", "occurrence"},
                {"symbol_key", key},
                {"kind", "macro_expansion"},
@@ -333,6 +367,17 @@ public:
         source_.relative(callee->getLocation())) {
       emitSymbol(callee, llvm::isa<clang::CXXMethodDecl>(callee) ? "method" : "function");
       emitRelationship(owner, callee, "calls", expression->getSourceRange(), "call");
+    }
+    return true;
+  }
+
+  bool VisitCXXConstructExpr(clang::CXXConstructExpr *expression) {
+    auto *constructor = expression->getConstructor();
+    auto *owner = enclosingCallable(expression);
+    if (constructor && owner && source_.relative(expression->getExprLoc()) &&
+        source_.relative(constructor->getLocation())) {
+      emitSymbol(constructor, "method");
+      emitRelationship(owner, constructor, "calls", expression->getSourceRange(), "call");
     }
     return true;
   }
@@ -516,11 +561,12 @@ private:
       return;
     emitFile(*path);
     auto key = source_.declKey(decl, kind);
+    const auto [startOffset, endOffset] = source_.offsets(decl->getSourceRange());
     llvm::json::Object metadata{{"is_definition", isDefinition(decl)},
                                 {"analysis_backend", "clang-libtooling"},
                                 {"advanced_facts_complete", true},
-                                {"start_offset", source_.offset(decl->getBeginLoc())},
-                                {"end_offset_exclusive", source_.offset(decl->getEndLoc())}};
+                                {"start_offset", startOffset},
+                                {"end_offset_exclusive", endOffset}};
     auto templateInfo = templateMetadata(decl);
     for (auto &entry : templateInfo)
       metadata[entry.first] = std::move(entry.second);
@@ -549,7 +595,10 @@ private:
                             {"metadata", std::move(metadata)}};
     sink_.add("symbol:" + key + (isDefinition(decl) ? ":0" : ":1"), std::move(fact));
     llvm::StringRef occurrenceKind = isDefinition(decl) ? "definition" : "declaration";
-    sink_.add("occurrence:" + key + ":" + occurrenceKind.str(),
+    auto occurrencePath = source_.path(decl->getLocation(), false).value_or(*path);
+    sink_.add("occurrence:" + key + ":" + occurrenceKind.str() + ":" +
+                  occurrencePath.string() + ":" +
+                  std::to_string(source_.offset(decl->getLocation(), false)),
               {{"fact", "occurrence"},
                {"symbol_key", key},
                {"kind", occurrenceKind.str()},
@@ -623,7 +672,7 @@ private:
     emitSymbol(target, *targetKind);
     auto sourceKey = source_.declKey(source, *sourceKind);
     auto targetKey = source_.declKey(target, *targetKind);
-    std::string evidence = std::to_string(source_.offset(range.getBegin()));
+    std::string evidence = std::to_string(source_.offset(range.getBegin(), false));
     sink_.add("edge:" + relation.str() + ":" + sourceKey + ":" + targetKey + ":" + evidence,
               {{"fact", "edge"},
                {"source_key", sourceKey},
