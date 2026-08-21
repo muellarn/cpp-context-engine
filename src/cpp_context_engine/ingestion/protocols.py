@@ -16,7 +16,11 @@ from cpp_context_engine.models import (
     CfgElement,
     CfgGraph,
     CodeSymbol,
+    DataAccess,
+    DataFlowAnalysis,
+    DataFlowEvidence,
     GraphEdge,
+    MemoryLocation,
     SymbolOccurrence,
     TranslationUnit,
 )
@@ -36,6 +40,10 @@ class IngestionBatch:
     cfg_edges: tuple[CfgEdge, ...] = ()
     callsites: tuple[CallSite, ...] = ()
     call_targets: tuple[CallTarget, ...] = ()
+    data_flow_analyses: tuple[DataFlowAnalysis, ...] = ()
+    memory_locations: tuple[MemoryLocation, ...] = ()
+    data_accesses: tuple[DataAccess, ...] = ()
+    data_flow_evidence: tuple[DataFlowEvidence, ...] = ()
 
 
 class Ingestor(Protocol):

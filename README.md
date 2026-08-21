@@ -310,9 +310,11 @@ use separate schema-v5 records rather than fake symbols and retain branch,
 switch, loop, jump, return, and supported exception flow. Direct, virtual,
 devirtualized, lambda/functor, template, and macro-generated calls use separate
 schema-v6 callsite/target evidence with explicit certainty and completeness.
-Local pointer points-to, def-use/dataflow, and dead-code judgments remain out of
-scope. Dedicated CLI/API/MCP CFG and advanced callsite reads are intentionally
-deferred to the interface issue.
+Schema v7 adds bounded intraprocedural definitions, uses, reaching definitions,
+overwrites, access paths, alias evidence, and local function/member-pointer target
+sets. It emits evidence only: dead-code and redundant-call judgments remain the
+LLM's responsibility. Dedicated CLI/API/MCP CFG, callsite, and data-flow reads are
+intentionally deferred to the interface issue.
 
 See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,
 incremental behavior, libclang configuration, and current guarantees.

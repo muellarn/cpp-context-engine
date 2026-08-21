@@ -1,10 +1,15 @@
 #include <algorithm>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -36,7 +41,7 @@ namespace {
 static_assert(CLANG_VERSION_MAJOR == 18, "cpp-context-clang-analyzer requires Clang 18");
 
 constexpr llvm::StringLiteral kProtocol = "cpp-context-clang-facts";
-constexpr std::int64_t kProtocolVersion = 3;
+constexpr std::int64_t kProtocolVersion = 4;
 constexpr std::int64_t kClangMajor = 18;
 
 const std::vector<std::string> kCapabilities = {
@@ -46,7 +51,8 @@ const std::vector<std::string> kCapabilities = {
     "occurrences",        "overrides",         "pp_callbacks",
     "source_manager",     "symbols",           "template_metadata",
     "uses_type",          "callsites_v1",     "dispatch_targets_v1",
-    "macro_expansion_stack", "template_relationships_v1"};
+    "macro_expansion_stack", "template_relationships_v1",
+    "intraprocedural_dataflow_v1", "points_to_v1"};
 
 void emit(llvm::json::Object object) {
   llvm::outs() << llvm::formatv("{0}\n", llvm::json::Value(std::move(object)));
@@ -304,6 +310,66 @@ private:
 };
 
 class Collector;
+
+constexpr unsigned kDataFlowMaxIterations = 64;
+constexpr unsigned kDataFlowMaxAliasTargets = 64;
+constexpr unsigned kDataFlowMaxAccessPathDepth = 8;
+constexpr unsigned kDataFlowMaxLocations = 4096;
+
+struct PointsToValue {
+  std::set<const clang::FunctionDecl *> functions;
+  std::set<std::string> locations;
+  bool complete = true;
+
+  bool operator==(const PointsToValue &other) const {
+    return functions == other.functions && locations == other.locations &&
+           complete == other.complete;
+  }
+};
+
+struct DataFlowState {
+  std::map<std::string, std::set<std::string>> definitions;
+  std::map<std::string, PointsToValue> pointsTo;
+
+  bool operator==(const DataFlowState &other) const {
+    return definitions == other.definitions && pointsTo == other.pointsTo;
+  }
+};
+
+struct MemoryLocationRecord {
+  std::string key;
+  std::string kind;
+  std::string name;
+  std::string typeName;
+  std::string declarationKey;
+  std::string baseKey;
+  std::vector<std::string> accessPath;
+  bool isVolatile = false;
+  bool isAtomic = false;
+  bool tracksPointsTo = false;
+};
+
+struct DataAccessRecord {
+  std::string key;
+  std::string blockKey;
+  std::string elementKey;
+  std::string locationKey;
+  std::string kind;
+  unsigned sequence = 0;
+  const clang::Stmt *statement = nullptr;
+  const clang::Expr *assignedExpression = nullptr;
+  std::string expression;
+  std::vector<const clang::FunctionDecl *> pointees;
+  bool pointsToComplete = true;
+};
+
+struct IndirectCallRecord {
+  const clang::CallExpr *expression = nullptr;
+  const clang::FunctionDecl *owner = nullptr;
+  std::string blockKey;
+  const clang::Expr *calleeExpression = nullptr;
+  unsigned sequence = 0;
+};
 
 class PreprocessorCollector final : public clang::PPCallbacks {
 public:
@@ -996,6 +1062,868 @@ private:
         ++successorIndex;
       }
     }
+    emitDataFlow(function, *cfg, graphKey);
+  }
+
+  void emitDataFlow(const clang::FunctionDecl *function, const clang::CFG &cfg,
+                    const std::string &graphKey) {
+    const std::string analysisKey = "data-flow:" + graphKey;
+    const auto blockKey = [&](const clang::CFGBlock &block) {
+      return graphKey + ":block:" + std::to_string(block.getBlockID());
+    };
+    std::set<std::string> incompleteReasons;
+    std::map<std::string, MemoryLocationRecord> locations;
+    std::map<std::string, std::vector<DataAccessRecord>> accessesByBlock;
+    std::map<std::string, unsigned> sequences;
+    std::vector<IndirectCallRecord> indirectCalls;
+    std::set<const clang::Expr *> handledExpressions;
+
+    const std::string unknownKey = analysisKey + ":memory:unknown";
+    locations.emplace(unknownKey,
+                      MemoryLocationRecord{unknownKey, "unknown", "$unknown", "", "", "",
+                                           {}, false, false, false});
+
+    const auto typeName = [&](clang::QualType type) {
+      return type.getAsString(context_.getPrintingPolicy());
+    };
+    const auto tracksPointsTo = [](clang::QualType type) {
+      if (type.isNull())
+        return false;
+      if (type->isReferenceType() || type->isMemberFunctionPointerType())
+        return true;
+      if (const auto *pointer = type->getAs<clang::PointerType>())
+        return pointer->getPointeeType()->isFunctionType() ||
+               !pointer->getPointeeType().isConstQualified();
+      return false;
+    };
+    const auto qualifyLocation = [&](MemoryLocationRecord &record, clang::QualType type) {
+      if (type.isNull())
+        return;
+      record.typeName = typeName(type);
+      record.isVolatile = type.isVolatileQualified();
+      record.isAtomic = type->isAtomicType() || record.typeName.find("std::atomic") != std::string::npos;
+      record.tracksPointsTo = tracksPointsTo(type);
+      if (record.isVolatile)
+        incompleteReasons.insert("volatile_access");
+      if (record.isAtomic)
+        incompleteReasons.insert("atomic_access");
+    };
+
+    std::function<std::string(const clang::ValueDecl *)> locationForDecl;
+    std::function<std::string(const clang::Expr *)> locationForLValue;
+    locationForDecl = [&](const clang::ValueDecl *decl) -> std::string {
+      if (!decl)
+        return unknownKey;
+      auto kind = symbolKind(decl).value_or("variable");
+      const bool indexed = source_.relative(decl->getLocation()).has_value();
+      const std::string declarationKey = indexed ? source_.declKey(decl, kind) : "";
+      const std::string key = analysisKey + ":memory:decl:" +
+                              (declarationKey.empty()
+                                   ? decl->getQualifiedNameAsString() + ":" +
+                                         std::to_string(source_.offset(decl->getLocation()))
+                                   : declarationKey);
+      if (locations.count(key))
+        return key;
+      std::string locationKind = "local";
+      if (llvm::isa<clang::ParmVarDecl>(decl))
+        locationKind = "parameter";
+      else if (const auto *variable = llvm::dyn_cast<clang::VarDecl>(decl);
+               variable && variable->hasGlobalStorage())
+        locationKind = "global";
+      MemoryLocationRecord record{key,
+                                  locationKind,
+                                  decl->getQualifiedNameAsString().empty()
+                                      ? decl->getNameAsString()
+                                      : decl->getQualifiedNameAsString(),
+                                  "",
+                                  declarationKey,
+                                  "",
+                                  {},
+                                  false,
+                                  false,
+                                  false};
+      if (record.name.empty())
+        record.name = "<anonymous-storage>";
+      qualifyLocation(record, decl->getType());
+      if (indexed) {
+        emitSymbol(decl, kind);
+      } else if (locationKind == "global") {
+        incompleteReasons.insert("external_global_storage");
+      }
+      locations.emplace(key, std::move(record));
+      if (locations.size() > kDataFlowMaxLocations) {
+        locations.erase(key);
+        incompleteReasons.insert("location_cap_exceeded");
+        return unknownKey;
+      }
+      return key;
+    };
+
+    const auto addDerivedLocation = [&](std::string key, std::string kind, std::string name,
+                                        clang::QualType type, std::string base,
+                                        std::vector<std::string> path) -> std::string {
+      if (locations.count(key))
+        return key;
+      if (path.size() > kDataFlowMaxAccessPathDepth) {
+        incompleteReasons.insert("access_path_cap_exceeded");
+        return unknownKey;
+      }
+      MemoryLocationRecord record{std::move(key), std::move(kind), std::move(name), "", "",
+                                  std::move(base), std::move(path), false, false, false};
+      qualifyLocation(record, type);
+      const auto result = record.key;
+      locations.emplace(result, std::move(record));
+      if (locations.size() > kDataFlowMaxLocations) {
+        locations.erase(result);
+        incompleteReasons.insert("location_cap_exceeded");
+        return unknownKey;
+      }
+      return result;
+    };
+
+    locationForLValue = [&](const clang::Expr *raw) -> std::string {
+      if (!raw)
+        return unknownKey;
+      const clang::Expr *expression = raw->IgnoreParenImpCasts();
+      handledExpressions.insert(expression);
+      if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(expression)) {
+        if (const auto *value = llvm::dyn_cast<clang::ValueDecl>(reference->getDecl()))
+          return locationForDecl(value);
+        return unknownKey;
+      }
+      if (llvm::isa<clang::CXXThisExpr>(expression)) {
+        const auto key = analysisKey + ":memory:this";
+        if (!locations.count(key)) {
+          MemoryLocationRecord record{key, "parameter", "this", "", "", "", {}, false,
+                                      false, true};
+          qualifyLocation(record, expression->getType());
+          locations.emplace(key, std::move(record));
+        }
+        return key;
+      }
+      if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(expression)) {
+        const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+        if (!field)
+          return unknownKey;
+        std::string base = locationForLValue(member->getBase());
+        if (member->isArrow()) {
+          auto dereference = analysisKey + ":memory:deref:" + base;
+          // Preserve the base path here: resetting every `->` to `*` hid deep
+          // field chains from the deterministic access-path budget.
+          auto dereferencePath = locations.at(base).accessPath;
+          dereferencePath.push_back("*");
+          dereference = addDerivedLocation(dereference, "dereference", "*(" +
+                                               locations.at(base).name + ")",
+                                           member->getBase()->getType()->getPointeeType(), base,
+                                           std::move(dereferencePath));
+          base = dereference;
+        }
+        auto path = locations.at(base).accessPath;
+        path.push_back(field->getNameAsString());
+        if (field->getParent() && field->getParent()->isUnion())
+          incompleteReasons.insert("union_storage");
+        const auto fieldKey = source_.declKey(field, "variable");
+        emitSymbol(field, "variable");
+        return addDerivedLocation(analysisKey + ":memory:field:" + base + ":" + fieldKey,
+                                  "field", locations.at(base).name + "." +
+                                               field->getNameAsString(),
+                                  field->getType(), base, std::move(path));
+      }
+      if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(expression);
+          unary && unary->getOpcode() == clang::UO_Deref) {
+        const std::string base = locationForLValue(unary->getSubExpr());
+        auto path = locations.at(base).accessPath;
+        path.push_back("*");
+        return addDerivedLocation(analysisKey + ":memory:deref:" + base, "dereference",
+                                  "*(" + locations.at(base).name + ")", expression->getType(),
+                                  base, std::move(path));
+      }
+      if (llvm::isa<clang::ArraySubscriptExpr>(expression)) {
+        incompleteReasons.insert("pointer_arithmetic_or_unknown_index");
+        return unknownKey;
+      }
+      incompleteReasons.insert("unknown_lvalue");
+      return unknownKey;
+    };
+
+    const auto cfgElementKey = [&](const clang::CFGBlock &block, unsigned index) {
+      return blockKey(block) + ":element:" + std::to_string(index);
+    };
+    std::map<const clang::Stmt *, std::pair<std::string, std::string>> statementAnchors;
+    std::vector<const clang::CFGBlock *> blocks(cfg.begin(), cfg.end());
+    std::sort(blocks.begin(), blocks.end(), [](const auto *left, const auto *right) {
+      return left->getBlockID() < right->getBlockID();
+    });
+    for (const auto *block : blocks) {
+      unsigned index = 0;
+      for (const auto &element : *block) {
+        if (const auto *statement = elementStatement(element))
+          statementAnchors.emplace(statement,
+                                   std::make_pair(blockKey(*block), cfgElementKey(*block, index)));
+        ++index;
+      }
+    }
+
+    const std::string entryBlockKey = blockKey(cfg.getEntry());
+    const auto addAccess = [&](const std::string &block, const std::string &element,
+                               const std::string &location, llvm::StringRef kind,
+                               const clang::Stmt *statement,
+                               const clang::Expr *assigned = nullptr) -> DataAccessRecord & {
+      const unsigned sequence = sequences[block]++;
+      std::string key = analysisKey + ":access:" + block + ":" +
+                        std::to_string(sequence) + ":" + kind.str() + ":" + location;
+      auto &records = accessesByBlock[block];
+      records.push_back(DataAccessRecord{key, block, element, location, kind.str(), sequence,
+                                         statement, assigned,
+                                         statement ? source_.source(statement->getSourceRange())
+                                                   : std::string{},
+                                         {}, true});
+      return records.back();
+    };
+
+    for (const auto *parameter : function->parameters()) {
+      const auto location = locationForDecl(parameter);
+      auto &access =
+          addAccess(entryBlockKey, "", location, "parameter_definition", nullptr);
+      if (locations.at(location).tracksPointsTo) {
+        access.pointsToComplete = false;
+        incompleteReasons.insert("external_parameter_points_to");
+      }
+    }
+    if (llvm::isa<clang::CXXMethodDecl>(function)) {
+      const auto thisKey = analysisKey + ":memory:this";
+      if (!locations.count(thisKey)) {
+        MemoryLocationRecord record{thisKey, "parameter", "this", "", "", "", {}, false,
+                                    false, true};
+        locations.emplace(thisKey, std::move(record));
+      }
+      addAccess(entryBlockKey, "", thisKey, "parameter_definition", nullptr);
+    }
+
+    std::function<void(const clang::Expr *, llvm::StringRef, const std::string &,
+                       const std::string &, const clang::Stmt *)>
+        addReads;
+    addReads = [&](const clang::Expr *raw, llvm::StringRef kind, const std::string &block,
+                   const std::string &element, const clang::Stmt *anchor) {
+      if (!raw)
+        return;
+      const auto *expression = raw->IgnoreParenImpCasts();
+      if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(expression)) {
+        handledExpressions.insert(expression);
+        if (llvm::isa<clang::FunctionDecl>(reference->getDecl()))
+          return;
+        if (const auto *value = llvm::dyn_cast<clang::ValueDecl>(reference->getDecl()))
+          addAccess(block, element, locationForDecl(value), kind, anchor);
+        return;
+      }
+      if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(expression)) {
+        handledExpressions.insert(expression);
+        if (llvm::isa<clang::FieldDecl>(member->getMemberDecl()))
+          addAccess(block, element, locationForLValue(member), kind, anchor);
+        addReads(member->getBase(), "read", block, element, anchor);
+        return;
+      }
+      if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(expression);
+          unary && unary->getOpcode() == clang::UO_Deref) {
+        handledExpressions.insert(expression);
+        addReads(unary->getSubExpr(), "read", block, element, anchor);
+        addAccess(block, element, locationForLValue(unary), kind, anchor);
+        return;
+      }
+      if (llvm::isa<clang::CXXReinterpretCastExpr>(expression))
+        incompleteReasons.insert("reinterpret_cast");
+      if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(expression);
+          binary && (binary->getOpcode() == clang::BO_Add ||
+                     binary->getOpcode() == clang::BO_Sub) &&
+          (binary->getLHS()->getType()->isPointerType() ||
+           binary->getRHS()->getType()->isPointerType()))
+        incompleteReasons.insert("pointer_arithmetic");
+      for (const auto *child : expression->children())
+        if (const auto *childExpression = llvm::dyn_cast_or_null<clang::Expr>(child))
+          addReads(childExpression, kind, block, element, anchor);
+    };
+
+    const auto returnLocation = [&]() {
+      const std::string key = analysisKey + ":memory:return";
+      if (!locations.count(key)) {
+        MemoryLocationRecord record{key, "return", "$return", "", "", "", {}, false,
+                                    false, tracksPointsTo(function->getReturnType())};
+        qualifyLocation(record, function->getReturnType());
+        locations.emplace(key, std::move(record));
+      }
+      return key;
+    };
+
+    for (const auto *block : blocks) {
+      const auto currentBlockKey = blockKey(*block);
+      unsigned elementIndex = 0;
+      for (const auto &element : *block) {
+        const auto *statement = elementStatement(element);
+        const auto elementKey = cfgElementKey(*block, elementIndex++);
+        if (!statement)
+          continue;
+        if (const auto *declaration = llvm::dyn_cast<clang::DeclStmt>(statement)) {
+          for (const auto *decl : declaration->decls()) {
+            const auto *variable = llvm::dyn_cast<clang::VarDecl>(decl);
+            if (!variable)
+              continue;
+            const auto location = locationForDecl(variable);
+            if (const auto *initializer = variable->getInit()) {
+              addReads(initializer, "read", currentBlockKey, elementKey, statement);
+              addAccess(currentBlockKey, elementKey, location, "initialization", statement,
+                        initializer);
+            } else {
+              auto &access = addAccess(currentBlockKey, elementKey, location, "initialization",
+                                       statement, nullptr);
+              access.pointsToComplete = !locations.at(location).tracksPointsTo;
+              if (locations.at(location).tracksPointsTo)
+                incompleteReasons.insert("uninitialized_pointer_or_reference");
+            }
+          }
+          continue;
+        }
+        if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(statement);
+            binary && binary->isAssignmentOp()) {
+          handledExpressions.insert(binary->getLHS()->IgnoreParenImpCasts());
+          const auto location = locationForLValue(binary->getLHS());
+          if (binary->isCompoundAssignmentOp())
+            addReads(binary->getLHS(), "read", currentBlockKey, elementKey, statement);
+          addReads(binary->getRHS(), "read", currentBlockKey, elementKey, statement);
+          addAccess(currentBlockKey, elementKey, location,
+                    binary->isCompoundAssignmentOp() ? "compound_assignment" : "assignment",
+                    statement, binary->getRHS());
+          continue;
+        }
+        if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(statement);
+            unary && unary->isIncrementDecrementOp()) {
+          handledExpressions.insert(unary->getSubExpr()->IgnoreParenImpCasts());
+          const auto location = locationForLValue(unary->getSubExpr());
+          addAccess(currentBlockKey, elementKey, location, "read", statement);
+          addAccess(currentBlockKey, elementKey, location,
+                    unary->isIncrementOp() ? "increment" : "decrement", statement);
+          continue;
+        }
+        if (const auto *returned = llvm::dyn_cast<clang::ReturnStmt>(statement)) {
+          addReads(returned->getRetValue(), "return_value", currentBlockKey, elementKey,
+                   statement);
+          addAccess(currentBlockKey, elementKey, returnLocation(), "assignment", statement,
+                    returned->getRetValue());
+          continue;
+        }
+        if (const auto *call = llvm::dyn_cast<clang::CallExpr>(statement)) {
+          for (const auto *argument : call->arguments())
+            addReads(argument, "call_argument", currentBlockKey, elementKey, statement);
+          if (!call->getType()->isVoidType()) {
+            const auto callLocation = addDerivedLocation(
+                analysisKey + ":memory:call-return:" +
+                    std::to_string(source_.offset(call->getExprLoc(), false)),
+                "return", "$call-return@" +
+                              std::to_string(source_.offset(call->getExprLoc(), false)),
+                call->getType(), "", {});
+            addAccess(currentBlockKey, elementKey, callLocation, "call_return", statement);
+          }
+          if (!call->getDirectCallee()) {
+            addReads(call->getCallee(), "read", currentBlockKey, elementKey, statement);
+            // Dependent templates have no concrete runtime callee expression yet;
+            // treating them as pointer calls overwrote their more precise reason.
+            if (!call->isTypeDependent() && !call->isValueDependent() &&
+                !call->getCallee()->isTypeDependent() &&
+                !call->getCallee()->isValueDependent())
+              indirectCalls.push_back(IndirectCallRecord{call, function, currentBlockKey,
+                                                         call->getCallee(),
+                                                         sequences[currentBlockKey]});
+          }
+          const auto *callee = call->getDirectCallee();
+          const bool effectFree = callee &&
+                                  (callee->hasAttr<clang::PureAttr>() ||
+                                   callee->hasAttr<clang::ConstAttr>());
+          bool escapingArgument = false;
+          unsigned argumentIndex = 0;
+          for (const auto *argument : call->arguments()) {
+            auto type = argument->getType();
+            if (type->isPointerType() ||
+                (type->isReferenceType() &&
+                 !type.getNonReferenceType().isConstQualified()))
+              escapingArgument = true;
+            const auto *stripped = argument->IgnoreParenImpCasts();
+            const clang::Expr *escapedStorage = nullptr;
+            if (const auto *address = llvm::dyn_cast<clang::UnaryOperator>(stripped);
+                address && address->getOpcode() == clang::UO_AddrOf)
+              escapedStorage = address->getSubExpr();
+            if (callee && argumentIndex < callee->getNumParams()) {
+              const auto parameterType = callee->getParamDecl(argumentIndex)->getType();
+              if (parameterType->isReferenceType() &&
+                  !parameterType.getNonReferenceType().isConstQualified())
+                escapedStorage = argument;
+            }
+            if (!effectFree && escapedStorage) {
+              const auto escapedLocation = locationForLValue(escapedStorage);
+              const auto found = locations.find(escapedLocation);
+              if (found != locations.end() && found->second.tracksPointsTo) {
+                auto &clobber = addAccess(currentBlockKey, elementKey, escapedLocation,
+                                          "unknown_clobber", statement);
+                clobber.pointsToComplete = false;
+              }
+            }
+            ++argumentIndex;
+          }
+          if (!effectFree &&
+              (escapingArgument || !callee || !source_.relative(callee->getLocation()))) {
+            addAccess(currentBlockKey, elementKey, unknownKey, "unknown_clobber", statement);
+            incompleteReasons.insert(escapingArgument ? "address_escape_or_unknown_call_effects"
+                                                      : "unknown_call_effects");
+          }
+          continue;
+        }
+        if (llvm::isa<clang::AsmStmt>(statement)) {
+          addAccess(currentBlockKey, elementKey, unknownKey, "unknown_clobber", statement);
+          incompleteReasons.insert("inline_assembly");
+        }
+      }
+      if (const auto *condition =
+              llvm::dyn_cast_or_null<clang::Expr>(block->getTerminatorCondition()))
+        addReads(condition, "condition", currentBlockKey, "", condition);
+    }
+
+    // AlwaysAdd puts leaf expressions in the CFG. Reads not owned by a definition,
+    // return, condition, or call still need an explicit fact, but covered leaves must
+    // not be duplicated.
+    for (const auto &[statement, anchor] : statementAnchors) {
+      const auto *expression = llvm::dyn_cast<clang::Expr>(statement);
+      if (!expression || handledExpressions.count(expression->IgnoreParenImpCasts()))
+        continue;
+      if (llvm::isa<clang::DeclRefExpr, clang::MemberExpr>(expression) ||
+          (llvm::isa<clang::UnaryOperator>(expression) &&
+           llvm::cast<clang::UnaryOperator>(expression)->getOpcode() == clang::UO_Deref))
+        addReads(expression, "read", anchor.first, anchor.second, statement);
+    }
+
+    std::map<std::string, const clang::CFGBlock *> keyToBlock;
+    std::map<std::string, std::vector<std::string>> predecessors;
+    for (const auto *block : blocks) {
+      const auto key = blockKey(*block);
+      keyToBlock[key] = block;
+      for (const auto &successor : block->succs()) {
+        if (const auto *target = successor.getReachableBlock())
+          predecessors[blockKey(*target)].push_back(key);
+      }
+    }
+    for (auto &[_, values] : predecessors) {
+      std::sort(values.begin(), values.end());
+      values.erase(std::unique(values.begin(), values.end()), values.end());
+    }
+
+    const auto capPointsTo = [&](PointsToValue &value) {
+      if (value.functions.size() + value.locations.size() <= kDataFlowMaxAliasTargets)
+        return;
+      incompleteReasons.insert("alias_target_cap_exceeded");
+      value.complete = false;
+      while (value.locations.size() > kDataFlowMaxAliasTargets)
+        value.locations.erase(std::prev(value.locations.end()));
+      const auto remaining = kDataFlowMaxAliasTargets - value.locations.size();
+      std::vector<const clang::FunctionDecl *> functions(value.functions.begin(),
+                                                          value.functions.end());
+      std::sort(functions.begin(), functions.end(), [&](const auto *left, const auto *right) {
+        const auto leftKind = llvm::isa<clang::CXXMethodDecl>(left) ? "method" : "function";
+        const auto rightKind = llvm::isa<clang::CXXMethodDecl>(right) ? "method" : "function";
+        return source_.declKey(left, leftKind) < source_.declKey(right, rightKind);
+      });
+      value.functions.clear();
+      value.functions.insert(functions.begin(), functions.begin() +
+                                                     std::min(remaining, functions.size()));
+    };
+
+    std::function<PointsToValue(const clang::Expr *, const DataFlowState &)> evaluatePointsTo;
+    evaluatePointsTo = [&](const clang::Expr *raw, const DataFlowState &state) -> PointsToValue {
+      if (!raw)
+        return PointsToValue{{}, {}, false};
+      const auto *expression = raw->IgnoreParenImpCasts();
+      if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(expression)) {
+        if (const auto *target = llvm::dyn_cast<clang::FunctionDecl>(reference->getDecl()))
+          return PointsToValue{{target}, {}, true};
+        if (const auto *value = llvm::dyn_cast<clang::ValueDecl>(reference->getDecl())) {
+          const auto location = locationForDecl(value);
+          if (const auto found = state.pointsTo.find(location); found != state.pointsTo.end())
+            return found->second;
+          if (!tracksPointsTo(value->getType()))
+            return PointsToValue{{}, {location}, true};
+          return PointsToValue{{}, {}, false};
+        }
+      }
+      if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(expression);
+          unary && unary->getOpcode() == clang::UO_AddrOf) {
+        const auto *operand = unary->getSubExpr()->IgnoreParenImpCasts();
+        if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(operand)) {
+          if (const auto *target = llvm::dyn_cast<clang::FunctionDecl>(reference->getDecl()))
+            return PointsToValue{{target}, {}, true};
+        }
+        if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(operand)) {
+          if (const auto *target = llvm::dyn_cast<clang::FunctionDecl>(member->getMemberDecl()))
+            return PointsToValue{{target}, {}, true};
+        }
+        return PointsToValue{{}, {locationForLValue(operand)}, true};
+      }
+      if (const auto *conditional = llvm::dyn_cast<clang::ConditionalOperator>(expression)) {
+        auto left = evaluatePointsTo(conditional->getTrueExpr(), state);
+        auto right = evaluatePointsTo(conditional->getFalseExpr(), state);
+        left.functions.insert(right.functions.begin(), right.functions.end());
+        left.locations.insert(right.locations.begin(), right.locations.end());
+        left.complete = left.complete && right.complete;
+        capPointsTo(left);
+        return left;
+      }
+      if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(expression);
+          binary && (binary->getOpcode() == clang::BO_PtrMemD ||
+                     binary->getOpcode() == clang::BO_PtrMemI))
+        return evaluatePointsTo(binary->getRHS(), state);
+      if (llvm::isa<clang::CXXNullPtrLiteralExpr, clang::GNUNullExpr>(expression) ||
+          (llvm::isa<clang::IntegerLiteral>(expression) &&
+           llvm::cast<clang::IntegerLiteral>(expression)->getValue() == 0))
+        return PointsToValue{{}, {}, true};
+      if (const auto *lambda = llvm::dyn_cast<clang::LambdaExpr>(expression))
+        return PointsToValue{{lambda->getCallOperator()}, {}, true};
+      if (llvm::isa<clang::CXXReinterpretCastExpr>(expression))
+        incompleteReasons.insert("reinterpret_cast");
+      if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(expression);
+          binary && (binary->getOpcode() == clang::BO_Add ||
+                     binary->getOpcode() == clang::BO_Sub))
+        incompleteReasons.insert("pointer_arithmetic");
+      return PointsToValue{{}, {}, false};
+    };
+
+    const auto isDefinition = [](llvm::StringRef kind) {
+      return kind == "parameter_definition" || kind == "initialization" ||
+             kind == "assignment" || kind == "compound_assignment" ||
+             kind == "increment" || kind == "decrement" || kind == "call_return" ||
+             kind == "unknown_clobber";
+    };
+    const auto transfer = [&](DataFlowState state,
+                              const std::vector<DataAccessRecord> &records) {
+      for (const auto &access : records) {
+        if (!isDefinition(access.kind))
+          continue;
+        state.definitions[access.locationKey] = {access.key};
+        const auto location = locations.find(access.locationKey);
+        if (location != locations.end() && location->second.tracksPointsTo) {
+          const bool referenceHandle =
+              (location->second.kind == "local" || location->second.kind == "parameter") &&
+              location->second.typeName.find('&') != std::string::npos;
+          if (referenceHandle && access.kind != "initialization" &&
+              access.kind != "parameter_definition" && access.kind != "unknown_clobber")
+            continue;
+          auto value = access.assignedExpression
+                           ? evaluatePointsTo(access.assignedExpression, state)
+                           : PointsToValue{{}, {}, access.pointsToComplete};
+          state.pointsTo[access.locationKey] = std::move(value);
+        }
+      }
+      return state;
+    };
+    const auto joinState = [&](const std::vector<std::string> &incoming,
+                               const std::map<std::string, DataFlowState> &outputs) {
+      DataFlowState joined;
+      std::vector<const DataFlowState *> states;
+      for (const auto &predecessor : incoming) {
+        const auto found = outputs.find(predecessor);
+        if (found != outputs.end())
+          states.push_back(&found->second);
+      }
+      std::set<std::string> pointLocations;
+      for (const auto *state : states) {
+        for (const auto &[location, definitions] : state->definitions)
+          joined.definitions[location].insert(definitions.begin(), definitions.end());
+        for (const auto &[location, _] : state->pointsTo)
+          pointLocations.insert(location);
+      }
+      for (const auto &location : pointLocations) {
+        PointsToValue destination;
+        for (const auto *state : states) {
+          const auto found = state->pointsTo.find(location);
+          if (found == state->pointsTo.end()) {
+            destination.complete = false;
+            continue;
+          }
+          destination.functions.insert(found->second.functions.begin(),
+                                       found->second.functions.end());
+          destination.locations.insert(found->second.locations.begin(),
+                                       found->second.locations.end());
+          destination.complete = destination.complete && found->second.complete;
+        }
+        capPointsTo(destination);
+        joined.pointsTo.emplace(location, std::move(destination));
+      }
+      return joined;
+    };
+
+    std::map<std::string, DataFlowState> inputs;
+    std::map<std::string, DataFlowState> outputs;
+    unsigned iterationCount = 0;
+    bool converged = false;
+    for (; iterationCount < kDataFlowMaxIterations; ++iterationCount) {
+      bool changed = false;
+      for (const auto *block : blocks) {
+        const auto key = blockKey(*block);
+        auto input = joinState(predecessors[key], outputs);
+        auto output = transfer(input, accessesByBlock[key]);
+        if (!inputs.count(key) || !(inputs[key] == input) || !outputs.count(key) ||
+            !(outputs[key] == output)) {
+          inputs[key] = std::move(input);
+          outputs[key] = std::move(output);
+          changed = true;
+        }
+      }
+      if (!changed) {
+        converged = true;
+        ++iterationCount;
+        break;
+      }
+    }
+    if (!converged)
+      incompleteReasons.insert("iteration_cap_exceeded");
+
+    std::set<std::string> emittedEvidence;
+    const auto emitAccessEvidence = [&](llvm::StringRef relation, llvm::StringRef certainty,
+                                        llvm::StringRef reason, const std::string &sourceAccess,
+                                        const std::string &targetAccess,
+                                        const clang::Stmt *statement) {
+      const std::string key = analysisKey + ":evidence:" + relation.str() + ":" +
+                              sourceAccess + ":" + targetAccess;
+      if (!emittedEvidence.insert(key).second)
+        return;
+      llvm::json::Object fact{{"fact", "data_flow_evidence_v1"},
+                              {"key", key},
+                              {"analysis_key", analysisKey},
+                              {"graph_key", graphKey},
+                              {"relation", relation.str()},
+                              {"certainty", certainty.str()},
+                              {"reason", reason.str()},
+                              {"source_access_key", sourceAccess},
+                              {"target_access_key", targetAccess}};
+      if (statement)
+        if (auto span = source_.span(statement->getSourceRange(), false))
+          fact["evidence_span"] = std::move(*span);
+      sink_.add("data-flow-evidence:" + key, std::move(fact));
+    };
+    const auto emitAliasEvidence = [&](llvm::StringRef relation, llvm::StringRef certainty,
+                                       llvm::StringRef reason, const std::string &sourceLocation,
+                                       const std::string &targetLocation,
+                                       const clang::Stmt *statement) {
+      const std::string key = analysisKey + ":evidence:" + relation.str() + ":" +
+                              sourceLocation + ":" + targetLocation;
+      if (!emittedEvidence.insert(key).second)
+        return;
+      llvm::json::Object fact{{"fact", "data_flow_evidence_v1"},
+                              {"key", key},
+                              {"analysis_key", analysisKey},
+                              {"graph_key", graphKey},
+                              {"relation", relation.str()},
+                              {"certainty", certainty.str()},
+                              {"reason", reason.str()},
+                              {"source_location_key", sourceLocation},
+                              {"target_location_key", targetLocation}};
+      if (statement)
+        if (auto span = source_.span(statement->getSourceRange(), false))
+          fact["evidence_span"] = std::move(*span);
+      sink_.add("data-flow-evidence:" + key, std::move(fact));
+    };
+
+    std::map<const clang::CallExpr *, PointsToValue> callValues;
+    for (const auto *block : blocks) {
+      const auto key = blockKey(*block);
+      DataFlowState state = inputs[key];
+      auto calls = std::vector<IndirectCallRecord>{};
+      for (const auto &call : indirectCalls)
+        if (call.blockKey == key)
+          calls.push_back(call);
+      std::sort(calls.begin(), calls.end(), [](const auto &left, const auto &right) {
+        return left.sequence < right.sequence;
+      });
+      std::size_t nextCall = 0;
+      for (auto &access : accessesByBlock[key]) {
+        while (nextCall < calls.size() && calls[nextCall].sequence <= access.sequence) {
+          callValues[calls[nextCall].expression] =
+              evaluatePointsTo(calls[nextCall].calleeExpression, state);
+          ++nextCall;
+        }
+        auto definitions = state.definitions[access.locationKey];
+        if (!isDefinition(access.kind)) {
+          const auto certainty = definitions.size() == 1 ? "certain" : "possible";
+          for (const auto &definition : definitions)
+            emitAccessEvidence("reaching_definition", certainty,
+                               definitions.size() == 1
+                                   ? "one definition reaches this use on every modeled path"
+                                   : "this definition reaches the use on at least one CFG path",
+                               definition, access.key, access.statement);
+        } else {
+          const auto certainty = definitions.size() == 1 ? "certain" : "possible";
+          for (const auto &definition : definitions)
+            emitAccessEvidence("overwrites", certainty,
+                               definitions.size() == 1
+                                   ? "this definition is the unique reaching prior value"
+                                   : "this definition is one of multiple reaching prior values",
+                               definition, access.key, access.statement);
+        }
+
+        const auto location = locations.find(access.locationKey);
+        if (location != locations.end() && !location->second.baseKey.empty() &&
+            location->second.kind == "dereference") {
+          const auto aliases = state.pointsTo.find(location->second.baseKey);
+          if (aliases != state.pointsTo.end()) {
+            const bool must = aliases->second.complete && aliases->second.locations.size() == 1;
+            for (const auto &target : aliases->second.locations)
+              emitAliasEvidence(must ? "must_alias" : "may_alias",
+                                must ? "certain" : "possible",
+                                must ? "a complete singleton points-to set identifies this storage"
+                                     : "the dereference may designate this storage",
+                                access.locationKey, target, access.statement);
+          }
+        }
+
+        if (isDefinition(access.kind)) {
+          state.definitions[access.locationKey] = {access.key};
+          if (location != locations.end() && location->second.tracksPointsTo) {
+            const bool referenceHandle =
+                (location->second.kind == "local" || location->second.kind == "parameter") &&
+                location->second.typeName.find('&') != std::string::npos;
+            if (referenceHandle && access.kind != "initialization" &&
+                access.kind != "parameter_definition" && access.kind != "unknown_clobber")
+              continue;
+            auto value = access.assignedExpression
+                             ? evaluatePointsTo(access.assignedExpression, state)
+                             : PointsToValue{{}, {}, access.pointsToComplete};
+            access.pointees.assign(value.functions.begin(), value.functions.end());
+            access.pointsToComplete = value.complete;
+            const bool must = value.complete && value.locations.size() == 1;
+            for (const auto &target : value.locations)
+              emitAliasEvidence(must ? "must_alias" : "may_alias",
+                                must ? "certain" : "possible",
+                                must ? "a complete singleton initializer aliases this storage"
+                                     : "this assignment may alias the target storage",
+                                access.locationKey, target, access.statement);
+            state.pointsTo[access.locationKey] = std::move(value);
+          }
+        }
+      }
+      while (nextCall < calls.size()) {
+        callValues[calls[nextCall].expression] =
+            evaluatePointsTo(calls[nextCall].calleeExpression, state);
+        ++nextCall;
+      }
+    }
+
+    for (const auto &call : indirectCalls) {
+      auto value = callValues[call.expression];
+      const auto range = call.expression->getSourceRange();
+      const auto ownerKind = symbolKind(call.owner).value_or("function");
+      const auto ownerKey = source_.declKey(call.owner, ownerKind);
+      const auto callsiteKey = "callsite:" + ownerKey + ":" +
+                               call.expression->getStmtClassName() + ":" +
+                               std::to_string(source_.offset(range.getBegin(), true)) + ":" +
+                               std::to_string(source_.offset(range.getBegin(), false)) + ":" +
+                               std::to_string(source_.offset(range.getEnd(), false));
+      const bool complete = value.complete;
+      sink_.add("callsite-resolution:" + callsiteKey,
+                {{"fact", "callsite_resolution_v1"},
+                 {"callsite_key", callsiteKey},
+                 {"target_set_complete", complete},
+                 {"unresolved_reason", complete ? "" : "points_to_set_incomplete"}});
+      const bool certain = complete && value.functions.size() == 1;
+      for (const auto *target : value.functions) {
+        if (!source_.relative(target->getLocation())) {
+          incompleteReasons.insert("external_indirect_target");
+          continue;
+        }
+        const auto targetKind = llvm::isa<clang::CXXMethodDecl>(target) ? "method" : "function";
+        emitSymbol(target, targetKind);
+        const auto targetKey = source_.declKey(target, targetKind);
+        sink_.add("call-target:data-flow:" + callsiteKey + ":" + targetKey,
+                  {{"fact", "call_target_v1"},
+                   {"callsite_key", callsiteKey},
+                   {"target_key", targetKey},
+                   {"certainty", certain ? "certain" : "possible"},
+                   {"confidence", certain ? 1.0 : 0.5},
+                   {"confidence_reason",
+                    certain
+                        ? "bounded data flow proved a complete singleton target set"
+                        : "target belongs to a non-singleton or incomplete points-to set; the "
+                          "value is deterministic ranking evidence, not a probability"},
+                   {"derivation", certain ? "intraprocedural_singleton_points_to"
+                                           : "intraprocedural_points_to_candidate"},
+                   {"evidence_span", std::move(*source_.span(range, false))}});
+      }
+    }
+
+    for (const auto &[key, location] : locations) {
+      llvm::json::Array accessPath;
+      for (const auto &component : location.accessPath)
+        accessPath.push_back(component);
+      llvm::json::Object fact{{"fact", "memory_location_v1"},
+                              {"key", key},
+                              {"analysis_key", analysisKey},
+                              {"graph_key", graphKey},
+                              {"kind", location.kind},
+                              {"name", location.name},
+                              {"type_name", location.typeName},
+                              {"access_path", std::move(accessPath)},
+                              {"is_volatile", location.isVolatile},
+                              {"is_atomic", location.isAtomic}};
+      if (!location.declarationKey.empty())
+        fact["declaration_key"] = location.declarationKey;
+      if (!location.baseKey.empty())
+        fact["base_key"] = location.baseKey;
+      sink_.add("memory-location:" + key, std::move(fact));
+    }
+    for (const auto &[block, records] : accessesByBlock) {
+      for (const auto &access : records) {
+        std::vector<std::string> sortedPointeeKeys;
+        for (const auto *pointee : access.pointees) {
+          const auto targetKind = llvm::isa<clang::CXXMethodDecl>(pointee) ? "method" : "function";
+          if (source_.relative(pointee->getLocation()))
+            sortedPointeeKeys.push_back(source_.declKey(pointee, targetKind));
+        }
+        std::sort(sortedPointeeKeys.begin(), sortedPointeeKeys.end());
+        llvm::json::Array pointeeKeys;
+        for (const auto &key : sortedPointeeKeys)
+          pointeeKeys.push_back(key);
+        llvm::json::Object fact{{"fact", "data_access_v1"},
+                                {"key", access.key},
+                                {"analysis_key", analysisKey},
+                                {"graph_key", graphKey},
+                                {"block_key", block},
+                                {"location_key", access.locationKey},
+                                {"kind", access.kind},
+                                {"sequence", static_cast<std::int64_t>(access.sequence)},
+                                {"expression", access.expression},
+                                {"pointee_keys", std::move(pointeeKeys)},
+                                {"points_to_complete", access.pointsToComplete}};
+        if (!access.elementKey.empty())
+          fact["cfg_element_key"] = access.elementKey;
+        if (access.statement)
+          if (auto span = source_.span(access.statement->getSourceRange(), false))
+            fact["span"] = std::move(*span);
+        sink_.add("data-access:" + access.key, std::move(fact));
+      }
+    }
+
+    llvm::json::Array reasons;
+    for (const auto &reason : incompleteReasons)
+      reasons.push_back(reason);
+    llvm::json::Object limits{{"max_iterations",
+                               static_cast<std::int64_t>(kDataFlowMaxIterations)},
+                              {"max_alias_targets",
+                               static_cast<std::int64_t>(kDataFlowMaxAliasTargets)},
+                              {"max_access_path_depth",
+                               static_cast<std::int64_t>(kDataFlowMaxAccessPathDepth)},
+                              {"max_locations",
+                               static_cast<std::int64_t>(kDataFlowMaxLocations)}};
+    sink_.add("data-flow-analysis:" + analysisKey,
+              {{"fact", "data_flow_analysis_v1"},
+               {"key", analysisKey},
+               {"graph_key", graphKey},
+               {"complete", incompleteReasons.empty()},
+               {"incomplete_reasons", std::move(reasons)},
+               {"iteration_count", static_cast<std::int64_t>(iterationCount)},
+               {"limits", std::move(limits)}});
   }
 
   static bool isRequiredImplicit(const clang::NamedDecl *decl) {

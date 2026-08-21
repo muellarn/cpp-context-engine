@@ -96,6 +96,45 @@ class CallTargetCertainty(StrEnum):
     POSSIBLE = "possible"
 
 
+class MemoryLocationKind(StrEnum):
+    """Compiler-normalized storage modeled by intraprocedural data flow."""
+
+    LOCAL = "local"
+    PARAMETER = "parameter"
+    GLOBAL = "global"
+    RETURN = "return"
+    DEREFERENCE = "dereference"
+    FIELD = "field"
+    UNKNOWN = "unknown"
+
+
+class DataAccessKind(StrEnum):
+    PARAMETER_DEFINITION = "parameter_definition"
+    INITIALIZATION = "initialization"
+    ASSIGNMENT = "assignment"
+    COMPOUND_ASSIGNMENT = "compound_assignment"
+    INCREMENT = "increment"
+    DECREMENT = "decrement"
+    CALL_RETURN = "call_return"
+    UNKNOWN_CLOBBER = "unknown_clobber"
+    READ = "read"
+    CALL_ARGUMENT = "call_argument"
+    RETURN_VALUE = "return_value"
+    CONDITION = "condition"
+
+
+class DataFlowRelation(StrEnum):
+    REACHING_DEFINITION = "reaching_definition"
+    OVERWRITES = "overwrites"
+    MUST_ALIAS = "must_alias"
+    MAY_ALIAS = "may_alias"
+
+
+class DataFlowCertainty(StrEnum):
+    CERTAIN = "certain"
+    POSSIBLE = "possible"
+
+
 @dataclass(frozen=True, slots=True)
 class SourceSpan:
     path: Path
@@ -399,6 +438,141 @@ class CallTarget:
             raise ValueError("call target confidence must be between zero and one")
         if not self.confidence_reason.strip() or not self.derivation.strip():
             raise ValueError("call targets require confidence and derivation evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class DataFlowAnalysis:
+    """One bounded fixed-point result for a concrete CFG graph."""
+
+    id: str
+    graph_id: str
+    complete: bool
+    incomplete_reasons: tuple[str, ...]
+    iteration_count: int
+    max_iterations: int
+    max_alias_targets: int
+    max_access_path_depth: int
+    max_locations: int
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.graph_id.strip():
+            raise ValueError("data-flow analysis identifiers must not be empty")
+        if self.iteration_count < 0:
+            raise ValueError("data-flow iteration count must be non-negative")
+        if (
+            min(
+                self.max_iterations,
+                self.max_alias_targets,
+                self.max_access_path_depth,
+                self.max_locations,
+            )
+            <= 0
+        ):
+            raise ValueError("data-flow limits must be positive")
+        reasons = tuple(
+            dict.fromkeys(reason.strip() for reason in self.incomplete_reasons if reason.strip())
+        )
+        if self.complete and reasons:
+            raise ValueError("complete data-flow analyses must not contain incomplete reasons")
+        if not self.complete and not reasons:
+            raise ValueError("incomplete data-flow analyses require an explicit reason")
+        object.__setattr__(self, "incomplete_reasons", reasons)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryLocation:
+    """A stable local storage/access-path identity within one analysis."""
+
+    id: str
+    analysis_id: str
+    graph_id: str
+    kind: MemoryLocationKind
+    name: str
+    type_name: str = ""
+    declaration_symbol_id: str | None = None
+    base_location_id: str | None = None
+    access_path: tuple[str, ...] = ()
+    is_volatile: bool = False
+    is_atomic: bool = False
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.analysis_id.strip() or not self.graph_id.strip():
+            raise ValueError("memory location identifiers must not be empty")
+        if not self.name.strip():
+            raise ValueError("memory locations require a display name")
+        if (
+            self.kind in {MemoryLocationKind.FIELD, MemoryLocationKind.DEREFERENCE}
+            and not self.base_location_id
+        ):
+            raise ValueError("field and dereference locations require a base location")
+
+
+@dataclass(frozen=True, slots=True)
+class DataAccess:
+    """One compiler-observed definition, use, or conservative clobber."""
+
+    id: str
+    analysis_id: str
+    graph_id: str
+    block_id: str
+    location_id: str
+    kind: DataAccessKind
+    sequence: int
+    cfg_element_id: str | None = None
+    span: SourceSpan | None = None
+    expression: str = ""
+    pointee_symbol_ids: tuple[str, ...] = ()
+    points_to_complete: bool = True
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        required = (self.id, self.analysis_id, self.graph_id, self.block_id, self.location_id)
+        if not all(value.strip() for value in required):
+            raise ValueError("data access identifiers must not be empty")
+        if self.sequence < 0:
+            raise ValueError("data access sequence must be non-negative")
+        pointees = tuple(
+            dict.fromkeys(item.strip() for item in self.pointee_symbol_ids if item.strip())
+        )
+        object.__setattr__(self, "pointee_symbol_ids", pointees)
+
+
+@dataclass(frozen=True, slots=True)
+class DataFlowEvidence:
+    """Evidence connecting accesses or aliasing storage locations."""
+
+    id: str
+    analysis_id: str
+    graph_id: str
+    relation: DataFlowRelation
+    certainty: DataFlowCertainty
+    reason: str
+    source_access_id: str | None = None
+    target_access_id: str | None = None
+    source_location_id: str | None = None
+    target_location_id: str | None = None
+    evidence_span: SourceSpan | None = None
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.analysis_id.strip() or not self.graph_id.strip():
+            raise ValueError("data-flow evidence identifiers must not be empty")
+        if not self.reason.strip():
+            raise ValueError("data-flow evidence requires a reason")
+        access_pair = self.source_access_id is not None and self.target_access_id is not None
+        location_pair = self.source_location_id is not None and self.target_location_id is not None
+        if access_pair == location_pair:
+            raise ValueError("data-flow evidence requires exactly one access or location pair")
 
 
 CfgFact = TypeVar("CfgFact")

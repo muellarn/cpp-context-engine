@@ -137,6 +137,10 @@ def index_project(config: AppConfig) -> IndexOperationResult:
             indexed_cfg_edges=sum(item.indexed_cfg_edges for item in results),
             indexed_callsites=sum(item.indexed_callsites for item in results),
             indexed_call_targets=sum(item.indexed_call_targets for item in results),
+            indexed_data_flow_analyses=sum(item.indexed_data_flow_analyses for item in results),
+            indexed_memory_locations=sum(item.indexed_memory_locations for item in results),
+            indexed_data_accesses=sum(item.indexed_data_accesses for item in results),
+            indexed_data_flow_evidence=sum(item.indexed_data_flow_evidence for item in results),
         )
         vector_search = SQLiteVectorSearch(
             store,
