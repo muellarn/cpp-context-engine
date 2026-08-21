@@ -8,6 +8,7 @@ import pytest
 
 from cpp_context_engine.analysis.interprocedural import (
     InterproceduralLimits,
+    _solve_variant,
     solve_interprocedural,
 )
 from cpp_context_engine.ingestion import (
@@ -69,6 +70,54 @@ def _summary(batch, name: str):
 
 def _effects(batch, summary):
     return [effect for effect in batch.summary_effects if effect.summary_id == summary.id]
+
+
+def test_solver_groups_local_facts_in_one_input_pass() -> None:
+    class CountingTuple(tuple):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    summaries = tuple(
+        FunctionSummary(
+            id=f"summary-{index}",
+            function_symbol_id=f"function-{index}",
+            graph_id=f"graph-{index}",
+            analysis_id=f"analysis-{index}",
+            parameter_modes=(),
+            parameter_location_ids=(),
+            local_complete=True,
+            local_incomplete_reasons=(),
+            complete=True,
+            incomplete_reasons=(),
+            recursive=False,
+            iteration_count=0,
+            max_scc_iterations=32,
+            max_scc_size=128,
+            max_summary_effects=1024,
+            translation_unit_id=f"tu-{index}",
+            build_configuration_id=f"configuration-{index}",
+        )
+        for index in range(20)
+    )
+    effects = CountingTuple()
+    origins = CountingTuple()
+
+    _solve_variant(
+        summaries,
+        effects,
+        origins,
+        (),
+        (),
+        (),
+        (),
+        InterproceduralLimits(),
+    )
+
+    assert effects.iterations == 1
+    assert origins.iterations == 1
 
 
 def test_body_variants_consume_only_their_own_callsites() -> None:
@@ -661,8 +710,8 @@ def test_v8_migration_is_atomic_and_forces_v7_native_reindex(
 
     monkeypatch.setattr(sqlite_module, "_execute_script", original)
     with SQLiteStore(database) as store:
-        assert SCHEMA_VERSION == 8
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 8  # noqa: SLF001
+        assert SCHEMA_VERSION == 10
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 10  # noqa: SLF001
         assert (
             store._connection.execute(
                 "SELECT advanced_facts_complete FROM translation_units"

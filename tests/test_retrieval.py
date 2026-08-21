@@ -71,9 +71,16 @@ def test_public_result_limit_reaches_search_adapters_before_expansion() -> None:
 class StoreStub:
     def __init__(self, symbols: Sequence[CodeSymbol]) -> None:
         self.symbols = {item.id: item for item in symbols}
+        self.bulk_calls: list[tuple[str, ...]] = []
 
     def get_symbol(self, symbol_id: str) -> CodeSymbol | None:
         return self.symbols.get(symbol_id)
+
+    def get_symbols(
+        self, symbol_ids: Sequence[str], *, build_scope: tuple[str, ...]
+    ) -> tuple[CodeSymbol | None, ...]:
+        self.bulk_calls.append(tuple(symbol_ids))
+        return tuple(self.symbols.get(symbol_id) for symbol_id in symbol_ids)
 
 
 class SourceStub:
@@ -274,11 +281,12 @@ def test_graph_hub_is_penalized_and_expansion_respects_node_budget() -> None:
     root = symbol("root")
     neighbors = [symbol(f"child-{index}") for index in range(20)]
     graph = GraphStub([GraphEdge("root", item.id, GraphRelation.REFERENCES) for item in neighbors])
+    store = StoreStub([root, *neighbors])
     retriever = HybridRetriever(
         lexical_search=SearchStub([root]),
         symbol_search=SearchStub([]),
         vector_search=SearchStub([]),
-        symbol_store=StoreStub([root, *neighbors]),
+        symbol_store=store,
         source_reader=SourceStub(),
         graph=graph,
         config=RetrievalConfig(
@@ -297,6 +305,7 @@ def test_graph_hub_is_penalized_and_expansion_respects_node_budget() -> None:
     assert all("hub degree 20" in item.reason for item in graph_items)
     assert all(item.hit.score < bundle.items[0].hit.score for item in graph_items)
     assert "graph expansion stopped at configured budget" in bundle.diagnostics
+    assert store.bulk_calls == [tuple(sorted(item.id for item in neighbors))]
 
 
 def test_graph_budget_selection_is_independent_of_adapter_edge_order() -> None:

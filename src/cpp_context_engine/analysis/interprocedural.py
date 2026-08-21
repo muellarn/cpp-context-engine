@@ -151,6 +151,8 @@ def _solve_variant(
     summaries_by_function: dict[str, list[FunctionSummary]] = defaultdict(list)
     for summary in summaries:
         summaries_by_function[summary.function_symbol_id].append(summary)
+    for bodies in summaries_by_function.values():
+        bodies.sort(key=lambda item: item.id)
     sites_by_owner: dict[tuple[str, str, str], list[CallSite]] = defaultdict(list)
     for site in callsites:
         sites_by_owner[
@@ -181,9 +183,7 @@ def _solve_variant(
     def callee_bodies(
         caller: FunctionSummary, target: CallTarget
     ) -> tuple[tuple[FunctionSummary, ...], bool]:
-        candidates = tuple(
-            sorted(summaries_by_function.get(target.target_symbol_id, ()), key=lambda item: item.id)
-        )
+        candidates = tuple(summaries_by_function.get(target.target_symbol_id, ()))
         same_tu = tuple(
             item
             for item in candidates
@@ -215,21 +215,20 @@ def _solve_variant(
         for member in component
     }
 
-    local_effect_map: dict[str, tuple[SummaryEffect, ...]] = defaultdict(tuple)
-    local_origin_map: dict[str, tuple[SummaryReturnOrigin, ...]] = defaultdict(tuple)
-    for summary in summaries:
-        local_effect_map[summary.id] = tuple(
-            sorted(
-                (item for item in local_effects if item.summary_id == summary.id),
-                key=lambda x: x.id,
-            )
-        )
-        local_origin_map[summary.id] = tuple(
-            sorted(
-                (item for item in local_origins if item.summary_id == summary.id),
-                key=lambda x: x.id,
-            )
-        )
+    effect_groups: dict[str, list[SummaryEffect]] = defaultdict(list)
+    origin_groups: dict[str, list[SummaryReturnOrigin]] = defaultdict(list)
+    for effect in local_effects:
+        effect_groups[effect.summary_id].append(effect)
+    for origin in local_origins:
+        origin_groups[origin.summary_id].append(origin)
+    local_effect_map = {
+        summary.id: tuple(sorted(effect_groups.get(summary.id, ()), key=lambda item: item.id))
+        for summary in summaries
+    }
+    local_origin_map = {
+        summary.id: tuple(sorted(origin_groups.get(summary.id, ()), key=lambda item: item.id))
+        for summary in summaries
+    }
 
     current_effects = dict(local_effect_map)
     current_origins = dict(local_origin_map)

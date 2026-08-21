@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from mcp import Client
 from pydantic import ValidationError
 
-from cpp_context_engine.api import CallRequest, CfgRequest, FlowRequest
+from cpp_context_engine.api import CallRequest, CfgRequest, FlowRequest, QueryRequest
 from cpp_context_engine.api.http import create_app
 from cpp_context_engine.cli import main
 from cpp_context_engine.config import AppConfig
@@ -370,6 +370,74 @@ def test_union_and_single_build_queries_are_bounded_and_evidence_ranked(tmp_path
     ]
     with pytest.raises(ValidationError):
         CfgRequest(function_symbol_id="cxx:analyze", max_edges=2_001)
+
+
+def test_every_public_union_query_respects_aggregate_limits(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = _config(project, tmp_path / "index.db")
+    _seed(config)
+
+    with build_runtime(config) as runtime:
+        context = runtime.query_context(
+            QueryRequest(
+                "analyze",
+                max_context_tokens=1_000,
+                builds=("alpha", "beta"),
+                max_results=1,
+            )
+        ).context
+        calls = runtime.analysis_service.calls(
+            CallRequest(
+                symbol_id="cxx:analyze",
+                direction=GraphDirection.OUTGOING,
+                builds=["alpha", "beta"],
+                max_results=1,
+            )
+        )
+        cfg = runtime.analysis_service.control_flow(
+            CfgRequest(
+                function_symbol_id="cxx:analyze",
+                builds=["alpha", "beta"],
+                max_graphs=1,
+                max_blocks=1,
+                max_elements=1,
+                max_edges=1,
+            )
+        )
+        flow = runtime.analysis_service.data_flow(
+            FlowRequest(
+                function_symbol_id="cxx:analyze",
+                builds=["alpha", "beta"],
+                max_analyses=1,
+                max_locations=1,
+                max_accesses=1,
+                max_evidence=1,
+            )
+        )
+
+    assert context.build_variants == ("alpha", "beta")
+    assert len(context.items) <= 1
+    assert context.estimated_tokens <= 1_000
+    assert calls.scope.kind == cfg.scope.kind == flow.scope.kind == "union"
+    assert len(calls.calls) <= 1
+    assert len(cfg.graphs) <= 1
+    assert sum(len(item.blocks) for item in cfg.graphs) <= 1
+    assert sum(len(item.elements) for item in cfg.graphs) <= 1
+    assert sum(len(item.edges) for item in cfg.graphs) <= 1
+    assert len(flow.analyses) <= 1
+    assert sum(len(item.locations) for item in flow.analyses) <= 1
+    assert sum(len(item.accesses) for item in flow.analyses) <= 1
+    assert (
+        sum(
+            len(item.evidence)
+            + len(item.effects)
+            + len(item.return_origins)
+            + len(item.interprocedural)
+            for item in flow.analyses
+        )
+        <= 1
+    )
 
 
 def test_exact_data_flow_budgets_do_not_report_truncation(tmp_path: Path) -> None:

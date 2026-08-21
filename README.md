@@ -107,6 +107,23 @@ for each build and labels every result with `build_variant` (and a stable
 `variant_id`). Reindexing one name removes stale translation units only from that
 variant. Remove a variant explicitly with `cpp-context remove-build NAME`.
 
+### Reading analysis evidence
+
+Call and flow results are evidence, not runtime proofs. On call edges, `certain`
+means Clang selected that target for the indexed build and call form; `possible`
+means the target is supported but not uniquely proven. `confidence` is a stable
+ranking signal, not a probability. `target_set_complete` applies to one callsite in
+one build: `false` means the world is open and additional runtime targets may
+exist. A bounded or truncated query is also never evidence that omitted targets do
+not exist.
+
+Data-flow `complete` flags cover only the analyzer's documented model and limits.
+Inspect `incomplete_reasons` and summary completeness before drawing conclusions,
+and keep separate build variants separate unless a union is intentional. See the
+[soundness and completeness matrix](docs/soundness-and-completeness.md) for dynamic
+loading, external code, assembly, undefined behavior, aliases, wrappers, registries,
+non-local jumps, and build-specific limitations.
+
 For a long-running MCP operator, configure paths with repeated `--build NAME=PATH`
 or `CPP_CONTEXT_BUILDS=debug=/path/debug/compile_commands.json,release=/path/release/compile_commands.json`.
 `CPP_CONTEXT_BUILD_SCOPE=debug,release` selects the server-visible union. MCP callers
@@ -201,6 +218,9 @@ paths, and one-based line ranges. Query length, build count, result/evidence cou
 graph depth/fanout, packed context, source size, and answer steps all have hard
 server-side limits. A tool may select only a subset of the operator-enabled build
 scope; omitting `builds` returns that scope and labels multi-build results as a union.
+For MCP call edges, interpret `certainty`, `confidence`, and `target_set_complete`
+with the evidence semantics above; in particular, confidence is ranking-only and
+an incomplete target set must not be treated as exhaustive.
 
 For Codex or another stdio-capable MCP client, add a local server using the generic
 command/environment shape below. The exact settings file or UI varies by client:
@@ -288,6 +308,12 @@ Without installing, use `PYTHONPATH=src python -m cpp_context_engine --help`.
 Pytest capture can be disabled with `pytest -s` on environments whose temporary
 directory is managed by an external cleanup process.
 
+The deterministic 100-translation-unit benchmark is local-only and is not part of
+GitHub Actions. Its generated project, SQLite index, and JSON report are disposable
+artifacts. See [Local benchmark methodology](docs/benchmarks/README.md) for the
+smoke command, budgets, recorded measurements, and the optional unexecuted
+1000-translation-unit profile.
+
 ## Architecture
 
 The package is split along the intended processing pipeline:
@@ -334,7 +360,9 @@ the store/service layer, stable CLI JSON, HTTP, and MCP. Certain call and flow
 evidence ranks before possible evidence without discarding the possible paths.
 
 See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,
-incremental behavior, libclang configuration, and current guarantees.
+incremental behavior, libclang configuration, and current guarantees. Analysis
+claims and open-world limits are summarized in the
+[soundness and completeness matrix](docs/soundness-and-completeness.md).
 
 ## Retrieval behavior
 

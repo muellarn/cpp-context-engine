@@ -325,7 +325,24 @@ class HybridRetriever:
             degree = len(relevant)
             if degree > self._config.per_node_edge_budget:
                 budget_exhausted = True
-            for edge in relevant[: self._config.per_node_edge_budget]:
+            limited_edges = relevant[: self._config.per_node_edge_budget]
+            prefetched: dict[tuple[str, str], CodeSymbol | None] = {}
+            if hasattr(self._symbol_store, "get_symbols"):
+                grouped: dict[str, list[str]] = defaultdict(list)
+                for edge in limited_edges:
+                    if edge.source_id == current.symbol.id:
+                        grouped[edge.build_variant].append(edge.target_id)
+                    elif edge.target_id == current.symbol.id:
+                        grouped[edge.build_variant].append(edge.source_id)
+                for build_variant, neighbor_ids in grouped.items():
+                    symbols = self._symbol_store.get_symbols(  # type: ignore[attr-defined]
+                        neighbor_ids, build_scope=(build_variant,)
+                    )
+                    prefetched.update(
+                        ((build_variant, symbol_id), symbol)
+                        for symbol_id, symbol in zip(neighbor_ids, symbols, strict=True)
+                    )
+            for edge in limited_edges:
                 if (
                     edge_count >= self._config.graph_edge_budget
                     or expanded_nodes >= self._config.graph_node_budget
@@ -343,12 +360,15 @@ class HybridRetriever:
                 if neighbor_key in visited:
                     continue
 
-                try:
-                    symbol = self._symbol_store.get_symbol(  # type: ignore[call-arg]
-                        neighbor_id, build_scope=(edge.build_variant,)
-                    )
-                except TypeError:
-                    symbol = self._symbol_store.get_symbol(neighbor_id)
+                if prefetched:
+                    symbol = prefetched.get((edge.build_variant, neighbor_id))
+                else:
+                    try:
+                        symbol = self._symbol_store.get_symbol(  # type: ignore[call-arg]
+                            neighbor_id, build_scope=(edge.build_variant,)
+                        )
+                    except TypeError:
+                        symbol = self._symbol_store.get_symbol(neighbor_id)
                 if symbol is None:
                     continue
                 neighbor_key = _evidence_key(symbol)

@@ -1,0 +1,130 @@
+{
+  "$id": "https://github.com/muellarn/cpp-context-engine/blob/main/docs/benchmarks/report-schema-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "all_budgets_passed": { "type": "boolean" },
+    "bounded_union_checks": {
+      "additionalProperties": { "type": "boolean" },
+      "minProperties": 4,
+      "type": "object"
+    },
+    "budget_results": {
+      "additionalProperties": { "type": "boolean" },
+      "minProperties": 5,
+      "type": "object"
+    },
+    "budgets": {
+      "additionalProperties": { "type": "number" },
+      "required": [
+        "cold_index_seconds",
+        "database_bytes",
+        "peak_rss_bytes",
+        "query_p95_seconds",
+        "warm_noop_seconds"
+      ],
+      "type": "object"
+    },
+    "environment": {
+      "additionalProperties": true,
+      "required": ["analyzer", "clang", "commit", "hardware", "llvm", "os", "python"],
+      "type": "object"
+    },
+    "fact_counts": {
+      "additionalProperties": { "minimum": 0, "type": "integer" },
+      "minProperties": 1,
+      "type": "object"
+    },
+    "generator_version": { "const": 1 },
+    "indexing": {
+      "additionalProperties": true,
+      "required": [
+        "advanced_facts_complete",
+        "analysis_backend",
+        "analyzer_capabilities",
+        "cold",
+        "header_reindex",
+        "warm"
+      ],
+      "type": "object"
+    },
+    "measured_at_utc": { "format": "date-time", "type": "string" },
+    "measurements": {
+      "additionalProperties": false,
+      "properties": {
+        "cold_index_seconds": { "minimum": 0, "type": "number" },
+        "database_bytes": { "minimum": 0, "type": "integer" },
+        "header_reindex_seconds": { "minimum": 0, "type": "number" },
+        "peak_rss_bytes": { "minimum": 0, "type": "integer" },
+        "queries": {
+          "additionalProperties": { "$ref": "#/$defs/queryDistribution" },
+          "minProperties": 5,
+          "type": "object"
+        },
+        "warm_noop_seconds": { "minimum": 0, "type": "number" }
+      },
+      "required": [
+        "cold_index_seconds",
+        "database_bytes",
+        "header_reindex_seconds",
+        "peak_rss_bytes",
+        "queries",
+        "warm_noop_seconds"
+      ],
+      "type": "object"
+    },
+    "profile": { "enum": ["custom", "reference", "smoke"] },
+    "schema": { "const": "cpp-context-benchmark-report" },
+    "schema_version": { "const": 1 },
+    "workload": {
+      "additionalProperties": false,
+      "properties": {
+        "builds": { "minimum": 1, "type": "integer" },
+        "functions_per_translation_unit": { "minimum": 1, "type": "integer" },
+        "seed": { "minimum": 0, "type": "integer" },
+        "source_hash": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+        "translation_units": { "minimum": 1, "type": "integer" }
+      },
+      "required": [
+        "builds",
+        "functions_per_translation_unit",
+        "seed",
+        "source_hash",
+        "translation_units"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "all_budgets_passed",
+    "bounded_union_checks",
+    "budget_results",
+    "budgets",
+    "environment",
+    "fact_counts",
+    "generator_version",
+    "indexing",
+    "measured_at_utc",
+    "measurements",
+    "profile",
+    "schema",
+    "schema_version",
+    "workload"
+  ],
+  "title": "C++ Context Engine benchmark report v1",
+  "type": "object",
+  "$defs": {
+    "queryDistribution": {
+      "additionalProperties": false,
+      "properties": {
+        "iterations": { "minimum": 1, "type": "integer" },
+        "max_items": { "minimum": 0, "type": "integer" },
+        "max_seconds": { "minimum": 0, "type": "number" },
+        "p50_seconds": { "minimum": 0, "type": "number" },
+        "p95_seconds": { "minimum": 0, "type": "number" }
+      },
+      "required": ["iterations", "max_items", "max_seconds", "p50_seconds", "p95_seconds"],
+      "type": "object"
+    }
+  }
+}

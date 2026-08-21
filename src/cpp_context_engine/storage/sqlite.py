@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import operator
 import re
 import sqlite3
 import struct
 from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -63,9 +65,32 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 MAX_CFG_PAGE_SIZE = 10_000
 MAX_CALL_PAGE_SIZE = 10_000
+_TRANSLATION_UNIT_DELETE_ORDER = (
+    "interprocedural_flows",
+    "call_argument_bindings",
+    "call_result_bindings",
+    "summary_effects",
+    "summary_return_origins",
+    "data_flow_evidence",
+    "call_targets",
+    "data_accesses",
+    "function_summaries",
+    "memory_locations",
+    "data_flow_analyses",
+    "cfg_edges",
+    "cfg_elements",
+    "cfg_blocks",
+    "cfg_graphs",
+    "callsites",
+    "occurrences",
+    "edges",
+    "symbol_variants",
+    "translation_unit_symbols",
+    "dependencies",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +123,9 @@ class SQLiteStore:
         # mode safely supports this read-heavy connection when the thread guard is off.
         self._connection = sqlite3.connect(path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
+        self._connection.create_function(
+            "_cpp_context_cosine", 4, _sqlite_cosine, deterministic=True
+        )
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._migrate()
@@ -330,6 +358,10 @@ class SQLiteStore:
             self._migrate_v7()
         if current <= 7:
             self._migrate_v8()
+        if current <= 8:
+            self._migrate_v9()
+        if current <= 9:
+            self._migrate_v10()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -1150,6 +1182,117 @@ class SQLiteStore:
         else:
             self._connection.commit()
 
+    def _migrate_v9(self) -> None:
+        """Index symbol refresh and translation-unit cascade lookup prefixes."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            indexes = (
+                (
+                    "symbol_variants_symbol_preference",
+                    "symbol_variants",
+                    "project_id, symbol_id, is_definition DESC, build_variant, translation_unit_id",
+                ),
+                ("edges_tu", "edges", "project_id, translation_unit_id"),
+                ("symbol_variants_tu", "symbol_variants", "project_id, translation_unit_id"),
+                ("cfg_blocks_tu", "cfg_blocks", "project_id, translation_unit_id"),
+                ("cfg_elements_tu", "cfg_elements", "project_id, translation_unit_id"),
+                ("cfg_edges_tu", "cfg_edges", "project_id, translation_unit_id"),
+                ("call_targets_tu", "call_targets", "project_id, translation_unit_id"),
+                (
+                    "data_flow_analyses_tu",
+                    "data_flow_analyses",
+                    "project_id, translation_unit_id",
+                ),
+                (
+                    "memory_locations_tu",
+                    "memory_locations",
+                    "project_id, translation_unit_id",
+                ),
+                ("data_accesses_tu", "data_accesses", "project_id, translation_unit_id"),
+                (
+                    "data_flow_evidence_tu",
+                    "data_flow_evidence",
+                    "project_id, translation_unit_id",
+                ),
+                (
+                    "function_summaries_tu",
+                    "function_summaries",
+                    "project_id, translation_unit_id",
+                ),
+            )
+            tables = {
+                row[0]
+                for row in self._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            for name, table, columns in indexes:
+                if table not in tables:
+                    continue
+                self._connection.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})")
+            # Parent deletes consult every child key. A missing prefix index turns
+            # changed-TU cascades into repeated full-table scans.
+            for table in sorted(tables):
+                foreign_keys: dict[int, list[tuple[int, str]]] = {}
+                for row in self._connection.execute(f"PRAGMA foreign_key_list({table})"):
+                    foreign_keys.setdefault(int(row[0]), []).append((int(row[1]), str(row[3])))
+                index_columns = [
+                    tuple(
+                        str(column[2])
+                        for column in self._connection.execute(f"PRAGMA index_info({index[1]})")
+                    )
+                    for index in self._connection.execute(f"PRAGMA index_list({table})")
+                ]
+                for key in foreign_keys.values():
+                    columns = tuple(column for _, column in sorted(key))
+                    if any(candidate[: len(columns)] == columns for candidate in index_columns):
+                        continue
+                    suffix = "_".join(columns)
+                    name = f"fk_lookup_{table}_{suffix}"
+                    if not all(
+                        value.replace("_", "").isalnum() for value in (table, name, *columns)
+                    ):
+                        raise RuntimeError("schema contains an unsafe foreign-key identifier")
+                    joined = ", ".join(columns)
+                    self._connection.execute(
+                        f"CREATE INDEX IF NOT EXISTS {name} ON {table}({joined})"
+                    )
+                    index_columns.append(columns)
+            self._connection.execute("PRAGMA user_version = 9")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _migrate_v10(self) -> None:
+        """Remove the obsolete duplicate symbol snapshot from TU membership rows."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            table = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'translation_unit_symbols'"
+            ).fetchone()
+            if table is not None:
+                columns = {
+                    row[1]
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(translation_unit_symbols)"
+                    )
+                }
+                if "snapshot_json" in columns:
+                    self._connection.execute(
+                        "ALTER TABLE translation_unit_symbols DROP COLUMN snapshot_json"
+                    )
+            self._connection.execute("PRAGMA user_version = 10")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
     def _rebuild_variant_fts(self) -> None:
         self._connection.execute("DELETE FROM symbol_variant_fts")
         rows = self._connection.execute(
@@ -1195,6 +1338,10 @@ class SQLiteStore:
             if batch.build_variants
             else BuildVariant(DEFAULT_BUILD_VARIANT, Path("."))
         )
+        # Canonical symbols are derived once from the newly inserted variants at
+        # the end of this transaction. Deferral keeps child fact insertion valid
+        # without a redundant provisional canonical-symbol write pass.
+        self._connection.execute("PRAGMA defer_foreign_keys = ON")
         with self._connection:
             project_id = self._ensure_project(root)
             self._put_build_variant(project_id, selected_variant)
@@ -1282,24 +1429,23 @@ class SQLiteStore:
                     ),
                 )
 
-            for symbol in batch.symbols:
-                self._put_symbol(project_id, symbol)
+            symbols = tuple(batch.symbols)
+            for symbol in symbols:
                 self._connection.execute(
                     """
                     INSERT OR IGNORE INTO translation_unit_symbols(
                         project_id, translation_unit_id, symbol_id,
-                        is_definition, snapshot_json
-                    ) VALUES (?, ?, ?, ?, ?)
+                        is_definition
+                    ) VALUES (?, ?, ?, ?)
                     """,
                     (
                         project_id,
                         symbol.translation_unit_id,
                         symbol.id,
                         int(bool(symbol.metadata.get("is_definition"))),
-                        self._symbol_snapshot(symbol),
                     ),
                 )
-                self._put_symbol_variant(project_id, symbol)
+            self._put_symbol_variants(project_id, symbols)
             self._put_occurrences(project_id, batch.occurrences)
             self._put_edges(project_id, batch.edges)
             self._put_cfg_facts(
@@ -1496,9 +1642,30 @@ class SQLiteStore:
             """,
             (project_id, project_id, *ids),
         )
-        self._connection.executemany(
-            "DELETE FROM translation_units WHERE project_id = ? AND id = ?",
-            ((project_id, unit_id) for unit_id in ids),
+        self._connection.execute(
+            f"""
+            DELETE FROM variant_embeddings
+            WHERE project_id = ? AND variant_id IN (
+                SELECT id FROM symbol_variants
+                WHERE project_id = ? AND translation_unit_id IN ({placeholders})
+            )
+            """,
+            (project_id, project_id, *ids),
+        )
+        # Delete leaf facts in bulk before their parents. Letting SQLite walk
+        # several overlapping ON DELETE CASCADE paths per TU scaled superlinearly
+        # for a shared-header reindex of the measured 200-TU smoke workload.
+        for table in _TRANSLATION_UNIT_DELETE_ORDER:
+            self._connection.execute(
+                f"""
+                DELETE FROM {table}
+                WHERE project_id = ? AND translation_unit_id IN ({placeholders})
+                """,
+                (project_id, *ids),
+            )
+        self._connection.execute(
+            f"DELETE FROM translation_units WHERE project_id = ? AND id IN ({placeholders})",
+            (project_id, *ids),
         )
         self._delete_orphans(project_id)
 
@@ -1588,6 +1755,19 @@ class SQLiteStore:
                 source_text = excluded.source_text,
                 build_configuration_id = excluded.build_configuration_id,
                 metadata_json = excluded.metadata_json
+            WHERE symbols.qualified_name IS NOT excluded.qualified_name
+               OR symbols.kind IS NOT excluded.kind
+               OR symbols.path IS NOT excluded.path
+               OR symbols.start_line IS NOT excluded.start_line
+               OR symbols.end_line IS NOT excluded.end_line
+               OR symbols.start_column IS NOT excluded.start_column
+               OR symbols.end_column IS NOT excluded.end_column
+               OR symbols.signature IS NOT excluded.signature
+               OR symbols.documentation IS NOT excluded.documentation
+               OR symbols.source_hash IS NOT excluded.source_hash
+               OR symbols.source_text IS NOT excluded.source_text
+               OR symbols.build_configuration_id IS NOT excluded.build_configuration_id
+               OR symbols.metadata_json IS NOT excluded.metadata_json
             """,
             (
                 project_id,
@@ -1605,6 +1785,99 @@ class SQLiteStore:
                 symbol.source_text,
                 symbol.build_configuration_id,
                 json.dumps(dict(symbol.metadata), sort_keys=True),
+            ),
+        )
+
+    def _put_canonical_symbols(
+        self,
+        project_id: int,
+        symbols: Iterable[CodeSymbol],
+        *,
+        prefer_definition: bool = True,
+    ) -> None:
+        """Upsert canonical symbols without one preference query per symbol."""
+
+        selected = tuple(symbols)
+        existing_definitions: set[str] = set()
+        if prefer_definition:
+            ids = sorted({symbol.id for symbol in selected})
+            for offset in range(0, len(ids), 500):
+                chunk = ids[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                existing_definitions.update(
+                    row["id"]
+                    for row in self._connection.execute(
+                        f"""
+                        SELECT id FROM symbols
+                        WHERE project_id = ? AND id IN ({placeholders})
+                          AND json_extract(metadata_json, '$.is_definition') = 1
+                        """,
+                        (project_id, *chunk),
+                    )
+                )
+        rows = (
+            symbol
+            for symbol in selected
+            if not (
+                prefer_definition
+                and symbol.id in existing_definitions
+                and not symbol.metadata.get("is_definition")
+            )
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO symbols(
+                project_id, id, qualified_name, kind, path, start_line, end_line,
+                start_column, end_column, signature, documentation, source_hash,
+                source_text, build_configuration_id, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, id) DO UPDATE SET
+                qualified_name = excluded.qualified_name,
+                kind = excluded.kind,
+                path = excluded.path,
+                start_line = excluded.start_line,
+                end_line = excluded.end_line,
+                start_column = excluded.start_column,
+                end_column = excluded.end_column,
+                signature = excluded.signature,
+                documentation = excluded.documentation,
+                source_hash = excluded.source_hash,
+                source_text = excluded.source_text,
+                build_configuration_id = excluded.build_configuration_id,
+                metadata_json = excluded.metadata_json
+            WHERE symbols.qualified_name IS NOT excluded.qualified_name
+               OR symbols.kind IS NOT excluded.kind
+               OR symbols.path IS NOT excluded.path
+               OR symbols.start_line IS NOT excluded.start_line
+               OR symbols.end_line IS NOT excluded.end_line
+               OR symbols.start_column IS NOT excluded.start_column
+               OR symbols.end_column IS NOT excluded.end_column
+               OR symbols.signature IS NOT excluded.signature
+               OR symbols.documentation IS NOT excluded.documentation
+               OR symbols.source_hash IS NOT excluded.source_hash
+               OR symbols.source_text IS NOT excluded.source_text
+               OR symbols.build_configuration_id IS NOT excluded.build_configuration_id
+               OR symbols.metadata_json IS NOT excluded.metadata_json
+            """,
+            (
+                (
+                    project_id,
+                    symbol.id,
+                    symbol.qualified_name,
+                    symbol.kind.value,
+                    str(symbol.span.path),
+                    symbol.span.start_line,
+                    symbol.span.end_line,
+                    symbol.span.start_column,
+                    symbol.span.end_column,
+                    symbol.signature,
+                    symbol.documentation,
+                    symbol.source_hash,
+                    symbol.source_text,
+                    symbol.build_configuration_id,
+                    json.dumps(dict(symbol.metadata), sort_keys=True),
+                )
+                for symbol in rows
             ),
         )
 
@@ -1659,43 +1932,70 @@ class SQLiteStore:
         )
 
     def _put_symbol_variant(self, project_id: int, symbol: CodeSymbol) -> None:
-        variant_id = symbol.variant_id or _stable_id(
-            "variant", symbol.build_variant, symbol.translation_unit_id, symbol.id
-        )
-        snapshot = self._symbol_snapshot(
-            CodeSymbol(
-                id=symbol.id,
-                qualified_name=symbol.qualified_name,
-                kind=symbol.kind,
-                span=symbol.span,
-                signature=symbol.signature,
-                documentation=symbol.documentation,
-                source_hash=symbol.source_hash,
-                source_text=symbol.source_text,
-                build_configuration_id=symbol.build_configuration_id,
-                translation_unit_id=symbol.translation_unit_id,
-                build_variant=symbol.build_variant,
-                variant_id=variant_id,
-                metadata=symbol.metadata,
+        self._put_symbol_variants(project_id, (symbol,))
+
+    def _put_symbol_variants(self, project_id: int, symbols: Iterable[CodeSymbol]) -> None:
+        records: list[tuple[CodeSymbol, str, str]] = []
+        for symbol in symbols:
+            variant_id = symbol.variant_id or _stable_id(
+                "variant", symbol.build_variant, symbol.translation_unit_id, symbol.id
             )
-        )
-        existing = self._connection.execute(
-            """
-            SELECT snapshot_json FROM symbol_variants
-            WHERE project_id = ? AND id = ?
-            """,
-            (project_id, variant_id),
-        ).fetchone()
-        if existing is not None and existing["snapshot_json"] != snapshot:
+            snapshot = self._symbol_snapshot(
+                CodeSymbol(
+                    id=symbol.id,
+                    qualified_name=symbol.qualified_name,
+                    kind=symbol.kind,
+                    span=symbol.span,
+                    signature=symbol.signature,
+                    documentation=symbol.documentation,
+                    source_hash=symbol.source_hash,
+                    source_text=symbol.source_text,
+                    build_configuration_id=symbol.build_configuration_id,
+                    translation_unit_id=symbol.translation_unit_id,
+                    build_variant=symbol.build_variant,
+                    variant_id=variant_id,
+                    metadata=symbol.metadata,
+                )
+            )
+            records.append((symbol, variant_id, snapshot))
+        existing: dict[str, str] = {}
+        variant_ids = [variant_id for _, variant_id, _ in records]
+        for offset in range(0, len(variant_ids), 500):
+            chunk = variant_ids[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            existing.update(
+                (row["id"], row["snapshot_json"])
+                for row in self._connection.execute(
+                    f"""
+                    SELECT id, snapshot_json FROM symbol_variants
+                    WHERE project_id = ? AND id IN ({placeholders})
+                    """,
+                    (project_id, *chunk),
+                )
+            )
             self._connection.execute(
-                "DELETE FROM variant_embeddings WHERE project_id = ? AND variant_id = ?",
-                (project_id, variant_id),
+                f"""
+                DELETE FROM symbol_variant_fts
+                WHERE project_id = ? AND variant_id IN ({placeholders})
+                """,
+                (project_id, *chunk),
             )
-        self._connection.execute(
-            "DELETE FROM symbol_variant_fts WHERE project_id = ? AND variant_id = ?",
-            (project_id, variant_id),
-        )
-        self._connection.execute(
+        changed = [
+            variant_id
+            for _, variant_id, snapshot in records
+            if variant_id in existing and existing[variant_id] != snapshot
+        ]
+        for offset in range(0, len(changed), 500):
+            chunk = changed[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            self._connection.execute(
+                f"""
+                DELETE FROM variant_embeddings
+                WHERE project_id = ? AND variant_id IN ({placeholders})
+                """,
+                (project_id, *chunk),
+            )
+        self._connection.executemany(
             """
             INSERT INTO symbol_variants(
                 project_id, id, symbol_id, build_variant, build_configuration_id,
@@ -1710,17 +2010,20 @@ class SQLiteStore:
                 snapshot_json = excluded.snapshot_json
             """,
             (
-                project_id,
-                variant_id,
-                symbol.id,
-                symbol.build_variant,
-                symbol.build_configuration_id,
-                symbol.translation_unit_id,
-                int(bool(symbol.metadata.get("is_definition"))),
-                snapshot,
+                (
+                    project_id,
+                    variant_id,
+                    symbol.id,
+                    symbol.build_variant,
+                    symbol.build_configuration_id,
+                    symbol.translation_unit_id,
+                    int(bool(symbol.metadata.get("is_definition"))),
+                    snapshot,
+                )
+                for symbol, variant_id, snapshot in records
             ),
         )
-        self._connection.execute(
+        self._connection.executemany(
             """
             INSERT INTO symbol_variant_fts(
                 project_id, variant_id, symbol_id, build_variant,
@@ -1728,34 +2031,37 @@ class SQLiteStore:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                project_id,
-                variant_id,
-                symbol.id,
-                symbol.build_variant,
-                symbol.qualified_name,
-                symbol.signature,
-                symbol.documentation,
-                symbol.source_text,
+                (
+                    project_id,
+                    variant_id,
+                    symbol.id,
+                    symbol.build_variant,
+                    symbol.qualified_name,
+                    symbol.signature,
+                    symbol.documentation,
+                    symbol.source_text,
+                )
+                for symbol, variant_id, _ in records
             ),
         )
 
     def _refresh_symbols(self, project_id: int, symbol_ids: set[str]) -> None:
-        for symbol_id in symbol_ids:
-            row = self._connection.execute(
-                """
-                SELECT snapshot_json FROM symbol_variants
-                WHERE project_id = ? AND symbol_id = ?
-                ORDER BY is_definition DESC, build_variant, translation_unit_id
-                LIMIT 1
+        preferred: dict[str, CodeSymbol] = {}
+        ids = sorted(symbol_ids)
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self._connection.execute(
+                f"""
+                SELECT symbol_id, snapshot_json FROM symbol_variants
+                WHERE project_id = ? AND symbol_id IN ({placeholders})
+                ORDER BY symbol_id, is_definition DESC, build_variant, translation_unit_id
                 """,
-                (project_id, symbol_id),
-            ).fetchone()
-            if row is not None:
-                self._put_symbol(
-                    project_id,
-                    self._snapshot_symbol(row["snapshot_json"]),
-                    prefer_definition=False,
-                )
+                (project_id, *chunk),
+            ):
+                if row["symbol_id"] not in preferred:
+                    preferred[row["symbol_id"]] = self._snapshot_symbol(row["snapshot_json"])
+        self._put_canonical_symbols(project_id, preferred.values(), prefer_definition=False)
 
     def _put_occurrences(self, project_id: int, occurrences: Iterable[SymbolOccurrence]) -> None:
         self._connection.executemany(
@@ -2400,9 +2706,24 @@ class SQLiteStore:
     ) -> int:
         if not affected_functions:
             return 0
-        selected_functions = self._forward_summary_callees(
-            project_id, build_variant, affected_functions
-        )
+        indexed_functions = {
+            row[0]
+            for row in self._connection.execute(
+                """
+                SELECT DISTINCT function_symbol_id FROM function_summaries
+                WHERE project_id = ? AND build_variant = ?
+                """,
+                (project_id, build_variant),
+            )
+        }
+        if indexed_functions <= affected_functions:
+            # A full build/header reindex already includes every indexed callee;
+            # walking the same call graph again only repeats thousands of lookups.
+            selected_functions = indexed_functions
+        else:
+            selected_functions = self._forward_summary_callees(
+                project_id, build_variant, affected_functions
+            )
         placeholders = ",".join("?" for _ in selected_functions)
         summary_rows = self._connection.execute(
             f"""
@@ -2819,6 +3140,68 @@ class SQLiteStore:
             "SELECT * FROM symbols WHERE project_id = ? AND id = ?", (project_id, symbol_id)
         ).fetchone()
         return self._row_to_symbol(canonical) if canonical else None
+
+    def get_symbols(
+        self,
+        symbol_ids: Iterable[str],
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> tuple[CodeSymbol | None, ...]:
+        """Resolve symbols in bounded SQL batches while preserving input order."""
+
+        requested = tuple(symbol_ids)
+        if not requested:
+            return ()
+        try:
+            project_id = self._project_id(project_root)
+        except KeyError:
+            return tuple(None for _ in requested)
+        names = self._scope_names(build_scope)
+        scope_placeholders = ",".join("?" for _ in names)
+        resolved: dict[str, CodeSymbol] = {}
+        unique_ids = sorted(set(requested))
+        for offset in range(0, len(unique_ids), 400):
+            chunk = unique_ids[offset : offset + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._connection.execute(
+                f"""
+                SELECT * FROM symbol_variants
+                WHERE project_id = ? AND build_variant IN ({scope_placeholders})
+                  AND (id IN ({placeholders}) OR symbol_id IN ({placeholders}))
+                ORDER BY is_definition DESC, build_variant, translation_unit_id, id
+                """,
+                (project_id, *names, *chunk, *chunk),
+            )
+            chunk_ids = set(chunk)
+            canonical_matches: dict[str, CodeSymbol] = {}
+            exact_matches: dict[str, CodeSymbol] = {}
+            for row in rows:
+                symbol = self._variant_row_to_symbol(row)
+                if row["id"] in chunk_ids:
+                    exact_matches[row["id"]] = symbol
+                if row["symbol_id"] in chunk_ids:
+                    canonical_matches.setdefault(row["symbol_id"], symbol)
+            resolved.update(canonical_matches)
+            # A variant ID is an exact identity; it must win even in the
+            # pathological case where it equals another symbol's canonical ID.
+            resolved.update(exact_matches)
+        missing = [symbol_id for symbol_id in unique_ids if symbol_id not in resolved]
+        if DEFAULT_BUILD_VARIANT in names:
+            for offset in range(0, len(missing), 500):
+                chunk = missing[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                resolved.update(
+                    (row["id"], self._row_to_symbol(row))
+                    for row in self._connection.execute(
+                        f"""
+                        SELECT * FROM symbols
+                        WHERE project_id = ? AND id IN ({placeholders})
+                        """,
+                        (project_id, *chunk),
+                    )
+                )
+        return tuple(resolved.get(symbol_id) for symbol_id in requested)
 
     def put_symbols(self, symbols: Iterable[CodeSymbol]) -> None:
         project_id = self._project_id()
@@ -3939,6 +4322,91 @@ class SQLiteStore:
                 (project_id, variant_id, model, len(normalized), magnitude, encoded),
             )
 
+    def put_embeddings(
+        self,
+        entries: Iterable[tuple[str, Sequence[float]]],
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> None:
+        """Validate and persist one embedding batch in a single transaction."""
+
+        project_id = self._project_id(project_root)
+        dimensions = {
+            row[0]
+            for row in self._connection.execute(
+                """
+                SELECT DISTINCT dimensions FROM variant_embeddings
+                WHERE project_id = ? AND model = ?
+                """,
+                (project_id, model),
+            )
+        }
+        selected_entries = tuple(entries)
+        variant_ids = {symbol_id for symbol_id, _ in selected_entries}
+        exact_variants: set[str] = set()
+        names = self._scope_names(build_scope)
+        scope_placeholders = ",".join("?" for _ in names)
+        ordered_ids = sorted(variant_ids)
+        for offset in range(0, len(ordered_ids), 500):
+            chunk = ordered_ids[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            exact_variants.update(
+                row[0]
+                for row in self._connection.execute(
+                    f"""
+                    SELECT id FROM symbol_variants
+                    WHERE project_id = ? AND build_variant IN ({scope_placeholders})
+                      AND id IN ({placeholders})
+                    """,
+                    (project_id, *names, *chunk),
+                )
+            )
+        resolved: dict[str, str] = {variant_id: variant_id for variant_id in exact_variants}
+        for symbol_id in variant_ids - exact_variants:
+            symbol = self.get_symbol(symbol_id, project_root, build_scope=build_scope)
+            if symbol is None or not symbol.variant_id:
+                raise KeyError(f"symbol variant is not indexed: {symbol_id}")
+            resolved[symbol_id] = symbol.variant_id
+
+        rows: list[tuple[object, ...]] = []
+        expected_dimensions = next(iter(dimensions)) if dimensions else None
+        for symbol_id, vector in selected_entries:
+            normalized = _validate_vector(vector)
+            if expected_dimensions is None:
+                expected_dimensions = len(normalized)
+            if len(normalized) != expected_dimensions:
+                raise ValueError(
+                    f"embedding model {model!r} already uses dimension "
+                    f"{expected_dimensions}, not {len(normalized)}"
+                )
+            magnitude = math.sqrt(sum(value * value for value in normalized))
+            encoded = struct.pack(f"<{len(normalized)}d", *normalized)
+            rows.append(
+                (
+                    project_id,
+                    resolved[symbol_id],
+                    model,
+                    len(normalized),
+                    magnitude,
+                    encoded,
+                )
+            )
+        with self._connection:
+            self._connection.executemany(
+                """
+                INSERT INTO variant_embeddings(
+                    project_id, variant_id, model, dimensions, magnitude, vector
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, variant_id, model) DO UPDATE SET
+                    dimensions = excluded.dimensions,
+                    magnitude = excluded.magnitude,
+                    vector = excluded.vector
+                """,
+                rows,
+            )
+
     def missing_embedding_symbol_ids(
         self,
         model: str,
@@ -4043,9 +4511,13 @@ class SQLiteStore:
                 f"query dimension {len(query_vector)} does not match model {model!r} "
                 f"dimension {next(iter(dimensions))}"
             )
-        rows = self._connection.execute(
+        query_blob = struct.pack(f"<{len(query_vector)}d", *query_vector)
+        selected = self._connection.execute(
             f"""
-            SELECT embeddings.*, variants.*
+            SELECT variants.id, variants.build_variant,
+                   _cpp_context_cosine(
+                       embeddings.vector, embeddings.magnitude, ?, ?
+                   ) AS score
             FROM variant_embeddings embeddings
             JOIN symbol_variants variants
               ON variants.project_id = embeddings.project_id
@@ -4053,19 +4525,21 @@ class SQLiteStore:
             WHERE embeddings.project_id = ? AND embeddings.model = ?
               AND embeddings.dimensions = ?
               AND variants.build_variant IN ({placeholders})
+            ORDER BY score DESC, variants.build_variant, variants.id
+            LIMIT ?
             """,
-            (project_id, model, len(query_vector), *names),
+            (query_blob, query_magnitude, project_id, model, len(query_vector), *names, limit),
+        ).fetchall()
+        symbols = self.get_symbols(
+            (row["id"] for row in selected),
+            project_root,
+            build_scope=build_scope,
         )
-        scored: list[SearchHit] = []
-        for row in rows:
-            candidate = struct.unpack(f"<{row['dimensions']}d", row["vector"])
-            dot_product = sum(
-                left * right for left, right in zip(query_vector, candidate, strict=True)
-            )
-            cosine = dot_product / (query_magnitude * row["magnitude"])
-            scored.append(SearchHit(self._variant_row_to_symbol(row), cosine, f"vector:{model}"))
-        scored.sort(key=lambda hit: (-hit.score, hit.symbol.build_variant, hit.symbol.variant_id))
-        return tuple(scored[:limit])
+        return tuple(
+            SearchHit(symbol, row["score"], f"vector:{model}")
+            for row, symbol in zip(selected, symbols, strict=True)
+            if symbol is not None
+        )
 
 
 def _validate_vector(vector: Sequence[float]) -> tuple[float, ...]:
@@ -4077,6 +4551,22 @@ def _validate_vector(vector: Sequence[float]) -> tuple[float, ...]:
     if not any(value != 0.0 for value in values):
         raise ValueError("embedding vector magnitude must be greater than zero")
     return values
+
+
+@lru_cache(maxsize=128)
+def _decode_vector_blob(blob: bytes) -> tuple[float, ...]:
+    return struct.unpack(f"<{len(blob) // 8}d", blob)
+
+
+def _sqlite_cosine(
+    candidate_blob: bytes,
+    candidate_magnitude: float,
+    query_blob: bytes,
+    query_magnitude: float,
+) -> float:
+    return sum(
+        map(operator.mul, _decode_vector_blob(candidate_blob), _decode_vector_blob(query_blob))
+    ) / (candidate_magnitude * query_magnitude)
 
 
 def _cfg_limit(limit: int) -> int:

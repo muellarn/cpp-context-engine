@@ -38,10 +38,9 @@ class SQLiteVectorSearch:
         self._max_text_chars = max_text_chars
 
     def index(self, symbol_ids: Sequence[str]) -> None:
-        symbols = [
-            self._store.get_symbol(symbol_id, self._project_root, build_scope=self._build_scope)
-            for symbol_id in symbol_ids
-        ]
+        symbols = self._store.get_symbols(
+            symbol_ids, self._project_root, build_scope=self._build_scope
+        )
         present = [symbol for symbol in symbols if symbol is not None]
         if not present:
             return
@@ -61,14 +60,15 @@ class SQLiteVectorSearch:
         vectors = self._provider.embed(texts)
         if len(vectors) != len(present):
             raise ValueError("embedding provider returned a different number of vectors than texts")
-        for symbol, vector in zip(present, vectors, strict=True):
-            self._store.put_embedding(
-                symbol.variant_id or symbol.id,
-                self._provider.model_id,
-                vector,
-                self._project_root,
-                build_scope=self._build_scope,
-            )
+        self._store.put_embeddings(
+            (
+                (symbol.variant_id or symbol.id, vector)
+                for symbol, vector in zip(present, vectors, strict=True)
+            ),
+            self._provider.model_id,
+            self._project_root,
+            build_scope=self._build_scope,
+        )
 
     def search(self, query: SearchQuery) -> Sequence[SearchHit]:
         vectors = self._provider.embed([query.text])

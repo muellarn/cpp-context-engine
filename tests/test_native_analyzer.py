@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import threading
 import time
 from collections import Counter
 from dataclasses import replace
@@ -25,6 +26,7 @@ from cpp_context_engine.ingestion.compilation_database import CompilationDatabas
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
 from cpp_context_engine.ingestion.native import _FactBatchBuilder
 from cpp_context_engine.models import (
+    BuildConfiguration,
     BuildScope,
     BuildVariant,
     CfgEdgeKind,
@@ -55,6 +57,121 @@ def _script(tmp_path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def test_fact_builder_caches_validated_project_paths(tmp_path: Path) -> None:
+    source = tmp_path / "source.cpp"
+    source.write_text("int value = 1;\n", encoding="utf-8")
+    configuration = BuildConfiguration(
+        id="build",
+        source_path=source,
+        directory=tmp_path,
+        arguments=("clang++", str(source)),
+        command_hash="hash",
+    )
+    builder = _FactBatchBuilder(tmp_path, configuration)
+
+    first = builder._path(str(source))  # noqa: SLF001 - verify the path hot-loop cache
+    second = builder._path(str(source))  # noqa: SLF001 - verify the path hot-loop cache
+
+    assert first is second
+
+
+def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path: Path) -> None:
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(3)
+
+    class ConcurrentClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            barrier.wait(timeout=2)
+            with lock:
+                active -= 1
+            return []
+
+    configurations = []
+    for index in range(3):
+        source = tmp_path / f"source-{index}.cpp"
+        source.write_text(f"int value_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+                build_variant=f"variant-{index}",
+            )
+        )
+
+    batch = NativeClangIngestor(ConcurrentClient()).ingest_configurations(  # type: ignore[arg-type]
+        tmp_path, configurations
+    )
+
+    assert maximum_active == 3
+    assert [item.build_configuration_id for item in batch.translation_units] == [
+        "build-0",
+        "build-1",
+        "build-2",
+    ]
+    assert [item.build_variant for item in batch.translation_units] == [
+        "variant-0",
+        "variant-1",
+        "variant-2",
+    ]
+
+
+def test_native_worker_failure_cancels_pending_work_without_partial_batch(tmp_path: Path) -> None:
+    started: list[int] = []
+    lock = threading.Lock()
+    workers_ready = threading.Barrier(7)
+
+    class FailingClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            index = int(configuration.id.removeprefix("build-"))
+            with lock:
+                started.append(index)
+            workers_ready.wait(timeout=2)
+            if index == 0:
+                raise RuntimeError("injected worker failure")
+            time.sleep(0.2)
+            return []
+
+    configurations = []
+    for index in range(10):
+        source = tmp_path / f"failure-{index}.cpp"
+        source.write_text(f"int failure_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="injected worker failure"):
+        NativeClangIngestor(FailingClient()).ingest_configurations(  # type: ignore[arg-type]
+            tmp_path, configurations
+        )
+
+    assert sorted(started) == list(range(7))
 
 
 def test_native_handshake_matches_protocol_golden() -> None:
