@@ -7,7 +7,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TypeVar
 
@@ -18,9 +18,18 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from cpp_context_engine import __version__
-from cpp_context_engine.api import AnswerRequest, QueryRequest
+from cpp_context_engine.api import (
+    AnswerRequest,
+    BuildListResult,
+    CallRequest,
+    CfgRequest,
+    ControlFlowResult,
+    DataFlowResult,
+    FlowRequest,
+    QueryRequest,
+)
 from cpp_context_engine.config import AppConfig
-from cpp_context_engine.models import CodeSymbol, GraphDirection, GraphRelation
+from cpp_context_engine.models import CodeSymbol, GraphDirection, GraphEdge, GraphRelation
 from cpp_context_engine.runtime import (
     Runtime,
     build_runtime,
@@ -34,9 +43,13 @@ from .contracts import (
     MAX_ANSWER_CHARS,
     MAX_DIAGNOSTICS,
     MAX_SEARCH_RESULTS,
+    AnalysisBlocks,
+    AnalysisGraphs,
+    AnalysisItems,
     AnswerSource,
     AnswerSteps,
     AskCodeResult,
+    Builds,
     ContextTokens,
     GraphDepth,
     GraphEdgeResult,
@@ -157,6 +170,91 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     )
 
     @server.tool(
+        title="List indexed build variants",
+        description=(
+            "List safe build labels and the operator-enabled single or union query scope. "
+            "Compilation-database paths and build metadata are not exposed."
+        ),
+        annotations=local_read,
+    )
+    async def list_builds(ctx: Context[ProjectServerState]) -> BuildListResult:
+        state = _state(ctx)
+        return await _call_tool(
+            state,
+            "list_builds",
+            lambda: state.require_runtime().analysis_service.list_builds(),
+            "Build listing failed for the configured project index.",
+        )
+
+    @server.tool(
+        title="Read bounded control-flow evidence",
+        description=(
+            "Return compiler-derived CFG blocks, elements, and typed edges for one stable "
+            "function symbol ID, within total pre-query budgets."
+        ),
+        annotations=local_read,
+    )
+    async def control_flow(
+        symbol_id: SymbolId,
+        ctx: Context[ProjectServerState],
+        builds: Builds = None,
+        max_graphs: AnalysisGraphs = 5,
+        max_blocks: AnalysisBlocks = 100,
+        max_elements: AnalysisItems = 500,
+        max_edges: AnalysisItems = 500,
+    ) -> ControlFlowResult:
+        state = _state(ctx)
+        return await _call_tool(
+            state,
+            "control_flow",
+            lambda: state.require_runtime().analysis_service.control_flow(
+                CfgRequest(
+                    function_symbol_id=symbol_id,
+                    builds=builds,
+                    max_graphs=max_graphs,
+                    max_blocks=max_blocks,
+                    max_elements=max_elements,
+                    max_edges=max_edges,
+                )
+            ),
+            "Control-flow lookup failed for the configured project index.",
+        )
+
+    @server.tool(
+        title="Read bounded data-flow evidence",
+        description=(
+            "Return intraprocedural def-use and alias evidence plus bounded function-summary "
+            "and interprocedural-flow evidence; no dead-code verdict is inferred."
+        ),
+        annotations=local_read,
+    )
+    async def data_flow(
+        symbol_id: SymbolId,
+        ctx: Context[ProjectServerState],
+        builds: Builds = None,
+        max_analyses: AnalysisGraphs = 5,
+        max_locations: AnalysisItems = 200,
+        max_accesses: AnalysisItems = 500,
+        max_evidence: AnalysisItems = 500,
+    ) -> DataFlowResult:
+        state = _state(ctx)
+        return await _call_tool(
+            state,
+            "data_flow",
+            lambda: state.require_runtime().analysis_service.data_flow(
+                FlowRequest(
+                    function_symbol_id=symbol_id,
+                    builds=builds,
+                    max_analyses=max_analyses,
+                    max_locations=max_locations,
+                    max_accesses=max_accesses,
+                    max_evidence=max_evidence,
+                )
+            ),
+            "Data-flow lookup failed for the configured project index.",
+        )
+
+    @server.tool(
         title="Index configured C++ project",
         description=(
             "Incrementally index the operator-configured project and compilation database. "
@@ -209,14 +307,20 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         ctx: Context[ProjectServerState],
         max_results: SearchResultLimit = 10,
         max_context_tokens: ContextTokens = 8_000,
+        builds: Builds = None,
     ) -> SearchCodeResult:
         state = _state(ctx)
 
         def operation() -> SearchCodeResult:
-            runtime = state.require_runtime()
-            bundle = runtime.retrieval_service.query(
-                QueryRequest(query.strip(), max_context_tokens)
-            ).context
+            runtime, temporary = _runtime_for_builds(state, builds)
+            try:
+                bundle = runtime.retrieval_service.query(
+                    QueryRequest(query.strip(), max_context_tokens, max_results=max_results)
+                ).context
+                selected_scope = runtime.config.build_scope
+            finally:
+                if temporary:
+                    runtime.close()
             items = [
                 SearchCodeItem(
                     symbol=_symbol_reference(item.hit.symbol, state.config.project_root),
@@ -240,6 +344,13 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                 estimated_tokens=bundle.estimated_tokens,
                 truncated=bundle.truncated or len(bundle.items) > max_results,
                 diagnostics=list(bundle.diagnostics[:MAX_DIAGNOSTICS]),
+                scope_kind="union" if selected_scope.is_union else "single",
+                scope_label=(
+                    f"union:{','.join(selected_scope.variants)}"
+                    if selected_scope.is_union
+                    else f"build:{selected_scope.variants[0]}"
+                ),
+                scope_variants=list(selected_scope.variants),
             )
 
         return await _call_tool(
@@ -261,18 +372,27 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         symbol_id: SymbolId,
         ctx: Context[ProjectServerState],
         max_source_chars: SourceChars = 20_000,
+        builds: Builds = None,
     ) -> ReadSymbolResult:
         state = _state(ctx)
 
         def operation() -> ReadSymbolResult:
             runtime = state.require_runtime()
-            symbol = _get_symbol(runtime, symbol_id)
+            scope = runtime.analysis_service.resolve_scope(builds)
+            symbol = _get_symbol(runtime, symbol_id, scope.variants)
             source = FilesystemSourceReader(state.config.project_root).read_symbol(symbol)
             truncated = len(source) > max_source_chars
             return ReadSymbolResult(
                 symbol=_symbol_reference(symbol, state.config.project_root),
                 source_text=source[:max_source_chars],
                 truncated=truncated,
+                scope_kind="union" if scope.is_union else "single",
+                scope_label=(
+                    f"union:{','.join(scope.variants)}"
+                    if scope.is_union
+                    else f"build:{scope.variants[0]}"
+                ),
+                scope_variants=list(scope.variants),
             )
 
         return await _call_tool(
@@ -298,6 +418,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         depth: GraphDepth = 1,
         max_results: GraphResultLimit = 50,
         per_node_fanout: GraphFanout = 20,
+        builds: Builds = None,
     ) -> GraphResult:
         return await _graph_tool(
             _state(ctx),
@@ -308,6 +429,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             depth=depth,
             max_results=max_results,
             per_node_fanout=per_node_fanout,
+            builds=builds,
         )
 
     @server.tool(
@@ -319,6 +441,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         symbol_id: SymbolId,
         ctx: Context[ProjectServerState],
         max_results: GraphFanout = 20,
+        builds: Builds = None,
     ) -> GraphResult:
         return await _graph_tool(
             _state(ctx),
@@ -329,6 +452,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             depth=1,
             max_results=max_results,
             per_node_fanout=max_results,
+            builds=builds,
         )
 
     @server.tool(
@@ -340,6 +464,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         symbol_id: SymbolId,
         ctx: Context[ProjectServerState],
         max_results: GraphFanout = 20,
+        builds: Builds = None,
     ) -> GraphResult:
         return await _graph_tool(
             _state(ctx),
@@ -350,6 +475,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             depth=1,
             max_results=max_results,
             per_node_fanout=max_results,
+            builds=builds,
         )
 
     @server.tool(
@@ -366,18 +492,23 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         ctx: Context[ProjectServerState],
         max_context_tokens: ContextTokens = 8_000,
         max_steps: AnswerSteps = 3,
+        builds: Builds = None,
     ) -> AskCodeResult:
         state = _state(ctx)
 
         def operation() -> AskCodeResult:
-            runtime = state.require_runtime()
-            if runtime.answer_service is None:
-                raise PublicToolFailure(
-                    "Code answering is unavailable; configure an LLM when starting the server."
+            runtime, temporary = _runtime_for_builds(state, builds)
+            try:
+                if runtime.answer_service is None:
+                    raise PublicToolFailure(
+                        "Code answering is unavailable; configure an LLM when starting the server."
+                    )
+                answer = runtime.answer_service.answer(
+                    AnswerRequest(query.strip(), max_context_tokens, max_steps)
                 )
-            answer = runtime.answer_service.answer(
-                AnswerRequest(query.strip(), max_context_tokens, max_steps)
-            )
+            finally:
+                if temporary:
+                    runtime.close()
             rendered_answer = _redact_project_root(answer.answer, state.config.project_root)
             diagnostics = list(answer.diagnostics[:MAX_DIAGNOSTICS])
             complete = answer.complete
@@ -404,6 +535,9 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                     for source in answer.sources[:MAX_SEARCH_RESULTS]
                 ],
                 diagnostics=diagnostics[:MAX_DIAGNOSTICS],
+                scope_kind="union" if len(answer.build_variants) > 1 else "single",
+                scope_label=answer.scope_label,
+                scope_variants=list(answer.build_variants),
             )
 
         return await _call_tool(
@@ -455,11 +589,68 @@ async def _graph_tool(
     depth: int,
     max_results: int,
     per_node_fanout: int,
+    builds: list[str] | None,
 ) -> GraphResult:
     def operation() -> GraphResult:
         runtime = state.require_runtime()
-        origin = _get_symbol(runtime, symbol_id)
-        edge_scope = (origin.build_variant,)
+        scope = runtime.analysis_service.resolve_scope(builds)
+        origin = _get_symbol(runtime, symbol_id, scope.variants)
+        if (
+            relations == [GraphRelation.CALLS]
+            and depth == 1
+            and direction in {GraphDirection.INCOMING, GraphDirection.OUTGOING}
+        ):
+            calls = runtime.analysis_service.calls(
+                CallRequest(
+                    symbol_id=origin.id,
+                    direction=direction,
+                    builds=list(scope.variants),
+                    max_results=max_results,
+                )
+            )
+            rendered_calls: list[GraphEdgeResult] = []
+            for call in calls.calls:
+                fact_scope = (call.provenance.build_variant,)
+                source = runtime.store.get_symbol(
+                    call.caller_symbol_id,
+                    state.config.project_root,
+                    build_scope=fact_scope,
+                )
+                target = runtime.store.get_symbol(
+                    call.target_symbol_id,
+                    state.config.project_root,
+                    build_scope=fact_scope,
+                )
+                if source is None or target is None:
+                    continue
+                rendered_calls.append(
+                    GraphEdgeResult(
+                        edge_id=call.target_evidence_id,
+                        build_variant=call.provenance.build_variant,
+                        source=_symbol_reference(source, state.config.project_root),
+                        target=_symbol_reference(target, state.config.project_root),
+                        relation=GraphRelation.CALLS,
+                        translation_unit_id=call.provenance.translation_unit_id,
+                        build_configuration_id=call.provenance.build_configuration_id,
+                        callsite_id=call.callsite_id,
+                        certainty=call.certainty,
+                        confidence=call.confidence,
+                        confidence_reason=call.confidence_reason,
+                        derivation=call.derivation,
+                        target_set_complete=call.target_set_complete,
+                    )
+                )
+            if rendered_calls:
+                return GraphResult(
+                    symbol=_symbol_reference(origin, state.config.project_root),
+                    direction=direction,
+                    depth=depth,
+                    edges=rendered_calls,
+                    truncated=calls.truncated,
+                    scope_kind=calls.scope.kind,
+                    scope_label=calls.scope.label,
+                    scope_variants=calls.scope.variants,
+                )
         edges = tuple(
             runtime.store.neighbors(
                 origin.id,
@@ -469,7 +660,7 @@ async def _graph_tool(
                 max_edges=max_results + 1,
                 per_node_limit=per_node_fanout,
                 project_root=state.config.project_root,
-                build_scope=edge_scope,
+                build_scope=scope,
             )
         )
         truncated = len(edges) > max_results
@@ -483,10 +674,90 @@ async def _graph_tool(
                 max_edges=max_results + 1,
                 per_node_limit=per_node_fanout + 1,
                 project_root=state.config.project_root,
-                build_scope=edge_scope,
+                build_scope=scope,
             )
             known_edge_ids = {edge.id for edge in edges}
             truncated = any(edge.id not in known_edge_ids for edge in probe)
+        call_details = {}
+        details_by_id = {}
+        evidence_edges: list[GraphEdge] = []
+        if relations is None or GraphRelation.CALLS in relations:
+            call_directions = (
+                (GraphDirection.OUTGOING, GraphDirection.INCOMING)
+                if direction == GraphDirection.BOTH
+                else (direction,)
+            )
+            for call_direction in call_directions:
+                evidence = runtime.analysis_service.calls(
+                    CallRequest(
+                        symbol_id=origin.id,
+                        direction=call_direction,
+                        builds=list(scope.variants),
+                        max_results=max_results,
+                    )
+                )
+                truncated |= evidence.truncated
+                for call in evidence.calls:
+                    pair = (
+                        call.caller_symbol_id,
+                        call.target_symbol_id,
+                        call.provenance.build_variant,
+                    )
+                    existing = call_details.get(pair)
+                    if existing is None or call.certainty.value == "certain":
+                        call_details[pair] = call
+                    details_by_id[call.target_evidence_id] = call
+                    evidence_edges.append(
+                        GraphEdge(
+                            source_id=call.caller_symbol_id,
+                            target_id=call.target_symbol_id,
+                            relation=GraphRelation.CALLS,
+                            translation_unit_id=call.provenance.translation_unit_id,
+                            id=call.target_evidence_id,
+                            build_configuration_id=call.provenance.build_configuration_id,
+                            build_variant=call.provenance.build_variant,
+                        )
+                    )
+        evidence_pairs = {
+            (edge.source_id, edge.target_id, edge.build_variant) for edge in evidence_edges
+        }
+        legacy_and_non_call_edges = tuple(
+            edge
+            for edge in edges
+            if edge.relation != GraphRelation.CALLS
+            or (edge.source_id, edge.target_id, edge.build_variant) not in evidence_pairs
+        )
+        origin_edges = [
+            edge
+            for edge in (*legacy_and_non_call_edges, *evidence_edges)
+            if origin.id in {edge.source_id, edge.target_id}
+        ]
+        deeper_edges = [
+            edge
+            for edge in legacy_and_non_call_edges
+            if origin.id not in {edge.source_id, edge.target_id}
+        ]
+
+        def edge_sort_key(edge: GraphEdge) -> tuple[object, ...]:
+            detail = details_by_id.get(edge.id) or call_details.get(
+                (edge.source_id, edge.target_id, edge.build_variant)
+            )
+            return (
+                0 if detail is not None and detail.certainty.value == "certain" else 1,
+                edge.relation.value,
+                edge.source_id,
+                edge.target_id,
+                edge.build_variant,
+                edge.id,
+            )
+
+        origin_edges.sort(key=edge_sort_key)
+        if len(origin_edges) > per_node_fanout:
+            # Advanced callsite facts augment legacy edges but still share the public fanout budget.
+            truncated = True
+        edges = tuple((*deeper_edges, *origin_edges[:per_node_fanout]))
+        truncated |= len(edges) > max_results
+        edges = tuple(sorted(edges, key=edge_sort_key))
         rendered: list[GraphEdgeResult] = []
         for edge in edges[:max_results]:
             edge_scope = (edge.build_variant,)
@@ -498,6 +769,9 @@ async def _graph_tool(
             )
             if source is None or target is None:
                 continue
+            detail = details_by_id.get(edge.id) or call_details.get(
+                (edge.source_id, edge.target_id, edge.build_variant)
+            )
             rendered.append(
                 GraphEdgeResult(
                     edge_id=edge.id,
@@ -505,6 +779,14 @@ async def _graph_tool(
                     source=_symbol_reference(source, state.config.project_root),
                     target=_symbol_reference(target, state.config.project_root),
                     relation=edge.relation,
+                    translation_unit_id=edge.translation_unit_id,
+                    build_configuration_id=edge.build_configuration_id,
+                    callsite_id=detail.callsite_id if detail else None,
+                    certainty=detail.certainty if detail else None,
+                    confidence=detail.confidence if detail else None,
+                    confidence_reason=detail.confidence_reason if detail else None,
+                    derivation=detail.derivation if detail else None,
+                    target_set_complete=detail.target_set_complete if detail else None,
                 )
             )
         return GraphResult(
@@ -513,6 +795,13 @@ async def _graph_tool(
             depth=depth,
             edges=rendered,
             truncated=truncated,
+            scope_kind="union" if scope.is_union else "single",
+            scope_label=(
+                f"union:{','.join(scope.variants)}"
+                if scope.is_union
+                else f"build:{scope.variants[0]}"
+            ),
+            scope_variants=list(scope.variants),
         )
 
     return await _call_tool(
@@ -523,11 +812,27 @@ async def _graph_tool(
     )
 
 
-def _get_symbol(runtime: Runtime, symbol_id: str) -> CodeSymbol:
-    symbol = runtime.store.get_symbol(symbol_id, runtime.config.project_root)
+def _get_symbol(
+    runtime: Runtime, symbol_id: str, build_scope: Sequence[str] | None = None
+) -> CodeSymbol:
+    symbol = runtime.store.get_symbol(
+        symbol_id,
+        runtime.config.project_root,
+        build_scope=tuple(build_scope) if build_scope else None,
+    )
     if symbol is None:
         raise PublicToolFailure("The requested symbol ID is not present in the configured index.")
     return symbol
+
+
+def _runtime_for_builds(
+    state: ProjectServerState, builds: list[str] | None
+) -> tuple[Runtime, bool]:
+    runtime = state.require_runtime()
+    scope = runtime.analysis_service.resolve_scope(builds)
+    if scope == runtime.config.build_scope:
+        return runtime, False
+    return build_runtime(replace(runtime.config, build_scope=scope)), True
 
 
 def _symbol_reference(symbol: CodeSymbol, project_root: Path) -> SymbolReference:

@@ -47,6 +47,8 @@ def test_context_service_validates_hard_token_limit() -> None:
         service.query(QueryRequest("find parser", 101))
     with pytest.raises(ValueError, match=r"\[1, 100\]"):
         service.query(QueryRequest("find parser", 0))
+    with pytest.raises(ValueError, match=r"max_results must be in \[1, 100\]"):
+        service.query(QueryRequest("find parser", max_results=0))
 
 
 def test_iterative_answer_searches_again_and_validates_citations() -> None:

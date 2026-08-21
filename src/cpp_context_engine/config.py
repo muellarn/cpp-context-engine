@@ -61,6 +61,8 @@ class AppConfig:
         )
         if len({variant.name for variant in variants}) != len(variants):
             raise ValueError("build variant names must be unique")
+        if len(variants) > 16:
+            raise ValueError("at most 16 build variants may be configured")
         object.__setattr__(self, "build_variants", tuple(variants))
         if self.libclang_library_file is not None:
             object.__setattr__(

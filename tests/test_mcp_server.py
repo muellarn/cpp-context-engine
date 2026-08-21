@@ -146,6 +146,9 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
             tools = {tool.name: tool for tool in listed.tools}
             assert set(tools) == {
                 "index_project",
+                "list_builds",
+                "control_flow",
+                "data_flow",
                 "search_code",
                 "read_symbol",
                 "neighbors",

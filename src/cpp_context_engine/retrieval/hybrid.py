@@ -8,9 +8,17 @@ from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import Any
 
 from cpp_context_engine.graph import CodeGraph
-from cpp_context_engine.models import CodeSymbol, GraphRelation, SearchHit, SearchQuery
+from cpp_context_engine.models import (
+    BuildScope,
+    CodeSymbol,
+    GraphEdge,
+    GraphRelation,
+    SearchHit,
+    SearchQuery,
+)
 from cpp_context_engine.retrieval.protocols import ContextBundle, ContextItem, ContextPathStep
 from cpp_context_engine.search import LexicalSearch, SymbolSearch, VectorSearch
 from cpp_context_engine.storage import SourceReader, SymbolStore
@@ -101,6 +109,7 @@ class HybridRetriever:
         source_reader: SourceReader,
         graph: CodeGraph | None = None,
         config: RetrievalConfig | None = None,
+        build_scope: BuildScope | None = None,
     ) -> None:
         self._searches = (
             ("lexical", lexical_search),
@@ -111,19 +120,33 @@ class HybridRetriever:
         self._source_reader = source_reader
         self._graph = graph
         self._config = config or RetrievalConfig()
+        self._build_scope = build_scope or BuildScope.single()
 
-    def retrieve(self, query: str, *, max_tokens: int) -> ContextBundle:
+    def retrieve(
+        self, query: str, *, max_tokens: int, max_results: int | None = None
+    ) -> ContextBundle:
         """Run bounded search, expansion, source reading, and context assembly."""
 
         if not query.strip():
             raise ValueError("query must not be empty")
         if max_tokens <= 0:
             raise ValueError("max_tokens must be greater than zero")
+        if max_results is not None and max_results <= 0:
+            raise ValueError("max_results must be greater than zero")
 
         diagnostics: list[str] = []
-        candidates = self._fuse(query, diagnostics)
+        result_limit = max_results or self._config.candidate_limit
+        candidates, candidates_truncated = self._fuse(query, diagnostics, result_limit)
         if not candidates:
-            return ContextBundle(query, (), "", 0, diagnostics=tuple(diagnostics))
+            return ContextBundle(
+                query,
+                (),
+                "",
+                0,
+                diagnostics=tuple(diagnostics),
+                build_variants=self._build_scope.variants,
+                scope_label=self._scope_label(),
+            )
 
         ranked = self._rerank(query, candidates, update_scores=False)
         seeds = ranked[: min(self._config.seed_limit, len(ranked))]
@@ -133,18 +156,31 @@ class HybridRetriever:
 
         expanded = self._expand(seeds, candidates, diagnostics)
         reranked = self._rerank(query, expanded, update_scores=True)
-        return self._pack(query, reranked, max_tokens, diagnostics)
+        return self._pack(
+            query,
+            reranked,
+            max_tokens,
+            result_limit,
+            diagnostics,
+            candidates_truncated=candidates_truncated,
+        )
 
-    def _fuse(self, text: str, diagnostics: list[str]) -> dict[str, _Candidate]:
-        query = SearchQuery(text, limit=self._config.search_limit)
+    def _fuse(
+        self, text: str, diagnostics: list[str], result_limit: int
+    ) -> tuple[dict[str, _Candidate], bool]:
+        search_limit = min(self._config.search_limit, result_limit)
+        query = SearchQuery(text, limit=search_limit)
         fused_scores: dict[str, float] = defaultdict(float)
         symbols: dict[str, CodeSymbol] = {}
         reasons: dict[str, list[str]] = defaultdict(list)
 
         successful_searches = 0
+        truncated = False
         for name, backend in self._searches:
             try:
-                hits = list(backend.search(query))[: self._config.search_limit]
+                raw_hits = list(backend.search(query))
+                truncated |= len(raw_hits) >= search_limit
+                hits = raw_hits[:search_limit]
             except Exception as exc:  # adapters are an explicit failure boundary
                 diagnostics.append(f"{name} search failed: {type(exc).__name__}")
                 continue
@@ -163,8 +199,8 @@ class HybridRetriever:
         if successful_searches == 0:
             diagnostics.append("all candidate searches failed")
         ordered_ids = sorted(fused_scores, key=fused_scores.__getitem__, reverse=True)
-        ordered_ids = ordered_ids[: self._config.candidate_limit]
-        return {
+        ordered_ids = ordered_ids[: min(self._config.candidate_limit, result_limit)]
+        candidates = {
             symbol_id: _Candidate(
                 hit=SearchHit(
                     symbol=symbols[symbol_id],
@@ -175,6 +211,7 @@ class HybridRetriever:
             )
             for symbol_id in ordered_ids
         }
+        return candidates, truncated
 
     def _expand(
         self,
@@ -206,6 +243,8 @@ class HybridRetriever:
                             current.symbol.id,
                             relations=self._config.relations,
                             depth=1,
+                            max_edges=self._config.per_node_edge_budget + 1,
+                            per_node_limit=self._config.per_node_edge_budget + 1,
                             build_scope=(current.symbol.build_variant,),
                         )
                     )
@@ -224,10 +263,64 @@ class HybridRetriever:
                 )
                 continue
 
+            call_evidence: dict[tuple[str, str], Any] = {}
+            evidence_edges: list[GraphEdge] = []
+            if GraphRelation.CALLS in self._config.relations and hasattr(
+                self._graph, "call_evidence"
+            ):
+                for incoming in (False, True):
+                    try:
+                        bounded = self._graph.call_evidence(  # type: ignore[attr-defined]
+                            current.symbol.id,
+                            incoming=incoming,
+                            build_scope=(current.symbol.build_variant,),
+                            limit=self._config.per_node_edge_budget + 1,
+                        )
+                    except Exception as exc:  # optional adapter evidence boundary
+                        diagnostics.append(
+                            f"call evidence lookup failed for {current.symbol.id}: "
+                            f"{type(exc).__name__}"
+                        )
+                        continue
+                    for site, target in bounded.items:
+                        key = (site.owner_symbol_id, target.target_symbol_id)
+                        existing = call_evidence.get(key)
+                        if existing is None or target.certainty.value == "certain":
+                            call_evidence[key] = target
+                        evidence_edges.append(
+                            GraphEdge(
+                                source_id=site.owner_symbol_id,
+                                target_id=target.target_symbol_id,
+                                relation=GraphRelation.CALLS,
+                                translation_unit_id=target.translation_unit_id,
+                                id=target.id,
+                                build_configuration_id=target.build_configuration_id,
+                                build_variant=target.build_variant,
+                            )
+                        )
+
             # Adapter row/insertion order must not decide which neighbors survive a hard budget.
+            indexed_edges = {
+                (edge.source_id, edge.target_id, edge.relation, edge.build_variant)
+                for edge in raw_edges
+            }
+            raw_edges.extend(
+                edge
+                for edge in evidence_edges
+                if (edge.source_id, edge.target_id, edge.relation, edge.build_variant)
+                not in indexed_edges
+            )
             relevant = sorted(
                 (edge for edge in raw_edges if edge.relation in self._config.relations),
-                key=lambda edge: (edge.relation.value, edge.source_id, edge.target_id),
+                key=lambda edge: (
+                    0
+                    if (evidence := call_evidence.get((edge.source_id, edge.target_id)))
+                    and evidence.certainty.value == "certain"
+                    else 1,
+                    edge.relation.value,
+                    edge.source_id,
+                    edge.target_id,
+                ),
             )
             degree = len(relevant)
             if degree > self._config.per_node_edge_budget:
@@ -268,12 +361,21 @@ class HybridRetriever:
                 step = ContextPathStep(edge.source_id, edge.target_id, edge.relation)
                 path = (*current.path, step)
                 graph_score = current.hit.score * self._config.graph_decay
+                target_evidence = call_evidence.get((edge.source_id, edge.target_id))
+                evidence_reason = ""
+                if target_evidence is not None:
+                    evidence_reason = (
+                        f"; call {target_evidence.certainty.value}, "
+                        f"confidence {target_evidence.confidence:.2f}, "
+                        f"derivation {target_evidence.derivation}, "
+                        f"build {target_evidence.build_variant}"
+                    )
                 candidate = candidates.get(neighbor_key)
                 if candidate is None:
                     candidate = _Candidate(
                         hit=SearchHit(symbol, graph_score, "graph"),
                         reasons=[
-                            f"{edge.relation.value} neighbor at depth {depth + 1}",
+                            f"{edge.relation.value} neighbor at depth {depth + 1}{evidence_reason}",
                             f"hub degree {degree}",
                         ],
                         path=path,
@@ -332,7 +434,10 @@ class HybridRetriever:
         query: str,
         ranked: Sequence[_Candidate],
         max_tokens: int,
+        max_results: int,
         diagnostics: list[str],
+        *,
+        candidates_truncated: bool = False,
     ) -> ContextBundle:
         char_budget = math.floor(max_tokens * self._config.chars_per_token)
         if self._config.max_context_chars is not None:
@@ -365,8 +470,13 @@ class HybridRetriever:
         rendered_parts: list[str] = []
         items: list[ContextItem] = []
         used_chars = 0
-        truncated = False
+        truncated = candidates_truncated
         for candidate in ordered:
+            # Candidate loss labels the result but only a source/token cut exhausts packing.
+            source_truncated = False
+            if len(items) >= max_results:
+                truncated = True
+                break
             try:
                 source = self._source_reader.read_symbol(candidate.symbol)
             except Exception as exc:  # malformed or unavailable files must not abort a query
@@ -387,12 +497,13 @@ class HybridRetriever:
                 source = f"{source[:available_source]}\n… [truncated]"
                 full = f"{prefix}{source}{suffix}"
                 truncated = True
+                source_truncated = True
 
             path = candidate.path
             items.append(ContextItem(candidate.hit, source, reason, path))
             rendered_parts.append(full)
             used_chars += len(full)
-            if truncated:
+            if source_truncated:
                 break
 
         if len(items) < len(ordered):
@@ -407,7 +518,13 @@ class HybridRetriever:
             items=tuple(items),
             diagnostics=tuple(dict.fromkeys(diagnostics)),
             truncated=truncated,
+            build_variants=self._build_scope.variants,
+            scope_label=self._scope_label(),
         )
+
+    def _scope_label(self) -> str:
+        prefix = "union" if self._build_scope.is_union else "build"
+        return f"{prefix}:{','.join(self._build_scope.variants)}"
 
     def _render_shell(self, candidate: _Candidate, reason: str) -> tuple[str, str]:
         symbol = candidate.symbol

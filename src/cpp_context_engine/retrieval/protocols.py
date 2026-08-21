@@ -41,9 +41,13 @@ class ContextBundle:
     items: tuple[ContextItem, ...] = ()
     diagnostics: tuple[str, ...] = ()
     truncated: bool = False
+    build_variants: tuple[str, ...] = ()
+    scope_label: str = ""
 
 
 class Retriever(Protocol):
-    def retrieve(self, query: str, *, max_tokens: int) -> ContextBundle:
+    def retrieve(
+        self, query: str, *, max_tokens: int, max_results: int | None = None
+    ) -> ContextBundle:
         """Return connected, ranked source context within a hard token budget."""
         ...

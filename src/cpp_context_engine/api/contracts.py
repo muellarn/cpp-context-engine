@@ -13,6 +13,8 @@ from cpp_context_engine.retrieval import ContextBundle
 class QueryRequest:
     query: str
     max_context_tokens: int | None = None
+    builds: tuple[str, ...] | None = None
+    max_results: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +33,7 @@ class AnswerRequest:
     query: str
     max_context_tokens: int | None = None
     max_steps: int | None = None
+    builds: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +53,8 @@ class AnswerResponse:
     steps: int
     complete: bool
     diagnostics: tuple[str, ...] = ()
+    build_variants: tuple[str, ...] = ("default",)
+    scope_label: str = "build:default"
 
 
 class AnswerService(Protocol):

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from cpp_context_engine import __version__
-from cpp_context_engine.api import AnswerRequest, QueryRequest
+from cpp_context_engine.api import AnswerRequest, CfgRequest, FlowRequest, QueryRequest
 from cpp_context_engine.config import AppConfig
 from cpp_context_engine.models import BuildScope, BuildVariant
 from cpp_context_engine.runtime import build_runtime, index_project
@@ -48,11 +48,37 @@ def _parser() -> argparse.ArgumentParser:
     remove_build.add_argument("name", help="build variant name")
     _add_project_options(remove_build, positional=False)
 
+    builds = commands.add_parser("builds", help="list indexed build variants and active scope")
+    _add_project_options(builds, positional=False)
+    builds.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    builds.add_argument("--build", action="append", default=[], metavar="NAME")
+
+    cfg = commands.add_parser("cfg", help="read bounded control-flow evidence for a function")
+    cfg.add_argument("symbol_id", help="stable function symbol ID")
+    _add_project_options(cfg, positional=False)
+    cfg.add_argument("--build", action="append", default=[], metavar="NAME")
+    cfg.add_argument("--max-graphs", type=int, default=5)
+    cfg.add_argument("--max-blocks", type=int, default=100)
+    cfg.add_argument("--max-elements", type=int, default=500)
+    cfg.add_argument("--max-edges", type=int, default=500)
+    cfg.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    flow = commands.add_parser("flow", help="read bounded data-flow evidence for a function")
+    flow.add_argument("symbol_id", help="stable function symbol ID")
+    _add_project_options(flow, positional=False)
+    flow.add_argument("--build", action="append", default=[], metavar="NAME")
+    flow.add_argument("--max-analyses", type=int, default=5)
+    flow.add_argument("--max-locations", type=int, default=200)
+    flow.add_argument("--max-accesses", type=int, default=500)
+    flow.add_argument("--max-evidence", type=int, default=500)
+    flow.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
     search = commands.add_parser("search", help="find connected symbols and source context")
     search.add_argument("query", help="natural-language, identifier, or signature query")
     _add_project_options(search, positional=False)
     _add_embedding_options(search)
     search.add_argument("--max-context-tokens", type=int)
+    search.add_argument("--max-results", type=int)
     search.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     search.add_argument("--build", action="append", default=[], metavar="NAME")
 
@@ -341,9 +367,67 @@ def _run_remove_build(config: AppConfig, name: str) -> int:
     return 0
 
 
-def _context_payload(bundle: Any) -> dict[str, Any]:
+def _print_contract(payload: Any, *, as_json: bool) -> int:
+    document = payload.model_dump(mode="json")
+    if as_json:
+        print(json.dumps(document, sort_keys=True))
+    else:
+        print(json.dumps(document, indent=2, sort_keys=True))
+    return 0
+
+
+def _run_builds(config: AppConfig, *, as_json: bool) -> int:
+    with build_runtime(config) as runtime:
+        result = runtime.analysis_service.list_builds()
+    return _print_contract(result, as_json=as_json)
+
+
+def _run_cfg(config: AppConfig, args: argparse.Namespace) -> int:
+    request = CfgRequest(
+        function_symbol_id=args.symbol_id,
+        builds=args.build or None,
+        max_graphs=args.max_graphs,
+        max_blocks=args.max_blocks,
+        max_elements=args.max_elements,
+        max_edges=args.max_edges,
+    )
+    with build_runtime(config) as runtime:
+        result = runtime.analysis_service.control_flow(request)
+    return _print_contract(result, as_json=args.json)
+
+
+def _run_flow(config: AppConfig, args: argparse.Namespace) -> int:
+    request = FlowRequest(
+        function_symbol_id=args.symbol_id,
+        builds=args.build or None,
+        max_analyses=args.max_analyses,
+        max_locations=args.max_locations,
+        max_accesses=args.max_accesses,
+        max_evidence=args.max_evidence,
+    )
+    with build_runtime(config) as runtime:
+        result = runtime.analysis_service.data_flow(request)
+    return _print_contract(result, as_json=args.json)
+
+
+def _context_payload(bundle: Any, project_root: Path | None = None) -> dict[str, Any]:
+    root = project_root.resolve(strict=False) if project_root is not None else None
+
+    def display_path(path: Path) -> str:
+        if root is None:
+            return path.as_posix() if not path.is_absolute() else "<absolute-path-redacted>"
+        resolved = (path if path.is_absolute() else root / path).resolve(strict=False)
+        if resolved.is_relative_to(root):
+            return resolved.relative_to(root).as_posix()
+        return "<outside-project>"
+
     return {
         "query": bundle.query,
+        "scope": {
+            "kind": "union" if len(bundle.build_variants) > 1 else "single",
+            "label": bundle.scope_label or "build:default",
+            "variants": list(bundle.build_variants or ("default",)),
+        },
         "estimated_tokens": bundle.estimated_tokens,
         "truncated": bundle.truncated,
         "diagnostics": list(bundle.diagnostics),
@@ -354,7 +438,7 @@ def _context_payload(bundle: Any) -> dict[str, Any]:
                 "build_variant": item.hit.symbol.build_variant,
                 "qualified_name": item.hit.symbol.qualified_name,
                 "kind": item.hit.symbol.kind.value,
-                "path": str(item.hit.symbol.span.path),
+                "path": display_path(item.hit.symbol.span.path),
                 "start_line": item.hit.symbol.span.start_line,
                 "end_line": item.hit.symbol.span.end_line,
                 "score": item.hit.score,
@@ -376,9 +460,9 @@ def _context_payload(bundle: Any) -> dict[str, Any]:
 def _run_search(config: AppConfig, args: argparse.Namespace) -> int:
     with build_runtime(config) as runtime:
         response = runtime.retrieval_service.query(
-            QueryRequest(args.query, args.max_context_tokens)
+            QueryRequest(args.query, args.max_context_tokens, max_results=args.max_results)
         )
-    payload = _context_payload(response.context)
+    payload = _context_payload(response.context, config.project_root)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -409,6 +493,11 @@ def _run_ask(config: AppConfig, args: argparse.Namespace) -> int:
         )
     payload = {
         "answer": response.answer,
+        "scope": {
+            "kind": "union" if len(response.build_variants) > 1 else "single",
+            "label": response.scope_label,
+            "variants": list(response.build_variants),
+        },
         "complete": response.complete,
         "steps": response.steps,
         "sources": [
@@ -416,7 +505,7 @@ def _run_ask(config: AppConfig, args: argparse.Namespace) -> int:
                 "symbol_id": source.symbol_id,
                 "qualified_name": source.qualified_name,
                 "build_variant": source.build_variant,
-                "path": str(source.path),
+                "path": _project_path(source.path, config.project_root),
                 "start_line": source.start_line,
                 "end_line": source.end_line,
             }
@@ -438,6 +527,16 @@ def _run_ask(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
+def _project_path(path: Path, project_root: Path) -> str:
+    root = project_root.resolve(strict=False)
+    resolved = (path if path.is_absolute() else root / path).resolve(strict=False)
+    return (
+        resolved.relative_to(root).as_posix()
+        if resolved.is_relative_to(root)
+        else "<outside-project>"
+    )
+
+
 def _run_serve(config: AppConfig) -> int:
     try:
         import uvicorn
@@ -449,6 +548,9 @@ def _run_serve(config: AppConfig) -> int:
     app = create_app(
         retrieval_service=runtime.retrieval_service,
         answer_service=runtime.answer_service,
+        analysis_service=runtime.analysis_service,
+        scoped_query=runtime.query_context,
+        scoped_answer=runtime.answer_question if runtime.answer_service is not None else None,
     )
     app.state.cpp_context_runtime = runtime
     try:
@@ -487,6 +589,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_index(config, as_json=args.json)
         if args.command == "remove-build":
             return _run_remove_build(config, args.name)
+        if args.command == "builds":
+            return _run_builds(config, as_json=args.json)
+        if args.command == "cfg":
+            return _run_cfg(config, args)
+        if args.command == "flow":
+            return _run_flow(config, args)
         if args.command == "search":
             return _run_search(config, args)
         if args.command == "ask":

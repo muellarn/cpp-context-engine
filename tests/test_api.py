@@ -8,6 +8,7 @@ from test_service import RetrieverStub
 from cpp_context_engine.api import ContextRetrievalService, IterativeAnswerService
 from cpp_context_engine.api.http import create_app
 from cpp_context_engine.llm import DeterministicFakeProvider
+from cpp_context_engine.llm.providers import LLMProviderError
 
 
 def test_context_endpoint_returns_provenance() -> None:
@@ -42,6 +43,11 @@ def test_answer_endpoint_returns_structured_citations() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "answer": "It validates the packet.",
+        "scope": {
+            "kind": "single",
+            "label": "build:default",
+            "variants": ["default"],
+        },
         "sources": [
             {
                 "symbol_id": "parse",
@@ -65,3 +71,21 @@ def test_answer_endpoint_reports_unconfigured_service() -> None:
     response = client.post("/v1/answer", json={"query": "How?"})
 
     assert response.status_code == 503
+
+
+def test_answer_endpoint_does_not_expose_provider_error_details(tmp_path) -> None:
+    retrieval = ContextRetrievalService(RetrieverStub())
+
+    class FailingAnswerService:
+        def answer(self, _request):
+            raise LLMProviderError(f"secret-token at {tmp_path}/private")
+
+    client = TestClient(
+        create_app(retrieval_service=retrieval, answer_service=FailingAnswerService())
+    )
+
+    response = client.post("/v1/answer", json={"query": "How?"})
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "configured LLM provider failed"}
+    assert str(tmp_path) not in response.text

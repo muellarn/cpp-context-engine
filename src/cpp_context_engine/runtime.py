@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from cpp_context_engine.api import ContextRetrievalService, IterativeAnswerService
+from cpp_context_engine.api import (
+    AnalysisQueryService,
+    AnswerRequest,
+    AnswerResponse,
+    ContextRetrievalService,
+    IterativeAnswerService,
+    QueryRequest,
+    QueryResponse,
+)
 from cpp_context_engine.config import AppConfig
 from cpp_context_engine.ingestion import (
     ClangIngestor,
@@ -46,6 +54,7 @@ class Runtime:
     vector_search: SQLiteVectorSearch
     retrieval_service: ContextRetrievalService
     answer_service: IterativeAnswerService | None
+    analysis_service: AnalysisQueryService
 
     def close(self) -> None:
         self.store.close()
@@ -55,6 +64,31 @@ class Runtime:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+    def query_context(self, request: QueryRequest) -> QueryResponse:
+        """Run retrieval in an operator-enabled request scope without cross-build leakage."""
+
+        requested = list(request.builds) if request.builds is not None else None
+        scope = self.analysis_service.resolve_scope(requested)
+        scoped_request = replace(request, builds=scope.variants)
+        if scope == self.config.build_scope:
+            return self.retrieval_service.query(scoped_request)
+        with build_runtime(replace(self.config, build_scope=scope)) as selected:
+            return selected.retrieval_service.query(scoped_request)
+
+    def answer_question(self, request: AnswerRequest) -> AnswerResponse:
+        """Run the complete answer loop inside one validated build scope."""
+
+        requested = list(request.builds) if request.builds is not None else None
+        scope = self.analysis_service.resolve_scope(requested)
+        scoped_request = replace(request, builds=scope.variants)
+        if scope == self.config.build_scope:
+            if self.answer_service is None:
+                raise ValueError("answer service is not configured")
+            return self.answer_service.answer(scoped_request)
+        with build_runtime(replace(self.config, build_scope=scope), require_llm=True) as selected:
+            assert selected.answer_service is not None
+            return selected.answer_service.answer(scoped_request)
 
 
 def embedding_provider(config: AppConfig) -> EmbeddingProvider:
@@ -178,9 +212,8 @@ def build_runtime(
     )
     try:
         if not store.has_project(config.project_root):
-            raise ValueError(
-                f"project is not indexed in {config.database_path}; run 'cpp-context index' first"
-            )
+            # Public CLI/API composition must not reveal the operator's absolute database path.
+            raise ValueError("project is not indexed; run 'cpp-context index' first")
         available = {variant.name for variant in store.build_variants(config.project_root)}
         missing_builds = set(config.build_scope.variants) - available
         if missing_builds:
@@ -204,17 +237,21 @@ def build_runtime(
                 candidate_limit=max(config.retrieval_limit, config.retrieval_limit * 4),
                 seed_limit=min(6, config.retrieval_limit),
             ),
+            build_scope=config.build_scope,
         )
         retrieval = ContextRetrievalService(
             retriever,
             default_max_context_tokens=config.max_context_tokens,
             max_context_tokens=max(64_000, config.max_context_tokens),
+            build_scope=config.build_scope,
+            default_max_results=config.retrieval_limit,
         )
         selected_llm = llm
         if selected_llm is None and (require_llm or (config.llm_base_url and config.llm_model)):
             selected_llm = llm_provider(config)
         answer = IterativeAnswerService(retrieval, selected_llm) if selected_llm else None
-        return Runtime(config, store, vector, retrieval, answer)
+        analysis = AnalysisQueryService(store, config.project_root, config.build_scope)
+        return Runtime(config, store, vector, retrieval, answer, analysis)
     except Exception:
         store.close()
         raise

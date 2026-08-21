@@ -5,6 +5,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from cpp_context_engine.models import (
+    BoundedCfgResult,
+    CallDispatchKind,
+    CallSite,
+    CallTarget,
+    CallTargetCertainty,
     CodeSymbol,
     GraphEdge,
     GraphRelation,
@@ -32,11 +37,35 @@ class SearchStub:
     def __init__(self, symbols: Sequence[CodeSymbol], *, failure: Exception | None = None) -> None:
         self.symbols = symbols
         self.failure = failure
+        self.queries: list[SearchQuery] = []
 
     def search(self, query: SearchQuery) -> Sequence[SearchHit]:
+        self.queries.append(query)
         if self.failure:
             raise self.failure
         return [SearchHit(item, 1.0 / rank, "stub") for rank, item in enumerate(self.symbols, 1)]
+
+
+def test_public_result_limit_reaches_search_adapters_before_expansion() -> None:
+    symbols = [symbol(f"item-{index}") for index in range(10)]
+    lexical = SearchStub(symbols)
+    symbol_search = SearchStub(symbols)
+    vector = SearchStub(symbols)
+    retriever = HybridRetriever(
+        lexical_search=lexical,
+        symbol_search=symbol_search,
+        vector_search=vector,
+        symbol_store=StoreStub(symbols),
+        source_reader=SourceStub(),
+    )
+
+    bundle = retriever.retrieve("item", max_tokens=1_000, max_results=2)
+
+    assert len(bundle.items) == 2
+    assert bundle.truncated
+    assert {
+        query.limit for backend in (lexical, symbol_search, vector) for query in backend.queries
+    } == {2}
 
 
 class StoreStub:
@@ -128,6 +157,52 @@ def test_inverse_graph_expansion_preserves_the_compiler_edge_direction() -> None
 
     caller_item = next(item for item in bundle.items if item.hit.symbol.id == "caller")
     assert caller_item.path == (ContextPathStep("caller", "callee", GraphRelation.CALLS),)
+
+
+def test_call_target_evidence_expands_possible_target_without_legacy_graph_edge() -> None:
+    caller = symbol("caller")
+    possible = symbol("possible")
+    span = SourceSpan(Path("caller.cpp"), 1, 1)
+    site = CallSite(
+        "site",
+        caller.id,
+        CallDispatchKind.VIRTUAL,
+        span,
+        span,
+        False,
+        unresolved_reason="open_world_virtual_dispatch",
+    )
+    target = CallTarget(
+        "target-evidence",
+        site.id,
+        possible.id,
+        CallTargetCertainty.POSSIBLE,
+        0.5,
+        "indexed override candidate; ranking value is not a probability",
+        "indexed_override_candidate",
+        span,
+    )
+
+    class EvidenceGraph(GraphStub):
+        def call_evidence(self, _symbol_id: str, *, incoming: bool, **_kwargs: object):
+            items = () if incoming else ((site, target),)
+            return BoundedCfgResult(items, False)
+
+    retriever = HybridRetriever(
+        lexical_search=SearchStub([caller]),
+        symbol_search=SearchStub([]),
+        vector_search=SearchStub([]),
+        symbol_store=StoreStub([caller, possible]),
+        source_reader=SourceStub(),
+        graph=EvidenceGraph([]),
+        config=RetrievalConfig(seed_limit=1, graph_depth=1),
+    )
+
+    bundle = retriever.retrieve("caller", max_tokens=1_000)
+
+    expanded = next(item for item in bundle.items if item.hit.symbol.id == "possible")
+    assert "call possible" in expanded.reason
+    assert "derivation indexed_override_candidate" in expanded.reason
 
 
 def test_union_graph_expansion_stays_within_the_seed_build() -> None:
