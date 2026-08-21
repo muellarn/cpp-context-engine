@@ -235,7 +235,7 @@ public:
       return std::nullopt;
     bool endIsExclusive = false;
     if (!sourceManager_.isWrittenInSameFile(begin, end)) {
-      // A declaration ending in a macro can otherwise combine source and definition files.
+      // Cross-file endpoints use Clang's deterministic use-site range when available.
       auto fileRange = clang::Lexer::makeFileCharRange(
           clang::CharSourceRange::getTokenRange(range), sourceManager_, langOptions_);
       fileRange = clang::Lexer::getAsCharRange(fileRange, sourceManager_, langOptions_);
@@ -244,7 +244,18 @@ public:
       begin = fileRange.getBegin();
       end = fileRange.getEnd();
       endIsExclusive = true;
+    } else if (spelling &&
+               !hasContiguousSpellingRange(range.getBegin(), range.getEnd())) {
+      // Ordered offsets alone do not prove a contiguous spelling range: a
+      // macro body token can precede a later use-site token in the same file.
+      return std::nullopt;
     }
+    // Independently resolved macro spelling endpoints can share a file while
+    // mixing the use-site begin with a definition-site end. Omitting that
+    // spelling span preserves its separate valid expansion span without
+    // silently reordering or inventing source evidence.
+    if (!isOrderedFileRange(begin, end))
+      return std::nullopt;
     auto candidate = path(begin, spelling);
     if (!candidate || !isProjectPath(*candidate))
       return std::nullopt;
@@ -253,6 +264,8 @@ public:
       if (endToken.isValid())
         end = endToken;
     }
+    if (!isOrderedFileRange(begin, end))
+      return std::nullopt;
     return llvm::json::Object{
         {"path", canonical(*candidate).string()},
         {"start_line", static_cast<std::int64_t>(sourceManager_.getSpellingLineNumber(begin))},
@@ -377,6 +390,39 @@ public:
   }
 
 private:
+  bool hasContiguousSpellingRange(clang::SourceLocation begin,
+                                  clang::SourceLocation end) const {
+    if (begin.isInvalid() || end.isInvalid())
+      return false;
+    if (!begin.isMacroID() && !end.isMacroID())
+      return true;
+    if (begin.isMacroID() != end.isMacroID())
+      return false;
+
+    clang::SourceLocation beginArgument;
+    clang::SourceLocation endArgument;
+    const bool beginIsArgument =
+        sourceManager_.isMacroArgExpansion(begin, &beginArgument);
+    const bool endIsArgument = sourceManager_.isMacroArgExpansion(end, &endArgument);
+    if (beginIsArgument != endIsArgument)
+      return false;
+    if (beginIsArgument)
+      return beginArgument == endArgument;
+
+    const auto beginExpansion = sourceManager_.getImmediateExpansionRange(begin);
+    const auto endExpansion = sourceManager_.getImmediateExpansionRange(end);
+    return beginExpansion.getBegin() == endExpansion.getBegin() &&
+           beginExpansion.getEnd() == endExpansion.getEnd();
+  }
+
+  bool isOrderedFileRange(clang::SourceLocation begin, clang::SourceLocation end) const {
+    if (begin.isInvalid() || end.isInvalid())
+      return false;
+    const auto [beginFile, beginOffset] = sourceManager_.getDecomposedLoc(begin);
+    const auto [endFile, endOffset] = sourceManager_.getDecomposedLoc(end);
+    return beginFile.isValid() && beginFile == endFile && beginOffset <= endOffset;
+  }
+
   clang::SourceManager &sourceManager_;
   const clang::LangOptions &langOptions_;
   std::filesystem::path projectRoot_;
@@ -762,7 +808,7 @@ private:
     auto spelling = source_.span(expression->getSourceRange(), true);
     auto expansion = source_.span(expression->getSourceRange(), false);
     auto ownerKind = symbolKind(owner);
-    if (!spelling || !expansion || !ownerKind)
+    if (!expansion || !ownerKind)
       return;
     emitSymbol(owner, *ownerKind);
     const bool staticTargetIndexed =
@@ -792,13 +838,14 @@ private:
                             {"key", callsiteKey},
                             {"owner_key", ownerKey},
                             {"dispatch_kind", dispatchKind.str()},
-                            {"spelling_span", std::move(*spelling)},
                             {"expansion_span", std::move(*expansion)},
                             {"expansion_stack",
                              source_.expansionStack(range.getBegin(), macroExpansions_)},
                             {"target_set_complete", complete},
                             {"unresolved_reason", unresolvedReason.str()},
                             {"callee_text", source_.source(range)}};
+    if (spelling)
+      site["spelling_span"] = std::move(*spelling);
     if (staticTargetIndexed)
       site["static_target_key"] = source_.declKey(
           staticTarget, llvm::isa<clang::CXXMethodDecl>(staticTarget) ? "method" : "function");
@@ -2507,6 +2554,8 @@ private:
 
   void emitSymbol(const clang::NamedDecl *decl, llvm::StringRef kind) {
     auto span = source_.span(decl->getSourceRange());
+    if (!span)
+      span = source_.span(decl->getSourceRange(), false);
     auto path = source_.path(decl->getLocation());
     if (!span || !path || !source_.isProjectPath(*path))
       return;
@@ -2547,13 +2596,18 @@ private:
     sink_.add("symbol:" + key + (isDefinition(decl) ? ":0" : ":1"), std::move(fact));
     llvm::StringRef occurrenceKind = isDefinition(decl) ? "definition" : "declaration";
     auto occurrencePath = source_.path(decl->getLocation(), false).value_or(*path);
+    auto occurrenceSpan = source_.span(decl->getSourceRange());
+    if (!occurrenceSpan)
+      occurrenceSpan = source_.span(decl->getSourceRange(), false);
+    if (!occurrenceSpan)
+      return;
     sink_.add("occurrence:" + key + ":" + occurrenceKind.str() + ":" +
                   occurrencePath.string() + ":" +
                   std::to_string(source_.offset(decl->getLocation(), false)),
               {{"fact", "occurrence"},
                {"symbol_key", key},
                {"kind", occurrenceKind.str()},
-               {"span", std::move(*source_.span(decl->getSourceRange()))},
+               {"span", std::move(*occurrenceSpan)},
                {"enclosing_key", enclosingDeclKey(decl)}});
     auto owner = enclosingDecl(decl);
     auto sourceKey = owner ? source_.declKey(owner, symbolKind(owner).value_or("unknown"))

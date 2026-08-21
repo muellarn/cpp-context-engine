@@ -473,6 +473,56 @@ def test_real_cfg_snapshot_covers_control_flow_macro_and_lifetime_facts() -> Non
     )
 
 
+def test_cfg_macro_expression_ranges_are_ordered_and_keep_expansion_evidence() -> None:
+    first = _cfg_batch()
+    second = _cfg_batch()
+    graph = _cfg_for(first, "cfg_fixture::local_object_macro_ranges")
+    elements = [element for element in first.cfg_elements if element.graph_id == graph.id]
+    target_text = {
+        "LOCAL_LEFT_OPERAND + 1",
+        "value - LOCAL_CHUNK_SIZE",
+        "value += LOCAL_CHUNK_SIZE",
+    }
+    macro_expressions = [
+        element
+        for element in elements
+        if element.statement_class in {"BinaryOperator", "CompoundAssignOperator"}
+        and element.text in target_text
+    ]
+
+    assert len(macro_expressions) == 3
+    assert all(element.spelling_span is None for element in macro_expressions)
+    assert all(element.expansion_span is not None for element in macro_expressions)
+    assert all(
+        (span.end_line, span.end_column) >= (span.start_line, span.start_column)
+        for element in first.cfg_elements
+        for span in (element.spelling_span, element.expansion_span)
+        if span is not None
+    )
+    assert first == second
+
+
+def test_mixed_macro_spelling_range_keeps_callsite_with_expansion_evidence(
+    tmp_path: Path,
+) -> None:
+    batch = _cfg_batch()
+    owner = next(
+        symbol
+        for symbol in batch.symbols
+        if symbol.qualified_name == "cfg_fixture::local_object_macro_call_range"
+    )
+    callsites = [site for site in batch.callsites if site.owner_symbol_id == owner.id]
+
+    assert len(callsites) == 1
+    assert callsites[0].callee_text == "LOCAL_CALL_TARGET(value)"
+    assert callsites[0].spelling_span is None
+    assert callsites[0].expansion_span is not None
+
+    with SQLiteStore(tmp_path / "index.db", project_root=CFG_FIXTURE) as store:
+        store.apply_ingestion(CFG_FIXTURE, batch)
+        assert store.get_callsite(callsites[0].id) == callsites[0]
+
+
 def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(tmp_path: Path) -> None:
     first = _cfg_batch()
     second = _cfg_batch()

@@ -40,6 +40,11 @@ are `file`, `symbol`, `occurrence`, `edge`, `include`, and the versioned
 references use stable
 USR or location-derived keys that the Python adapter converts to canonical IDs.
 Macro expansions carry independent `spelling_span` and `expansion_span` objects.
+Every emitted span is validated against one Clang file buffer and ordered byte
+offsets. Genuinely cross-file endpoints use Clang's deterministic file-character
+range when available. If independent macro spelling endpoints instead mix a use
+site with an earlier definition in the same file, the invalid spelling span is
+omitted; the separately mapped expansion span and macro stack remain available.
 Symbols can carry `template_kind`, `template_arguments`,
 `is_lambda_call_operator`, and `stable_lambda_key` metadata.
 
