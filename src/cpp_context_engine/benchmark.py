@@ -695,6 +695,31 @@ def _database_size(database: Path) -> int:
     )
 
 
+def _write_report_atomic(output: Path, document: str) -> None:
+    """Replace a report only after its complete contents reach a sibling file."""
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(document)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _fact_counts(database: Path) -> dict[str, int]:
     with sqlite3.connect(database) as connection:
         return {
@@ -805,10 +830,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         spec = replace(
             base,
-            translation_units=args.translation_units or base.translation_units,
-            builds=args.builds or base.builds,
-            functions_per_translation_unit=args.functions_per_tu
-            or base.functions_per_translation_unit,
+            translation_units=(
+                base.translation_units if args.translation_units is None else args.translation_units
+            ),
+            builds=base.builds if args.builds is None else args.builds,
+            functions_per_translation_unit=(
+                base.functions_per_translation_unit
+                if args.functions_per_tu is None
+                else args.functions_per_tu
+            ),
             seed=base.seed if args.seed is None else args.seed,
         )
         report = run_benchmark(
@@ -826,8 +856,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output is None:
         print(document, end="")
     else:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(document, encoding="utf-8")
+        try:
+            _write_report_atomic(args.output, document)
+        except OSError:
+            # Filesystem details can contain project/user paths; keep the CLI error public-safe.
+            print("error: benchmark report could not be written", file=sys.stderr)
+            return 2
         print(f"benchmark report written: {args.output}", file=sys.stderr)
     return 1 if args.enforce_budgets and not report["all_budgets_passed"] else 0
 

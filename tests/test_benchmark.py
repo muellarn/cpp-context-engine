@@ -190,3 +190,47 @@ def test_cli_labels_dimension_overrides_as_custom(monkeypatch: pytest.MonkeyPatc
         == 0
     )
     assert captured["profile"] == "custom"
+
+
+@pytest.mark.parametrize("option", ["--translation-units", "--builds", "--functions-per-tu"])
+def test_cli_rejects_zero_dimension_instead_of_running_the_default_profile(
+    option: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_run(**_arguments: object) -> dict[str, object]:
+        raise AssertionError("invalid dimensions must fail before the benchmark starts")
+
+    monkeypatch.setattr(benchmark_module, "run_benchmark", unexpected_run)
+
+    assert benchmark_module.main(["--clang-analyzer", "unused-by-test", option, "0"]) == 2
+
+
+def test_cli_report_write_is_atomic_and_preserves_existing_output_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "report.json"
+    output.write_text("previous report\n", encoding="utf-8")
+    monkeypatch.setattr(
+        benchmark_module,
+        "run_benchmark",
+        lambda **_arguments: {"all_budgets_passed": True},
+    )
+    monkeypatch.setattr(benchmark_module, "validate_report", lambda _report: None)
+
+    def fail_replace(_source: object, _destination: object) -> None:
+        raise OSError("injected atomic replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    assert (
+        benchmark_module.main(
+            [
+                "--clang-analyzer",
+                "unused-by-test",
+                "--output",
+                str(output),
+            ]
+        )
+        == 2
+    )
+    assert output.read_text(encoding="utf-8") == "previous report\n"
+    assert "injected atomic replace failure" not in capsys.readouterr().err
