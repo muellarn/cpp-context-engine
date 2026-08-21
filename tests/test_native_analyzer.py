@@ -61,7 +61,7 @@ def test_native_handshake_matches_protocol_golden() -> None:
     request = {
         "type": "hello",
         "protocol": "cpp-context-clang-facts",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "required_clang_major": 18,
     }
     completed = subprocess.run(  # noqa: S603 - repository-built test binary
@@ -405,6 +405,8 @@ def test_companion_preserves_baseline_canonical_ids_and_relation_parity() -> Non
     }
     assert baseline_ids <= native_ids
     assert {edge.relation for edge in baseline.edges} <= {edge.relation for edge in native.edges}
+    assert baseline.callsites == () and baseline.call_targets == ()
+    assert all(not unit.advanced_facts_complete for unit in baseline.translation_units)
 
 
 @pytest.mark.clang
@@ -452,7 +454,7 @@ def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
     valid = {
         "type": "hello",
         "protocol": "cpp-context-clang-facts",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "analyzer_version": "test",
         "clang_major": 18,
         "capabilities": [
@@ -470,6 +472,10 @@ def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
             "symbols",
             "template_metadata",
             "uses_type",
+            "callsites_v1",
+            "dispatch_targets_v1",
+            "macro_expansion_stack",
+            "template_relationships_v1",
         ],
     }
     script = _script(
@@ -557,12 +563,14 @@ def test_doctor_checks_real_companion(capsys: pytest.CaptureFixture[str]) -> Non
     )
     report = json.loads(capsys.readouterr().out)
     assert report["clang_analyzer_executable"] is True
-    assert report["clang_analyzer_protocol"] == 2
+    assert report["clang_analyzer_protocol"] == 3
     assert report["clang_analyzer_clang_major"] == 18
     assert report["advanced_facts_complete"] is True
     assert report["cfg_facts_available"] is True
+    assert report["call_facts_available"] is True
     assert "function_cfg_v1" in report["clang_analyzer_capabilities"]
     assert "macro_provenance" in report["clang_analyzer_capabilities"]
+    assert "callsites_v1" in report["clang_analyzer_capabilities"]
 
 
 def test_cli_index_reports_companion_coverage(

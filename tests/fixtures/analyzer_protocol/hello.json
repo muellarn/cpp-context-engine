@@ -14,10 +14,14 @@
     "source_manager",
     "symbols",
     "template_metadata",
-    "uses_type"
+    "uses_type",
+    "callsites_v1",
+    "dispatch_targets_v1",
+    "macro_expansion_stack",
+    "template_relationships_v1"
   ],
   "clang_major": 18,
   "protocol": "cpp-context-clang-facts",
-  "protocol_version": 2,
+  "protocol_version": 3,
   "type": "hello"
 }

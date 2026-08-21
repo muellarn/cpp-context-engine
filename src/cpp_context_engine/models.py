@@ -34,6 +34,9 @@ class GraphRelation(StrEnum):
     OVERRIDES = "overrides"
     USES_TYPE = "uses_type"
     INCLUDES = "includes"
+    INSTANTIATES = "instantiates"
+    SPECIALIZES = "specializes"
+    GENERATED_BY_MACRO = "generated_by_macro"
 
 
 class GraphDirection(StrEnum):
@@ -72,6 +75,25 @@ class CfgEdgeKind(StrEnum):
     RETURN = "return"
     GOTO = "goto"
     EXCEPTION = "exception"
+
+
+class CallDispatchKind(StrEnum):
+    """Compiler-observed dispatch form at one syntactic callsite."""
+
+    DIRECT = "direct"
+    CONSTRUCTOR = "constructor"
+    VIRTUAL = "virtual"
+    DEVIRTUALIZED = "devirtualized"
+    LAMBDA = "lambda"
+    GENERIC_LAMBDA = "generic_lambda"
+    FUNCTOR = "functor"
+    DEPENDENT_TEMPLATE = "dependent_template"
+    UNRESOLVED_INDIRECT = "unresolved_indirect"
+
+
+class CallTargetCertainty(StrEnum):
+    CERTAIN = "certain"
+    POSSIBLE = "possible"
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +333,72 @@ class CfgEdge:
             raise ValueError("CFG edge identifiers must not be empty")
         if self.successor_index < 0:
             raise ValueError("CFG successor index must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class MacroExpansionFrame:
+    """One innermost-to-outermost preprocessor expansion frame."""
+
+    macro_symbol_id: str
+    name: str
+    spelling_span: SourceSpan
+    expansion_span: SourceSpan
+
+    def __post_init__(self) -> None:
+        if not self.macro_symbol_id.strip() or not self.name.strip():
+            raise ValueError("macro expansion frames require a symbol and name")
+
+
+@dataclass(frozen=True, slots=True)
+class CallSite:
+    """One syntactic call expression in one concrete compiler invocation."""
+
+    id: str
+    owner_symbol_id: str
+    dispatch_kind: CallDispatchKind
+    spelling_span: SourceSpan
+    expansion_span: SourceSpan
+    target_set_complete: bool
+    static_target_symbol_id: str | None = None
+    unresolved_reason: str = ""
+    callee_text: str = ""
+    expansion_stack: tuple[MacroExpansionFrame, ...] = ()
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.owner_symbol_id.strip():
+            raise ValueError("callsite identifiers must not be empty")
+        if not self.target_set_complete and not self.unresolved_reason.strip():
+            raise ValueError("incomplete callsites require an unresolved reason")
+        if self.target_set_complete and self.unresolved_reason:
+            raise ValueError("complete callsites must not have an unresolved reason")
+
+
+@dataclass(frozen=True, slots=True)
+class CallTarget:
+    """One compiler-derived target edge for a CallSite."""
+
+    id: str
+    callsite_id: str
+    target_symbol_id: str
+    certainty: CallTargetCertainty
+    confidence: float
+    confidence_reason: str
+    derivation: str
+    evidence_span: SourceSpan
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.callsite_id.strip() or not self.target_symbol_id.strip():
+            raise ValueError("call target identifiers must not be empty")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("call target confidence must be between zero and one")
+        if not self.confidence_reason.strip() or not self.derivation.strip():
+            raise ValueError("call targets require confidence and derivation evidence")
 
 
 CfgFact = TypeVar("CfgFact")

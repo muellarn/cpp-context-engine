@@ -318,6 +318,8 @@ def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP TABLE call_targets;
+        DROP TABLE callsites;
         DROP TABLE cfg_edges;
         DROP TABLE cfg_elements;
         DROP TABLE cfg_blocks;
@@ -328,14 +330,23 @@ def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
     connection.close()
 
     with SQLiteStore(database) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 5  # noqa: SLF001
+        assert (  # noqa: SLF001
+            store._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        )
         tables = {
             row[0]
             for row in store._connection.execute(  # noqa: SLF001
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert {"cfg_graphs", "cfg_blocks", "cfg_elements", "cfg_edges"} <= tables
+        assert {
+            "cfg_graphs",
+            "cfg_blocks",
+            "cfg_elements",
+            "cfg_edges",
+            "callsites",
+            "call_targets",
+        } <= tables
 
 
 def test_v4_migration_does_not_claim_v5_before_cfg_schema_exists(tmp_path: Path) -> None:

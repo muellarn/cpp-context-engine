@@ -32,6 +32,8 @@ class IndexingResult:
     indexed_cfg_blocks: int = 0
     indexed_cfg_elements: int = 0
     indexed_cfg_edges: int = 0
+    indexed_callsites: int = 0
+    indexed_call_targets: int = 0
 
 
 class ProjectIndexer:
@@ -73,16 +75,18 @@ class ProjectIndexer:
             batch = IngestionBatch((), (), (), (), (), (variant,))
         if changed:
             batch = IngestionBatch(
-                batch.build_configurations,
-                batch.translation_units,
-                batch.symbols,
-                batch.occurrences,
-                batch.edges,
-                (variant,),
-                batch.cfg_graphs,
-                batch.cfg_blocks,
-                batch.cfg_elements,
-                batch.cfg_edges,
+                build_configurations=batch.build_configurations,
+                translation_units=batch.translation_units,
+                symbols=batch.symbols,
+                occurrences=batch.occurrences,
+                edges=batch.edges,
+                build_variants=(variant,),
+                cfg_graphs=batch.cfg_graphs,
+                cfg_blocks=batch.cfg_blocks,
+                cfg_elements=batch.cfg_elements,
+                cfg_edges=batch.cfg_edges,
+                callsites=batch.callsites,
+                call_targets=batch.call_targets,
             )
         removed = len(set(previous) - current_ids)
         self._store.apply_ingestion(
@@ -102,6 +106,8 @@ class ProjectIndexer:
             indexed_cfg_blocks=len(batch.cfg_blocks),
             indexed_cfg_elements=len(batch.cfg_elements),
             indexed_cfg_edges=len(batch.cfg_edges),
+            indexed_callsites=len(batch.callsites),
+            indexed_call_targets=len(batch.call_targets),
         )
 
     @staticmethod
