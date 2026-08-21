@@ -80,7 +80,9 @@ class IterativeAnswerService:
             ).context
             diagnostics.extend(bundle.diagnostics)
             for item in bundle.items:
-                known_items[item.hit.symbol.id] = item
+                known_items.setdefault(item.hit.symbol.id, item)
+                if item.hit.symbol.variant_id:
+                    known_items[item.hit.symbol.variant_id] = item
 
             raw = self.llm.complete(
                 self._prompt(original_query, search_query, bundle, step, step_limit)
@@ -174,6 +176,7 @@ class IterativeAnswerService:
                     path=symbol.span.path,
                     start_line=symbol.span.start_line,
                     end_line=symbol.span.end_line,
+                    build_variant=symbol.build_variant,
                 )
             )
         return tuple(citations)

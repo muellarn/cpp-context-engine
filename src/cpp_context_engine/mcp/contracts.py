@@ -54,6 +54,8 @@ class SourceLocation(ToolOutput):
 
 class SymbolReference(ToolOutput):
     symbol_id: str
+    variant_id: str = ""
+    build_variant: str = "default"
     qualified_name: str
     kind: SymbolKind
     signature: str
@@ -89,6 +91,8 @@ class ReadSymbolResult(ToolOutput):
 
 
 class GraphEdgeResult(ToolOutput):
+    edge_id: str = ""
+    build_variant: str = "default"
     source: SymbolReference
     target: SymbolReference
     relation: GraphRelation
@@ -116,6 +120,7 @@ class IndexProjectResult(ToolOutput):
 class AnswerSource(ToolOutput):
     symbol_id: str
     qualified_name: str
+    build_variant: str = "default"
     location: SourceLocation
 
 

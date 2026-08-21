@@ -15,7 +15,9 @@ from typing import Any
 from cpp_context_engine import __version__
 from cpp_context_engine.api import AnswerRequest, QueryRequest
 from cpp_context_engine.config import AppConfig
+from cpp_context_engine.models import BuildScope, BuildVariant
 from cpp_context_engine.runtime import build_runtime, index_project
+from cpp_context_engine.storage import SQLiteStore
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -34,6 +36,17 @@ def _parser() -> argparse.ArgumentParser:
     _add_project_options(index, positional=True, include_compile_commands=True)
     _add_embedding_options(index)
     index.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    index.add_argument(
+        "--build",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="named compilation database; repeat to index multiple variants",
+    )
+
+    remove_build = commands.add_parser("remove-build", help="remove one indexed build variant")
+    remove_build.add_argument("name", help="build variant name")
+    _add_project_options(remove_build, positional=False)
 
     search = commands.add_parser("search", help="find connected symbols and source context")
     search.add_argument("query", help="natural-language, identifier, or signature query")
@@ -41,6 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_embedding_options(search)
     search.add_argument("--max-context-tokens", type=int)
     search.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    search.add_argument("--build", action="append", default=[], metavar="NAME")
 
     ask = commands.add_parser("ask", help="answer a code question with validated sources")
     ask.add_argument("query", help="question about the indexed C++ project")
@@ -50,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     ask.add_argument("--max-context-tokens", type=int)
     ask.add_argument("--max-steps", type=int)
     ask.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    ask.add_argument("--build", action="append", default=[], metavar="NAME")
 
     serve = commands.add_parser("serve", help="serve the wired FastAPI application")
     _add_project_options(serve, positional=False)
@@ -57,6 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_llm_options(serve)
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
+    serve.add_argument("--build", action="append", default=[], metavar="NAME")
 
     mcp = commands.add_parser("mcp", help="serve the configured project over MCP")
     _add_project_options(mcp, positional=False, include_compile_commands=True)
@@ -70,6 +86,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     mcp.add_argument("--host", help="HTTP bind address (default: configured localhost)")
     mcp.add_argument("--port", type=int, help="HTTP port")
+    mcp.add_argument(
+        "--build",
+        action="append",
+        default=[],
+        metavar="NAME[=PATH]",
+        help="operator-owned build scope or named compilation database",
+    )
     return parser
 
 
@@ -116,12 +139,29 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         compilation_database = project / "build" / "compile_commands.json"
     else:
         compilation_database = base.compilation_database
+    build_arguments = getattr(args, "build", [])
+    configured_variants = base.build_variants
+    build_scope = base.build_scope
+    if args.command in {"index", "mcp"} and any("=" in item for item in build_arguments):
+        configured_variants = _parse_build_variants(build_arguments)
+        build_scope = BuildScope(tuple(variant.name for variant in configured_variants))
+        compilation_database = configured_variants[0].compilation_database
+    elif explicit_commands is not None or (
+        project_arg is not None
+        and "CPP_CONTEXT_COMPILE_COMMANDS" not in os.environ
+        and "CPP_CONTEXT_BUILDS" not in os.environ
+    ):
+        configured_variants = (BuildVariant("default", compilation_database),)
+    if build_arguments and not any("=" in item for item in build_arguments):
+        build_scope = BuildScope(tuple(build_arguments))
     return replace(
         base,
         project_root=project,
         index_directory=database.parent if database else project / ".cpp-context",
         database_path=database,
         compilation_database=compilation_database,
+        build_variants=configured_variants,
+        build_scope=build_scope,
         libclang_library_file=getattr(args, "libclang", None) or base.libclang_library_file,
         embedding_provider=getattr(args, "embedding_provider", None) or base.embedding_provider,
         embedding_base_url=getattr(args, "embedding_base_url", None) or base.embedding_base_url,
@@ -133,6 +173,16 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         serve_host=getattr(args, "host", None) or base.serve_host,
         serve_port=getattr(args, "port", None) or base.serve_port,
     )
+
+
+def _parse_build_variants(values: Sequence[str]) -> tuple[BuildVariant, ...]:
+    variants: list[BuildVariant] = []
+    for value in values:
+        name, separator, raw_path = value.partition("=")
+        if not separator or not name.strip() or not raw_path.strip():
+            raise ValueError("--build must use NAME=PATH when configuring compilation databases")
+        variants.append(BuildVariant(name.strip(), Path(raw_path.strip())))
+    return tuple(variants)
 
 
 def _doctor(config: AppConfig, *, as_json: bool) -> int:
@@ -201,6 +251,15 @@ def _run_index(config: AppConfig, *, as_json: bool) -> int:
     return 0
 
 
+def _run_remove_build(config: AppConfig, name: str) -> int:
+    assert config.database_path is not None
+    with SQLiteStore(config.database_path, project_root=config.project_root) as store:
+        if not store.remove_build_variant(name, config.project_root):
+            raise ValueError(f"build variant is not indexed: {name}")
+    print(f"removed build variant: {name}")
+    return 0
+
+
 def _context_payload(bundle: Any) -> dict[str, Any]:
     return {
         "query": bundle.query,
@@ -210,6 +269,8 @@ def _context_payload(bundle: Any) -> dict[str, Any]:
         "results": [
             {
                 "symbol_id": item.hit.symbol.id,
+                "variant_id": item.hit.symbol.variant_id,
+                "build_variant": item.hit.symbol.build_variant,
                 "qualified_name": item.hit.symbol.qualified_name,
                 "kind": item.hit.symbol.kind.value,
                 "path": str(item.hit.symbol.span.path),
@@ -273,6 +334,7 @@ def _run_ask(config: AppConfig, args: argparse.Namespace) -> int:
             {
                 "symbol_id": source.symbol_id,
                 "qualified_name": source.qualified_name,
+                "build_variant": source.build_variant,
                 "path": str(source.path),
                 "start_line": source.start_line,
                 "end_line": source.end_line,
@@ -342,6 +404,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _doctor(config, as_json=args.json)
         if args.command == "index":
             return _run_index(config, as_json=args.json)
+        if args.command == "remove-build":
+            return _run_remove_build(config, args.name)
         if args.command == "search":
             return _run_search(config, args)
         if args.command == "ask":

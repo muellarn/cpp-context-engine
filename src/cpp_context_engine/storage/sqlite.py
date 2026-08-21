@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -14,6 +15,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cpp_context_engine.models import (
+    DEFAULT_BUILD_VARIANT,
+    BuildScope,
+    BuildVariant,
     CodeSymbol,
     GraphDirection,
     GraphEdge,
@@ -29,7 +33,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,14 +43,22 @@ class TranslationUnitState:
     command_hash: str
     content_hash: str
     dependencies: tuple[tuple[Path, str], ...]
+    build_variant: str = DEFAULT_BUILD_VARIANT
 
 
 class SQLiteStore:
     """A replaceable local store with atomic translation-unit updates."""
 
-    def __init__(self, path: Path, *, project_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        project_root: Path | None = None,
+        build_scope: BuildScope | None = None,
+    ) -> None:
         self.path = path
         self.project_root = project_root.resolve(strict=False) if project_root else None
+        self.build_scope = build_scope or BuildScope.single()
         path.parent.mkdir(parents=True, exist_ok=True)
         # FastAPI executes synchronous handlers in worker threads; SQLite's serialized
         # mode safely supports this read-heavy connection when the thread guard is off.
@@ -272,6 +284,247 @@ class SQLiteStore:
                     PRAGMA user_version = 2;
                     """
                 )
+        if current <= 2:
+            self._migrate_v3()
+
+    def _migrate_v3(self) -> None:
+        """Add build/TU evidence tables without discarding baseline v2 reads."""
+
+        with self._connection:
+            self._connection.executescript(
+                """
+                CREATE TABLE build_variants (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    compilation_database TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    reindex_required INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project_id, name)
+                );
+
+                ALTER TABLE build_configurations
+                    ADD COLUMN build_variant TEXT NOT NULL DEFAULT 'default';
+                ALTER TABLE translation_units
+                    ADD COLUMN build_variant TEXT NOT NULL DEFAULT 'default';
+                ALTER TABLE occurrences
+                    ADD COLUMN build_variant TEXT NOT NULL DEFAULT 'default';
+                ALTER TABLE occurrences
+                    ADD COLUMN build_configuration_id TEXT NOT NULL DEFAULT '';
+                ALTER TABLE edges ADD COLUMN id TEXT NOT NULL DEFAULT '';
+                ALTER TABLE edges
+                    ADD COLUMN build_variant TEXT NOT NULL DEFAULT 'default';
+                ALTER TABLE edges
+                    ADD COLUMN build_configuration_id TEXT NOT NULL DEFAULT '';
+
+                CREATE TABLE symbol_variants (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    is_definition INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, build_variant, translation_unit_id, symbol_id),
+                    FOREIGN KEY (project_id, symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE variant_embeddings (
+                    project_id INTEGER NOT NULL,
+                    variant_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    magnitude REAL NOT NULL,
+                    vector BLOB NOT NULL,
+                    PRIMARY KEY (project_id, variant_id, model),
+                    FOREIGN KEY (project_id, variant_id)
+                        REFERENCES symbol_variants(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE VIRTUAL TABLE symbol_variant_fts USING fts5(
+                    project_id UNINDEXED,
+                    variant_id UNINDEXED,
+                    symbol_id UNINDEXED,
+                    build_variant UNINDEXED,
+                    qualified_name,
+                    signature,
+                    documentation,
+                    source_text,
+                    tokenize = 'unicode61'
+                );
+
+                CREATE INDEX symbol_variants_scope
+                    ON symbol_variants(project_id, build_variant, symbol_id);
+                CREATE INDEX translation_units_scope
+                    ON translation_units(project_id, build_variant, id);
+                CREATE INDEX edges_scope_source
+                    ON edges(project_id, build_variant, source_id, relation);
+                CREATE INDEX edges_scope_target
+                    ON edges(project_id, build_variant, target_id, relation);
+                PRAGMA user_version = 3;
+                """
+            )
+            projects = self._connection.execute("SELECT id FROM projects").fetchall()
+            for project in projects:
+                project_id = int(project[0])
+                self._connection.execute(
+                    """
+                    INSERT INTO build_variants(
+                        project_id, name, compilation_database, reindex_required
+                    ) VALUES (?, 'default', '', 1)
+                    """,
+                    (project_id,),
+                )
+                units = {
+                    row["id"]: row["build_configuration_id"]
+                    for row in self._connection.execute(
+                        """
+                        SELECT id, build_configuration_id FROM translation_units
+                        WHERE project_id = ?
+                        """,
+                        (project_id,),
+                    )
+                }
+                origins = self._connection.execute(
+                    """
+                    SELECT translation_unit_id, symbol_id, is_definition, snapshot_json
+                    FROM translation_unit_symbols WHERE project_id = ?
+                    """,
+                    (project_id,),
+                ).fetchall()
+                for origin in origins:
+                    variant_id = _stable_id(
+                        "variant",
+                        DEFAULT_BUILD_VARIANT,
+                        origin["translation_unit_id"],
+                        origin["symbol_id"],
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO symbol_variants(
+                            project_id, id, symbol_id, build_variant,
+                            build_configuration_id, translation_unit_id,
+                            is_definition, snapshot_json
+                        ) VALUES (?, ?, ?, 'default', ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            variant_id,
+                            origin["symbol_id"],
+                            units.get(origin["translation_unit_id"], ""),
+                            origin["translation_unit_id"],
+                            origin["is_definition"],
+                            origin["snapshot_json"],
+                        ),
+                    )
+                edge_rows = self._connection.execute(
+                    """
+                    SELECT rowid, translation_unit_id, source_id, target_id, relation
+                    FROM edges WHERE project_id = ? ORDER BY rowid
+                    """,
+                    (project_id,),
+                ).fetchall()
+                for edge in edge_rows:
+                    edge_id = _stable_id(
+                        "edge",
+                        DEFAULT_BUILD_VARIANT,
+                        edge["translation_unit_id"],
+                        edge["source_id"],
+                        edge["target_id"],
+                        edge["relation"],
+                        str(edge["rowid"]),
+                    )
+                    self._connection.execute(
+                        """
+                        UPDATE edges SET id = ?, build_configuration_id = ?
+                        WHERE rowid = ?
+                        """,
+                        (edge_id, units.get(edge["translation_unit_id"], ""), edge["rowid"]),
+                    )
+                self._connection.execute(
+                    """
+                    UPDATE occurrences
+                    SET build_configuration_id = COALESCE((
+                        SELECT units.build_configuration_id FROM translation_units units
+                        WHERE units.project_id = occurrences.project_id
+                          AND units.id = occurrences.translation_unit_id
+                    ), '')
+                    WHERE project_id = ?
+                    """,
+                    (project_id,),
+                )
+            self._rebuild_variant_fts()
+            self._connection.executescript(
+                """
+                CREATE TABLE edges_v3 (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, source_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE
+                );
+                INSERT INTO edges_v3(
+                    project_id, id, translation_unit_id, build_configuration_id,
+                    build_variant, source_id, target_id, relation
+                )
+                SELECT project_id, id, translation_unit_id, build_configuration_id,
+                       build_variant, source_id, target_id, relation
+                FROM edges;
+                DROP TABLE edges;
+                ALTER TABLE edges_v3 RENAME TO edges;
+                CREATE INDEX edges_source ON edges(project_id, source_id, relation);
+                CREATE INDEX edges_target ON edges(project_id, target_id, relation);
+                CREATE INDEX edges_scope_source
+                    ON edges(project_id, build_variant, source_id, relation);
+                CREATE INDEX edges_scope_target
+                    ON edges(project_id, build_variant, target_id, relation);
+                """
+            )
+
+    def _rebuild_variant_fts(self) -> None:
+        self._connection.execute("DELETE FROM symbol_variant_fts")
+        rows = self._connection.execute(
+            """
+            SELECT project_id, id, symbol_id, build_variant, snapshot_json
+            FROM symbol_variants ORDER BY project_id, id
+            """
+        )
+        for row in rows:
+            snapshot = json.loads(row["snapshot_json"])
+            self._connection.execute(
+                """
+                INSERT INTO symbol_variant_fts(
+                    project_id, variant_id, symbol_id, build_variant,
+                    qualified_name, signature, documentation, source_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["project_id"],
+                    row["id"],
+                    row["symbol_id"],
+                    row["build_variant"],
+                    snapshot["qualified_name"],
+                    snapshot["signature"],
+                    snapshot["documentation"],
+                    snapshot["source_text"],
+                ),
+            )
 
     def apply_ingestion(
         self,
@@ -279,18 +532,29 @@ class SQLiteStore:
         batch: IngestionBatch,
         *,
         current_translation_unit_ids: frozenset[str] | None = None,
+        build_variant: BuildVariant | None = None,
     ) -> None:
         """Atomically replace changed units and optionally remove stale units."""
 
         root = str(project_root.resolve(strict=False))
+        selected_variant = build_variant or (
+            batch.build_variants[0]
+            if batch.build_variants
+            else BuildVariant(DEFAULT_BUILD_VARIANT, Path("."))
+        )
         with self._connection:
             project_id = self._ensure_project(root)
+            self._put_build_variant(project_id, selected_variant)
             existing: set[str] = set()
             if current_translation_unit_ids is not None:
                 existing = {
                     row[0]
                     for row in self._connection.execute(
-                        "SELECT id FROM translation_units WHERE project_id = ?", (project_id,)
+                        """
+                        SELECT id FROM translation_units
+                        WHERE project_id = ? AND build_variant = ?
+                        """,
+                        (project_id, selected_variant.name),
                     )
                 }
             changed_ids = {unit.id for unit in batch.translation_units}
@@ -308,8 +572,8 @@ class SQLiteStore:
                     """
                     INSERT INTO build_configurations(
                         project_id, id, source_path, directory, arguments_json,
-                        command_hash, output
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        command_hash, output, build_variant
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, id) DO UPDATE SET
                         source_path = excluded.source_path,
                         directory = excluded.directory,
@@ -325,6 +589,7 @@ class SQLiteStore:
                         json.dumps(configuration.arguments),
                         configuration.command_hash,
                         str(configuration.output) if configuration.output else None,
+                        configuration.build_variant,
                     ),
                 )
             for unit in batch.translation_units:
@@ -332,8 +597,8 @@ class SQLiteStore:
                     """
                     INSERT INTO translation_units(
                         project_id, id, build_configuration_id, source_path,
-                        content_hash, diagnostics_json
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        content_hash, diagnostics_json, build_variant
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         project_id,
@@ -342,6 +607,7 @@ class SQLiteStore:
                         str(unit.source_path),
                         unit.content_hash,
                         json.dumps(unit.diagnostics),
+                        unit.build_variant,
                     ),
                 )
                 self._connection.executemany(
@@ -373,12 +639,115 @@ class SQLiteStore:
                         self._symbol_snapshot(symbol),
                     ),
                 )
+                self._put_symbol_variant(project_id, symbol)
             self._put_occurrences(project_id, batch.occurrences)
             self._put_edges(project_id, batch.edges)
             self._refresh_symbols(
                 project_id, affected_symbols | {symbol.id for symbol in batch.symbols}
             )
             self._delete_orphans(project_id)
+            self._connection.execute(
+                """
+                UPDATE build_variants SET reindex_required = 0
+                WHERE project_id = ? AND name = ?
+                """,
+                (project_id, selected_variant.name),
+            )
+
+    def _put_build_variant(self, project_id: int, variant: BuildVariant) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO build_variants(
+                project_id, name, compilation_database, target, platform,
+                metadata_json, reindex_required
+            ) VALUES (?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(project_id, name) DO UPDATE SET
+                compilation_database = excluded.compilation_database,
+                target = excluded.target,
+                platform = excluded.platform,
+                metadata_json = excluded.metadata_json
+            """,
+            (
+                project_id,
+                variant.name,
+                str(variant.compilation_database),
+                variant.target,
+                variant.platform,
+                json.dumps(dict(variant.metadata), sort_keys=True),
+            ),
+        )
+
+    def build_variants(self, project_root: Path | None = None) -> tuple[BuildVariant, ...]:
+        try:
+            project_id = self._project_id(project_root)
+        except KeyError:
+            return ()
+        return tuple(
+            BuildVariant(
+                row["name"],
+                Path(row["compilation_database"] or "."),
+                row["target"],
+                row["platform"],
+                json.loads(row["metadata_json"]),
+            )
+            for row in self._connection.execute(
+                "SELECT * FROM build_variants WHERE project_id = ? ORDER BY name",
+                (project_id,),
+            )
+        )
+
+    def reindex_required_variants(self, project_root: Path | None = None) -> tuple[str, ...]:
+        project_id = self._project_id(project_root)
+        return tuple(
+            row[0]
+            for row in self._connection.execute(
+                """
+                SELECT name FROM build_variants
+                WHERE project_id = ? AND reindex_required = 1 ORDER BY name
+                """,
+                (project_id,),
+            )
+        )
+
+    def remove_build_variant(self, name: str, project_root: Path | None = None) -> bool:
+        """Explicitly delete one build's facts while preserving every other variant."""
+
+        project_id = self._project_id(project_root)
+        with self._connection:
+            affected = {
+                row[0]
+                for row in self._connection.execute(
+                    """
+                    SELECT DISTINCT symbol_id FROM symbol_variants
+                    WHERE project_id = ? AND build_variant = ?
+                    """,
+                    (project_id, name),
+                )
+            }
+            cursor = self._connection.execute(
+                "DELETE FROM build_variants WHERE project_id = ? AND name = ?",
+                (project_id, name),
+            )
+            if cursor.rowcount == 0:
+                return False
+            unit_ids = tuple(
+                row[0]
+                for row in self._connection.execute(
+                    """
+                    SELECT id FROM translation_units
+                    WHERE project_id = ? AND build_variant = ?
+                    """,
+                    (project_id, name),
+                )
+            )
+            self._delete_translation_units(project_id, unit_ids)
+            self._connection.execute(
+                "DELETE FROM build_configurations WHERE project_id = ? AND build_variant = ?",
+                (project_id, name),
+            )
+            self._refresh_symbols(project_id, affected)
+            self._delete_orphans(project_id)
+            return True
 
     def _ensure_project(self, root: str) -> int:
         self._connection.execute("INSERT OR IGNORE INTO projects(root) VALUES (?)", (root,))
@@ -412,9 +781,23 @@ class SQLiteStore:
         return True
 
     def _delete_translation_units(self, project_id: int, unit_ids: Iterable[str]) -> None:
+        ids = tuple(unit_ids)
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        self._connection.execute(
+            f"""
+            DELETE FROM symbol_variant_fts
+            WHERE project_id = ? AND variant_id IN (
+                SELECT id FROM symbol_variants
+                WHERE project_id = ? AND translation_unit_id IN ({placeholders})
+            )
+            """,
+            (project_id, project_id, *ids),
+        )
         self._connection.executemany(
             "DELETE FROM translation_units WHERE project_id = ? AND id = ?",
-            ((project_id, unit_id) for unit_id in unit_ids),
+            ((project_id, unit_id) for unit_id in ids),
         )
         self._delete_orphans(project_id)
 
@@ -438,9 +821,9 @@ class SQLiteStore:
             """
             DELETE FROM symbols
             WHERE project_id = ? AND NOT EXISTS (
-                SELECT 1 FROM translation_unit_symbols origins
-                WHERE origins.project_id = symbols.project_id
-                  AND origins.symbol_id = symbols.id
+                SELECT 1 FROM symbol_variants variants
+                WHERE variants.project_id = symbols.project_id
+                  AND variants.symbol_id = symbols.id
             )
             """,
             (project_id,),
@@ -527,6 +910,8 @@ class SQLiteStore:
                 "source_text": symbol.source_text,
                 "build_configuration_id": symbol.build_configuration_id,
                 "translation_unit_id": symbol.translation_unit_id,
+                "build_variant": symbol.build_variant,
+                "variant_id": symbol.variant_id,
                 "metadata": dict(symbol.metadata),
             },
             sort_keys=True,
@@ -552,16 +937,99 @@ class SQLiteStore:
             source_text=data["source_text"],
             build_configuration_id=data["build_configuration_id"],
             translation_unit_id=data["translation_unit_id"],
+            build_variant=data.get("build_variant", DEFAULT_BUILD_VARIANT),
+            variant_id=data.get("variant_id", ""),
             metadata=data["metadata"],
+        )
+
+    def _put_symbol_variant(self, project_id: int, symbol: CodeSymbol) -> None:
+        variant_id = symbol.variant_id or _stable_id(
+            "variant", symbol.build_variant, symbol.translation_unit_id, symbol.id
+        )
+        snapshot = self._symbol_snapshot(
+            CodeSymbol(
+                id=symbol.id,
+                qualified_name=symbol.qualified_name,
+                kind=symbol.kind,
+                span=symbol.span,
+                signature=symbol.signature,
+                documentation=symbol.documentation,
+                source_hash=symbol.source_hash,
+                source_text=symbol.source_text,
+                build_configuration_id=symbol.build_configuration_id,
+                translation_unit_id=symbol.translation_unit_id,
+                build_variant=symbol.build_variant,
+                variant_id=variant_id,
+                metadata=symbol.metadata,
+            )
+        )
+        existing = self._connection.execute(
+            """
+            SELECT snapshot_json FROM symbol_variants
+            WHERE project_id = ? AND id = ?
+            """,
+            (project_id, variant_id),
+        ).fetchone()
+        if existing is not None and existing["snapshot_json"] != snapshot:
+            self._connection.execute(
+                "DELETE FROM variant_embeddings WHERE project_id = ? AND variant_id = ?",
+                (project_id, variant_id),
+            )
+        self._connection.execute(
+            "DELETE FROM symbol_variant_fts WHERE project_id = ? AND variant_id = ?",
+            (project_id, variant_id),
+        )
+        self._connection.execute(
+            """
+            INSERT INTO symbol_variants(
+                project_id, id, symbol_id, build_variant, build_configuration_id,
+                translation_unit_id, is_definition, snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, id) DO UPDATE SET
+                symbol_id = excluded.symbol_id,
+                build_variant = excluded.build_variant,
+                build_configuration_id = excluded.build_configuration_id,
+                translation_unit_id = excluded.translation_unit_id,
+                is_definition = excluded.is_definition,
+                snapshot_json = excluded.snapshot_json
+            """,
+            (
+                project_id,
+                variant_id,
+                symbol.id,
+                symbol.build_variant,
+                symbol.build_configuration_id,
+                symbol.translation_unit_id,
+                int(bool(symbol.metadata.get("is_definition"))),
+                snapshot,
+            ),
+        )
+        self._connection.execute(
+            """
+            INSERT INTO symbol_variant_fts(
+                project_id, variant_id, symbol_id, build_variant,
+                qualified_name, signature, documentation, source_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                variant_id,
+                symbol.id,
+                symbol.build_variant,
+                symbol.qualified_name,
+                symbol.signature,
+                symbol.documentation,
+                symbol.source_text,
+            ),
         )
 
     def _refresh_symbols(self, project_id: int, symbol_ids: set[str]) -> None:
         for symbol_id in symbol_ids:
             row = self._connection.execute(
                 """
-                SELECT snapshot_json FROM translation_unit_symbols
+                SELECT snapshot_json FROM symbol_variants
                 WHERE project_id = ? AND symbol_id = ?
-                ORDER BY is_definition DESC, translation_unit_id
+                ORDER BY is_definition DESC, build_variant, translation_unit_id
                 LIMIT 1
                 """,
                 (project_id, symbol_id),
@@ -578,8 +1046,9 @@ class SQLiteStore:
             """
             INSERT OR REPLACE INTO occurrences(
                 project_id, translation_unit_id, id, symbol_id, enclosing_symbol_id,
-                kind, path, start_line, end_line, start_column, end_column
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                kind, path, start_line, end_line, start_column, end_column,
+                build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -594,6 +1063,8 @@ class SQLiteStore:
                     occurrence.span.end_line,
                     occurrence.span.start_column,
                     occurrence.span.end_column,
+                    occurrence.build_configuration_id,
+                    occurrence.build_variant,
                 )
                 for occurrence in occurrences
             ),
@@ -603,39 +1074,56 @@ class SQLiteStore:
         self._connection.executemany(
             """
             INSERT OR IGNORE INTO edges(
-                project_id, translation_unit_id, source_id, target_id, relation
-            ) VALUES (?, ?, ?, ?, ?)
+                project_id, id, translation_unit_id, build_configuration_id,
+                build_variant, source_id, target_id, relation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
                     project_id,
+                    edge.id
+                    or _stable_id(
+                        "edge",
+                        edge.build_variant,
+                        edge.translation_unit_id,
+                        edge.source_id,
+                        edge.target_id,
+                        edge.relation.value,
+                    ),
                     edge.translation_unit_id,
+                    edge.build_configuration_id,
+                    edge.build_variant,
                     edge.source_id,
                     edge.target_id,
-                    edge.relation,
+                    edge.relation.value,
                 )
                 for edge in edges
             ),
         )
 
     def translation_unit_states(
-        self, project_root: Path | None = None
+        self,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
     ) -> dict[str, TranslationUnitState]:
         try:
             project_id = self._project_id(project_root)
         except KeyError:
             return {}
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
         rows = self._connection.execute(
-            """
+            f"""
             SELECT units.id, units.build_configuration_id, configs.command_hash,
-                   units.content_hash
+                   units.content_hash, units.build_variant
             FROM translation_units units
             JOIN build_configurations configs
               ON configs.project_id = units.project_id
              AND configs.id = units.build_configuration_id
-            WHERE units.project_id = ?
+            WHERE units.project_id = ? AND units.build_variant IN ({placeholders})
             """,
-            (project_id,),
+            (project_id, *names),
         ).fetchall()
         result: dict[str, TranslationUnitState] = {}
         for row in rows:
@@ -655,18 +1143,40 @@ class SQLiteStore:
                 command_hash=row["command_hash"],
                 content_hash=row["content_hash"],
                 dependencies=dependencies,
+                build_variant=row["build_variant"],
             )
         return result
 
-    def get_symbol(self, symbol_id: str, project_root: Path | None = None) -> CodeSymbol | None:
+    def get_symbol(
+        self,
+        symbol_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> CodeSymbol | None:
         try:
             project_id = self._project_id(project_root)
         except KeyError:
             return None
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
         row = self._connection.execute(
+            f"""
+            SELECT * FROM symbol_variants
+            WHERE project_id = ? AND (symbol_id = ? OR id = ?)
+              AND build_variant IN ({placeholders})
+            ORDER BY is_definition DESC, build_variant, translation_unit_id LIMIT 1
+            """,
+            (project_id, symbol_id, symbol_id, *names),
+        ).fetchone()
+        if row is not None:
+            return self._variant_row_to_symbol(row)
+        if DEFAULT_BUILD_VARIANT not in names:
+            return None
+        canonical = self._connection.execute(
             "SELECT * FROM symbols WHERE project_id = ? AND id = ?", (project_id, symbol_id)
         ).fetchone()
-        return self._row_to_symbol(row) if row else None
+        return self._row_to_symbol(canonical) if canonical else None
 
     def put_symbols(self, symbols: Iterable[CodeSymbol]) -> None:
         project_id = self._project_id()
@@ -674,18 +1184,49 @@ class SQLiteStore:
             for symbol in symbols:
                 self._put_symbol(project_id, symbol)
 
-    def symbols(self, project_root: Path | None = None) -> tuple[CodeSymbol, ...]:
+    def symbols(
+        self,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> tuple[CodeSymbol, ...]:
         try:
             project_id = self._project_id(project_root)
         except KeyError:
             return ()
-        return tuple(
-            self._row_to_symbol(row)
-            for row in self._connection.execute(
-                "SELECT * FROM symbols WHERE project_id = ? ORDER BY qualified_name, id",
-                (project_id,),
-            )
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM symbol_variants
+            WHERE project_id = ? AND build_variant IN ({placeholders})
+            ORDER BY json_extract(snapshot_json, '$.qualified_name'), build_variant, id
+            """,
+            (project_id, *names),
         )
+        result = [self._variant_row_to_symbol(row) for row in rows]
+        if DEFAULT_BUILD_VARIANT in names:
+            result.extend(
+                self._row_to_symbol(row)
+                for row in self._connection.execute(
+                    """
+                    SELECT * FROM symbols WHERE project_id = ? AND NOT EXISTS (
+                        SELECT 1 FROM symbol_variants variants
+                        WHERE variants.project_id = symbols.project_id
+                          AND variants.symbol_id = symbols.id
+                    ) ORDER BY qualified_name, id
+                    """,
+                    (project_id,),
+                )
+            )
+        return tuple(result)
+
+    def _scope_names(self, scope: BuildScope | tuple[str, ...] | None) -> tuple[str, ...]:
+        if scope is None:
+            return self.build_scope.variants
+        if isinstance(scope, BuildScope):
+            return scope.variants
+        return BuildScope(scope).variants
 
     @staticmethod
     def _row_to_symbol(row: sqlite3.Row) -> CodeSymbol:
@@ -705,13 +1246,39 @@ class SQLiteStore:
             source_hash=row["source_hash"],
             source_text=row["source_text"],
             build_configuration_id=row["build_configuration_id"],
+            build_variant=DEFAULT_BUILD_VARIANT,
             metadata=json.loads(row["metadata_json"]),
         )
 
+    @classmethod
+    def _variant_row_to_symbol(cls, row: sqlite3.Row) -> CodeSymbol:
+        symbol = cls._snapshot_symbol(row["snapshot_json"])
+        return CodeSymbol(
+            id=symbol.id,
+            qualified_name=symbol.qualified_name,
+            kind=symbol.kind,
+            span=symbol.span,
+            signature=symbol.signature,
+            documentation=symbol.documentation,
+            source_hash=symbol.source_hash,
+            source_text=symbol.source_text,
+            build_configuration_id=row["build_configuration_id"],
+            translation_unit_id=row["translation_unit_id"],
+            build_variant=row["build_variant"],
+            variant_id=row["id"],
+            metadata=symbol.metadata,
+        )
+
     def occurrences(
-        self, symbol_id: str, project_root: Path | None = None
+        self,
+        symbol_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
     ) -> tuple[SymbolOccurrence, ...]:
         project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
         return tuple(
             SymbolOccurrence(
                 id=row["id"],
@@ -726,48 +1293,72 @@ class SQLiteStore:
                     row["end_column"],
                 ),
                 translation_unit_id=row["translation_unit_id"],
+                build_configuration_id=row["build_configuration_id"],
+                build_variant=row["build_variant"],
             )
             for row in self._connection.execute(
-                """
+                f"""
                 SELECT * FROM occurrences
                 WHERE project_id = ? AND symbol_id = ?
-                ORDER BY path, start_line, start_column
+                  AND build_variant IN ({placeholders})
+                ORDER BY build_variant, path, start_line, start_column
                 """,
-                (project_id, symbol_id),
+                (project_id, symbol_id, *names),
             )
         )
 
-    def search(self, query: SearchQuery, project_root: Path | None = None) -> Sequence[SearchHit]:
+    def search(
+        self,
+        query: SearchQuery,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> Sequence[SearchHit]:
         project_id = self._project_id(project_root)
         terms = re.findall(r"[\w:]+", query.text, flags=re.UNICODE)
         if not terms:
             return ()
         expression = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
-        # FTS5 weights include the two leading UNINDEXED identity columns.
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
         rows = self._connection.execute(
-            """
-            SELECT symbols.*, bm25(symbol_fts, 0.0, 0.0, 8.0, 4.0, 2.0, 1.0) AS rank
-            FROM symbol_fts
-            JOIN symbols
-              ON symbols.project_id = CAST(symbol_fts.project_id AS INTEGER)
-             AND symbols.id = symbol_fts.symbol_id
-            WHERE symbol_fts MATCH ? AND symbols.project_id = ?
-            ORDER BY rank, symbols.qualified_name
+            f"""
+            SELECT variants.*,
+                   bm25(symbol_variant_fts, 0.0, 0.0, 0.0, 0.0, 8.0, 4.0, 2.0, 1.0)
+                       AS rank
+            FROM symbol_variant_fts
+            JOIN symbol_variants variants
+              ON variants.project_id = CAST(symbol_variant_fts.project_id AS INTEGER)
+             AND variants.id = symbol_variant_fts.variant_id
+            WHERE symbol_variant_fts MATCH ? AND variants.project_id = ?
+              AND variants.build_variant IN ({placeholders})
+            ORDER BY rank, variants.build_variant, variants.id
             LIMIT ?
             """,
-            (expression, project_id, query.limit),
+            (expression, project_id, *names, query.limit),
         ).fetchall()
-        return tuple(
+        hits = [
             SearchHit(
-                symbol=self._row_to_symbol(row),
+                symbol=self._variant_row_to_symbol(row),
                 score=-float(row["rank"]),
                 source="fts5",
             )
             for row in rows
-        )
+        ]
+        if DEFAULT_BUILD_VARIANT in names and len(hits) < query.limit:
+            hits.extend(
+                self._standalone_search(
+                    expression, project_id, query.limit - len(hits), symbols_only=False
+                )
+            )
+        return tuple(hits[: query.limit])
 
     def search_symbols(
-        self, query: SearchQuery, project_root: Path | None = None
+        self,
+        query: SearchQuery,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
     ) -> Sequence[SearchHit]:
         """Search only compiler-resolved names and signatures through FTS5."""
 
@@ -779,31 +1370,80 @@ class SQLiteStore:
         expression = (
             f"qualified_name : ({' OR '.join(escaped)}) OR signature : ({' OR '.join(escaped)})"
         )
-        # Keep the leading identity columns at zero so name/signature weights land correctly.
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
         rows = self._connection.execute(
-            """
-            SELECT symbols.*, bm25(symbol_fts, 0.0, 0.0, 12.0, 6.0, 0.0, 0.0) AS rank
-            FROM symbol_fts
-            JOIN symbols
-              ON symbols.project_id = CAST(symbol_fts.project_id AS INTEGER)
-             AND symbols.id = symbol_fts.symbol_id
-            WHERE symbol_fts MATCH ? AND symbols.project_id = ?
-            ORDER BY rank, symbols.qualified_name
+            f"""
+            SELECT variants.*,
+                   bm25(symbol_variant_fts, 0.0, 0.0, 0.0, 0.0, 12.0, 6.0, 0.0, 0.0)
+                       AS rank
+            FROM symbol_variant_fts
+            JOIN symbol_variants variants
+              ON variants.project_id = CAST(symbol_variant_fts.project_id AS INTEGER)
+             AND variants.id = symbol_variant_fts.variant_id
+            WHERE symbol_variant_fts MATCH ? AND variants.project_id = ?
+              AND variants.build_variant IN ({placeholders})
+            ORDER BY rank, variants.build_variant, variants.id
             LIMIT ?
             """,
-            (expression, project_id, query.limit),
+            (expression, project_id, *names, query.limit),
         ).fetchall()
         query_text = query.text.casefold().strip()
-        return tuple(
+        hits = [
             SearchHit(
-                symbol=self._row_to_symbol(row),
+                symbol=self._variant_row_to_symbol(row),
                 score=-float(row["rank"])
-                + (2.0 if row["qualified_name"].casefold() == query_text else 0.0)
-                + (1.0 if row["qualified_name"].casefold().endswith(f"::{query_text}") else 0.0),
+                + (
+                    2.0
+                    if self._variant_row_to_symbol(row).qualified_name.casefold() == query_text
+                    else 0.0
+                )
+                + (
+                    1.0
+                    if self._variant_row_to_symbol(row)
+                    .qualified_name.casefold()
+                    .endswith(f"::{query_text}")
+                    else 0.0
+                ),
                 source="sqlite-symbol",
             )
             for row in rows
+        ]
+        if DEFAULT_BUILD_VARIANT in names and len(hits) < query.limit:
+            hits.extend(
+                self._standalone_search(
+                    expression, project_id, query.limit - len(hits), symbols_only=True
+                )
+            )
+        hits.sort(key=lambda hit: (-hit.score, hit.symbol.qualified_name, hit.symbol.id))
+        return tuple(hits[: query.limit])
+
+    def _standalone_search(
+        self, expression: str, project_id: int, limit: int, *, symbols_only: bool
+    ) -> list[SearchHit]:
+        weights = "12.0, 6.0, 0.0, 0.0" if symbols_only else "8.0, 4.0, 2.0, 1.0"
+        rows = self._connection.execute(
+            f"""
+            SELECT symbols.*, bm25(symbol_fts, 0.0, 0.0, {weights}) AS rank
+            FROM symbol_fts JOIN symbols
+              ON symbols.project_id = CAST(symbol_fts.project_id AS INTEGER)
+             AND symbols.id = symbol_fts.symbol_id
+            WHERE symbol_fts MATCH ? AND symbols.project_id = ? AND NOT EXISTS (
+                SELECT 1 FROM symbol_variants variants
+                WHERE variants.project_id = symbols.project_id
+                  AND variants.symbol_id = symbols.id
+            ) ORDER BY rank, symbols.qualified_name LIMIT ?
+            """,
+            (expression, project_id, limit),
         )
+        return [
+            SearchHit(
+                self._row_to_symbol(row),
+                -float(row["rank"]),
+                "sqlite-symbol" if symbols_only else "fts5",
+            )
+            for row in rows
+        ]
 
     def put_edges(self, edges: Iterable[GraphEdge]) -> None:
         project_id = self._project_id()
@@ -820,6 +1460,7 @@ class SQLiteStore:
         max_edges: int | None = None,
         per_node_limit: int | None = None,
         project_root: Path | None = None,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
     ) -> Sequence[GraphEdge]:
         if depth < 1:
             raise ValueError("graph depth must be at least one")
@@ -828,9 +1469,11 @@ class SQLiteStore:
         if per_node_limit is not None and per_node_limit < 1:
             raise ValueError("per-node graph limit must be at least one")
         project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        scope_placeholders = ",".join("?" for _ in names)
         frontier = deque([(symbol_id, 0)])
         visited_symbols = {symbol_id}
-        found: dict[tuple[str, str, GraphRelation], GraphEdge] = {}
+        found: dict[str, GraphEdge] = {}
         while frontier:
             if max_edges is not None and len(found) >= max_edges:
                 break
@@ -839,13 +1482,13 @@ class SQLiteStore:
                 continue
             if direction == GraphDirection.OUTGOING:
                 endpoint_sql = "source_id = ?"
-                parameters: list[object] = [project_id, current]
+                parameters: list[object] = [project_id, *names, current]
             elif direction == GraphDirection.INCOMING:
                 endpoint_sql = "target_id = ?"
-                parameters = [project_id, current]
+                parameters = [project_id, *names, current]
             else:
                 endpoint_sql = "(source_id = ? OR target_id = ?)"
-                parameters = [project_id, current, current]
+                parameters = [project_id, *names, current, current]
             relation_sql = ""
             if relations:
                 placeholders = ",".join("?" for _ in relations)
@@ -857,18 +1500,28 @@ class SQLiteStore:
                 parameters.append(per_node_limit)
             rows = self._connection.execute(
                 (
-                    "SELECT DISTINCT source_id, target_id, relation FROM edges "
-                    f"WHERE project_id = ? AND {endpoint_sql}"
+                    "SELECT id, translation_unit_id, build_configuration_id, build_variant, "
+                    "source_id, target_id, relation FROM edges "
+                    f"WHERE project_id = ? AND build_variant IN ({scope_placeholders}) "
+                    f"AND {endpoint_sql}"
                     + relation_sql
-                    + " ORDER BY relation, source_id, target_id"
+                    + " ORDER BY relation, source_id, target_id, build_variant, id"
                     + limit_sql
                 ),
                 parameters,
             )
             for row in rows:
                 relation = GraphRelation(row["relation"])
-                key = (row["source_id"], row["target_id"], relation)
-                found[key] = GraphEdge(*key)
+                edge_id = row["id"]
+                found[edge_id] = GraphEdge(
+                    row["source_id"],
+                    row["target_id"],
+                    relation,
+                    row["translation_unit_id"],
+                    edge_id,
+                    row["build_configuration_id"],
+                    row["build_variant"],
+                )
                 if max_edges is not None and len(found) >= max_edges:
                     break
                 adjacent = (
@@ -889,14 +1542,20 @@ class SQLiteStore:
         model: str,
         vector: Sequence[float],
         project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
     ) -> None:
         project_id = self._project_id(project_root)
+        symbol = self.get_symbol(symbol_id, project_root, build_scope=build_scope)
+        if symbol is None or not symbol.variant_id:
+            raise KeyError(f"symbol variant is not indexed: {symbol_id}")
+        variant_id = symbol.variant_id
         normalized = _validate_vector(vector)
         dimensions = {
             row[0]
             for row in self._connection.execute(
                 """
-                SELECT DISTINCT dimensions FROM embeddings
+                SELECT DISTINCT dimensions FROM variant_embeddings
                 WHERE project_id = ? AND model = ?
                 """,
                 (project_id, model),
@@ -912,36 +1571,74 @@ class SQLiteStore:
         with self._connection:
             self._connection.execute(
                 """
-                INSERT INTO embeddings(
-                    project_id, symbol_id, model, dimensions, magnitude, vector
+                INSERT INTO variant_embeddings(
+                    project_id, variant_id, model, dimensions, magnitude, vector
                 ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, symbol_id, model) DO UPDATE SET
+                ON CONFLICT(project_id, variant_id, model) DO UPDATE SET
                     dimensions = excluded.dimensions,
                     magnitude = excluded.magnitude,
                     vector = excluded.vector
                 """,
-                (project_id, symbol_id, model, len(normalized), magnitude, encoded),
+                (project_id, variant_id, model, len(normalized), magnitude, encoded),
             )
 
     def missing_embedding_symbol_ids(
-        self, model: str, project_root: Path | None = None
+        self,
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
     ) -> tuple[str, ...]:
         """Return stable IDs whose current source snapshot has no vector for ``model``."""
 
         project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        return tuple(
+            dict.fromkeys(
+                row[0]
+                for row in self._connection.execute(
+                    f"""
+                    SELECT variants.symbol_id FROM symbol_variants variants
+                    LEFT JOIN variant_embeddings embeddings
+                      ON embeddings.project_id = variants.project_id
+                     AND embeddings.variant_id = variants.id
+                     AND embeddings.model = ?
+                    WHERE variants.project_id = ?
+                      AND variants.build_variant IN ({placeholders})
+                      AND embeddings.variant_id IS NULL
+                    ORDER BY variants.build_variant, variants.symbol_id
+                    """,
+                    (model, project_id, *names),
+                )
+            )
+        )
+
+    def missing_embedding_variant_ids(
+        self,
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> tuple[str, ...]:
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
         return tuple(
             row[0]
             for row in self._connection.execute(
-                """
-                SELECT symbols.id FROM symbols
-                LEFT JOIN embeddings
-                  ON embeddings.project_id = symbols.project_id
-                 AND embeddings.symbol_id = symbols.id
+                f"""
+                SELECT variants.id FROM symbol_variants variants
+                LEFT JOIN variant_embeddings embeddings
+                  ON embeddings.project_id = variants.project_id
+                 AND embeddings.variant_id = variants.id
                  AND embeddings.model = ?
-                WHERE symbols.project_id = ? AND embeddings.symbol_id IS NULL
-                ORDER BY symbols.id
+                WHERE variants.project_id = ?
+                  AND variants.build_variant IN ({placeholders})
+                  AND embeddings.variant_id IS NULL
+                ORDER BY variants.build_variant, variants.id
                 """,
-                (model, project_id),
+                (model, project_id, *names),
             )
         )
 
@@ -949,7 +1646,7 @@ class SQLiteStore:
         project_id = self._project_id(project_root)
         return int(
             self._connection.execute(
-                "SELECT count(*) FROM embeddings WHERE project_id = ? AND model = ?",
+                "SELECT count(*) FROM variant_embeddings WHERE project_id = ? AND model = ?",
                 (project_id, model),
             ).fetchone()[0]
         )
@@ -961,20 +1658,27 @@ class SQLiteStore:
         model: str,
         limit: int = 20,
         project_root: Path | None = None,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
     ) -> Sequence[SearchHit]:
         if limit <= 0:
             raise ValueError("vector search limit must be greater than zero")
         query_vector = _validate_vector(vector)
         query_magnitude = math.sqrt(sum(value * value for value in query_vector))
         project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
         dimensions = {
             row[0]
             for row in self._connection.execute(
-                """
-                SELECT DISTINCT dimensions FROM embeddings
-                WHERE project_id = ? AND model = ?
+                f"""
+                SELECT DISTINCT dimensions FROM variant_embeddings embeddings
+                JOIN symbol_variants variants
+                  ON variants.project_id = embeddings.project_id
+                 AND variants.id = embeddings.variant_id
+                WHERE embeddings.project_id = ? AND embeddings.model = ?
+                  AND variants.build_variant IN ({placeholders})
                 """,
-                (project_id, model),
+                (project_id, model, *names),
             )
         }
         if dimensions and dimensions != {len(query_vector)}:
@@ -983,16 +1687,17 @@ class SQLiteStore:
                 f"dimension {next(iter(dimensions))}"
             )
         rows = self._connection.execute(
-            """
-            SELECT embeddings.*, symbols.*
-            FROM embeddings
-            JOIN symbols
-              ON symbols.project_id = embeddings.project_id
-             AND symbols.id = embeddings.symbol_id
+            f"""
+            SELECT embeddings.*, variants.*
+            FROM variant_embeddings embeddings
+            JOIN symbol_variants variants
+              ON variants.project_id = embeddings.project_id
+             AND variants.id = embeddings.variant_id
             WHERE embeddings.project_id = ? AND embeddings.model = ?
               AND embeddings.dimensions = ?
+              AND variants.build_variant IN ({placeholders})
             """,
-            (project_id, model, len(query_vector)),
+            (project_id, model, len(query_vector), *names),
         )
         scored: list[SearchHit] = []
         for row in rows:
@@ -1001,8 +1706,8 @@ class SQLiteStore:
                 left * right for left, right in zip(query_vector, candidate, strict=True)
             )
             cosine = dot_product / (query_magnitude * row["magnitude"])
-            scored.append(SearchHit(self._row_to_symbol(row), cosine, f"vector:{model}"))
-        scored.sort(key=lambda hit: (-hit.score, hit.symbol.id))
+            scored.append(SearchHit(self._variant_row_to_symbol(row), cosine, f"vector:{model}"))
+        scored.sort(key=lambda hit: (-hit.score, hit.symbol.build_variant, hit.symbol.variant_id))
         return tuple(scored[:limit])
 
 
@@ -1015,3 +1720,11 @@ def _validate_vector(vector: Sequence[float]) -> tuple[float, ...]:
     if not any(value != 0.0 for value in values):
         raise ValueError("embedding vector magnitude must be greater than zero")
     return values
+
+
+def _stable_id(prefix: str, *parts: str) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(part.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+    return f"{prefix}_{digest.hexdigest()[:32]}"

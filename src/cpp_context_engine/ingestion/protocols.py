@@ -8,6 +8,7 @@ from typing import Protocol
 
 from cpp_context_engine.models import (
     BuildConfiguration,
+    BuildVariant,
     CodeSymbol,
     GraphEdge,
     SymbolOccurrence,
@@ -22,6 +23,7 @@ class IngestionBatch:
     symbols: tuple[CodeSymbol, ...]
     occurrences: tuple[SymbolOccurrence, ...]
     edges: tuple[GraphEdge, ...]
+    build_variants: tuple[BuildVariant, ...] = ()
 
 
 class Ingestor(Protocol):

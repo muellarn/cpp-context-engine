@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "..",
+    "file": "src/features.cpp",
+    "arguments": ["clang++", "-std=c++20", "-DFEATURE_ALPHA", "-c", "src/features.cpp"]
+  }
+]

@@ -152,7 +152,7 @@ class HybridRetriever:
             seen_in_backend: set[str] = set()
             weight = self._config.source_weights.get(name, 1.0)
             for rank, hit in enumerate(hits, start=1):
-                symbol_id = hit.symbol.id
+                symbol_id = _evidence_key(hit.symbol)
                 if symbol_id in seen_in_backend:
                     continue
                 seen_in_backend.add(symbol_id)
@@ -186,7 +186,7 @@ class HybridRetriever:
             return candidates
 
         queue = deque((seed, 0) for seed in seeds)
-        visited = {seed.symbol.id for seed in seeds}
+        visited = {_evidence_key(seed.symbol) for seed in seeds}
         edge_count = 0
         expanded_nodes = 0
         budget_exhausted = False
@@ -235,20 +235,29 @@ class HybridRetriever:
                     neighbor_id = edge.source_id
                 else:
                     continue
-                if neighbor_id in visited:
+                neighbor_key = f"{edge.build_variant}:{neighbor_id}"
+                if neighbor_key in visited:
                     continue
 
-                symbol = self._symbol_store.get_symbol(neighbor_id)
+                try:
+                    symbol = self._symbol_store.get_symbol(  # type: ignore[call-arg]
+                        neighbor_id, build_scope=(edge.build_variant,)
+                    )
+                except TypeError:
+                    symbol = self._symbol_store.get_symbol(neighbor_id)
                 if symbol is None:
                     continue
-                visited.add(neighbor_id)
+                neighbor_key = _evidence_key(symbol)
+                if neighbor_key in visited:
+                    continue
+                visited.add(neighbor_key)
                 expanded_nodes += 1
                 # Neighbor traversal is bidirectional, but provenance must retain the
                 # compiler-derived edge orientation instead of inventing a reverse edge.
                 step = ContextPathStep(edge.source_id, edge.target_id, edge.relation)
                 path = (*current.path, step)
                 graph_score = current.hit.score * self._config.graph_decay
-                candidate = candidates.get(neighbor_id)
+                candidate = candidates.get(neighbor_key)
                 if candidate is None:
                     candidate = _Candidate(
                         hit=SearchHit(symbol, graph_score, "graph"),
@@ -257,13 +266,13 @@ class HybridRetriever:
                             f"hub degree {degree}",
                         ],
                         path=path,
-                        parent_id=current.symbol.id,
+                        parent_id=_evidence_key(current.symbol),
                         hub_degree=degree,
                     )
-                    candidates[neighbor_id] = candidate
+                    candidates[neighbor_key] = candidate
                 else:
                     candidate.path = path
-                    candidate.parent_id = current.symbol.id
+                    candidate.parent_id = _evidence_key(current.symbol)
                     candidate.hub_degree = degree
                     candidate.reasons.append(f"reached through {edge.relation.value}")
                     if graph_score > candidate.hit.score:
@@ -335,11 +344,12 @@ class HybridRetriever:
             component_queue = deque([root])
             while component_queue:
                 candidate = component_queue.popleft()
-                if candidate.symbol.id in seen:
+                key = _evidence_key(candidate.symbol)
+                if key in seen:
                     continue
-                seen.add(candidate.symbol.id)
+                seen.add(key)
                 ordered.append(candidate)
-                component_queue.extend(by_parent.get(candidate.symbol.id, ()))
+                component_queue.extend(by_parent.get(key, ()))
 
         rendered_parts: list[str] = []
         items: list[ContextItem] = []
@@ -410,9 +420,14 @@ class HybridRetriever:
         prefix = (
             f"### {symbol.qualified_name}\n"
             f"Symbol-ID: {symbol.id}\n"
+            f"Build: {symbol.build_variant}\n"
             f"Location: {display_path}:{span.start_line}-{span.end_line}\n"
             f"Selected: {reason}\n"
             f"Path: {path}\n"
             "```cpp\n"
         )
         return prefix, "\n```\n\n"
+
+
+def _evidence_key(symbol: CodeSymbol) -> str:
+    return symbol.variant_id or f"{symbol.build_variant}:{symbol.id}"

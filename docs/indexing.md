@@ -29,6 +29,21 @@ with SQLiteStore(root / ".cpp-context" / "index.db", project_root=root) as store
     )
 ```
 
+For multiple configurations, bind each database to a named `BuildVariant` and
+index it independently:
+
+```python
+from cpp_context_engine.models import BuildScope, BuildVariant, SearchQuery
+
+debug = BuildVariant("debug", root / "build-debug" / "compile_commands.json")
+release = BuildVariant("release", root / "build-release" / "compile_commands.json")
+with SQLiteStore(root / ".cpp-context" / "index.db", project_root=root) as store:
+    indexer = ProjectIndexer(ClangIngestor(), store)
+    indexer.index(root, debug.compilation_database, build_variant=debug)
+    indexer.index(root, release.compilation_database, build_variant=release)
+    hits = store.search(SearchQuery("packet handler"), build_scope=BuildScope(("debug", "release")))
+```
+
 Compilation-database entries are checked before parsing. Exactly one of
 `arguments` and `command` must be present, source files must exist, and relative
 paths are resolved from the database location/entry working directory. The exact
@@ -59,6 +74,14 @@ translation unit that recorded it; removed compilation commands cascade their
 now-unreferenced symbols, occurrences, graph edges, embeddings, and FTS rows.
 Symbols seen by multiple translation units retain origin mappings so updating or
 removing one unit does not discard facts still used by another.
+
+Schema v3 separates canonical Clang symbol identity from deduplicated
+build/configuration/translation-unit `symbol_variants`. Occurrences and graph edges
+carry the same provenance. Graph edges have stable evidence IDs, so repeated calls
+between the same endpoint symbols remain distinct callsites. Build-filtered FTS,
+vector, symbol and graph reads use `BuildScope`; union results retain their build
+labels. `SQLiteStore.remove_build_variant` is the only operation that removes an
+entire named build.
 
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by model ID and dimension. `SQLiteVectorSearch` accepts any provider

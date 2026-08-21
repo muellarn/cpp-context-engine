@@ -121,7 +121,7 @@ class _TranslationUnitCollector:
         self.translation_unit_id = translation_unit_id
         self.symbols: dict[str, CodeSymbol] = {}
         self.occurrences: dict[str, SymbolOccurrence] = {}
-        self.edges: set[GraphEdge] = set()
+        self.edges: dict[str, GraphEdge] = {}
         self.dependencies: set[Path] = {configuration.source_path}
         self._contents: dict[Path, bytes] = {}
 
@@ -224,10 +224,10 @@ class _TranslationUnitCollector:
             return
         target = self._make_symbol(referenced, target_kind, referenced_path)
         self._put_symbol(target)
-        self._put_edge(enclosing_symbol_id, target.id, relation)
+        self._put_edge(enclosing_symbol_id, target.id, relation, cursor=cursor)
         self._put_occurrence(cursor, target.id, occurrence_kind, enclosing_symbol_id)
         if relation != GraphRelation.REFERENCES:
-            self._put_edge(enclosing_symbol_id, target.id, GraphRelation.REFERENCES)
+            self._put_edge(enclosing_symbol_id, target.id, GraphRelation.REFERENCES, cursor=cursor)
 
     def _collect_overrides(self, cursor: Any, source_id: str) -> None:
         """Use libclang's native override API, absent from the Python wrapper."""
@@ -272,8 +272,46 @@ class _TranslationUnitCollector:
         ):
             self.symbols[symbol.id] = symbol
 
-    def _put_edge(self, source_id: str, target_id: str, relation: GraphRelation) -> None:
-        self.edges.add(GraphEdge(source_id, target_id, relation, self.translation_unit_id))
+    def _put_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        relation: GraphRelation,
+        *,
+        cursor: Any | None = None,
+    ) -> None:
+        span = self._span(cursor) if cursor is not None else None
+        location = (
+            (
+                str(span.path),
+                str(span.start_line),
+                str(span.start_column),
+                str(span.end_line),
+                str(span.end_column),
+            )
+            if span is not None
+            else ("", "", "", "", "")
+        )
+        edge_id = (
+            "edge_"
+            + _hash_text(
+                self.configuration.build_variant,
+                self.translation_unit_id,
+                source_id,
+                target_id,
+                relation.value,
+                *location,
+            )[:32]
+        )
+        self.edges[edge_id] = GraphEdge(
+            source_id,
+            target_id,
+            relation,
+            self.translation_unit_id,
+            edge_id,
+            self.configuration.id,
+            self.configuration.build_variant,
+        )
 
     def _put_occurrence(
         self,
@@ -289,6 +327,8 @@ class _TranslationUnitCollector:
             "occ_"
             + _hash_text(
                 symbol_id,
+                self.configuration.build_variant,
+                self.translation_unit_id,
                 kind.value,
                 str(span.path),
                 str(span.start_line),
@@ -304,6 +344,8 @@ class _TranslationUnitCollector:
             kind=kind,
             enclosing_symbol_id=enclosing_symbol_id,
             translation_unit_id=self.translation_unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
         )
 
     def _file_symbol(self, path: Path) -> CodeSymbol:
@@ -325,6 +367,11 @@ class _TranslationUnitCollector:
             source_hash=_hash_bytes(content),
             build_configuration_id=self.configuration.id,
             translation_unit_id=self.translation_unit_id,
+            build_variant=self.configuration.build_variant,
+            variant_id="variant_"
+            + _hash_text(self.configuration.build_variant, self.translation_unit_id, symbol_id)[
+                :32
+            ],
             metadata={"relative_path": relative},
         )
         self.symbols[symbol_id] = symbol
@@ -353,6 +400,11 @@ class _TranslationUnitCollector:
             source_text=source_text,
             build_configuration_id=self.configuration.id,
             translation_unit_id=self.translation_unit_id,
+            build_variant=self.configuration.build_variant,
+            variant_id="variant_"
+            + _hash_text(self.configuration.build_variant, self.translation_unit_id, symbol_id)[
+                :32
+            ],
             metadata={
                 "usr": usr,
                 "display_name": cursor.displayname or cursor.spelling,
@@ -453,8 +505,14 @@ class ClangIngestor:
         self._cindex = _load_cindex(library_file)
         self._fail_on_error = fail_on_error
 
-    def ingest(self, project_root: Path, compilation_database: Path) -> IngestionBatch:
-        database = CompilationDatabase.load(compilation_database)
+    def ingest(
+        self,
+        project_root: Path,
+        compilation_database: Path,
+        *,
+        build_variant: str = "default",
+    ) -> IngestionBatch:
+        database = CompilationDatabase.load(compilation_database, build_variant=build_variant)
         return self.ingest_configurations(project_root, database.configurations)
 
     def ingest_configurations(
@@ -511,11 +569,12 @@ class ClangIngestor:
                     content_hash=_hash_bytes(configuration.source_path.read_bytes()),
                     dependencies=dependencies,
                     diagnostics=diagnostics,
+                    build_variant=configuration.build_variant,
                 )
             )
             symbols.extend(collector.symbols.values())
             occurrences.extend(collector.occurrences.values())
-            edges.extend(collector.edges)
+            edges.extend(collector.edges.values())
 
         return IngestionBatch(
             build_configurations=tuple(build_configurations),

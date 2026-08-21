@@ -12,7 +12,11 @@ from cpp_context_engine.ingestion.compilation_database import (
     translation_unit_id,
 )
 from cpp_context_engine.ingestion.protocols import IngestionBatch
-from cpp_context_engine.models import BuildConfiguration
+from cpp_context_engine.models import (
+    DEFAULT_BUILD_VARIANT,
+    BuildConfiguration,
+    BuildVariant,
+)
 from cpp_context_engine.storage.sqlite import SQLiteStore, TranslationUnitState
 
 
@@ -33,10 +37,19 @@ class ProjectIndexer:
         self._ingestor = ingestor
         self._store = store
 
-    def index(self, project_root: Path, compilation_database: Path) -> IndexingResult:
+    def index(
+        self,
+        project_root: Path,
+        compilation_database: Path,
+        *,
+        build_variant: BuildVariant | None = None,
+    ) -> IndexingResult:
         project_root = project_root.resolve(strict=False)
-        database = CompilationDatabase.load(compilation_database)
-        previous = self._store.translation_unit_states(project_root)
+        variant = build_variant or BuildVariant(DEFAULT_BUILD_VARIANT, compilation_database)
+        if variant.compilation_database != compilation_database.resolve(strict=False):
+            raise ValueError("build variant compilation database does not match index request")
+        database = CompilationDatabase.load(compilation_database, build_variant=variant.name)
+        previous = self._store.translation_unit_states(project_root, build_scope=(variant.name,))
         current_ids = frozenset(translation_unit_id(config) for config in database.configurations)
         changed = [
             configuration
@@ -46,12 +59,22 @@ class ProjectIndexer:
         if changed:
             batch = self._ingestor.ingest_configurations(project_root, changed)
         else:
-            batch = IngestionBatch((), (), (), (), ())
+            batch = IngestionBatch((), (), (), (), (), (variant,))
+        if changed:
+            batch = IngestionBatch(
+                batch.build_configurations,
+                batch.translation_units,
+                batch.symbols,
+                batch.occurrences,
+                batch.edges,
+                (variant,),
+            )
         removed = len(set(previous) - current_ids)
         self._store.apply_ingestion(
             project_root,
             batch,
             current_translation_unit_ids=current_ids,
+            build_variant=variant,
         )
         return IndexingResult(
             indexed_translation_units=len(changed),
