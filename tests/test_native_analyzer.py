@@ -8,6 +8,7 @@ import stat
 import subprocess
 import threading
 import time
+import zlib
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -24,7 +25,7 @@ from cpp_context_engine.ingestion import (
 from cpp_context_engine.ingestion.clang import ClangIngestor, ClangUnavailableError
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
-from cpp_context_engine.ingestion.native import _FactBatchBuilder
+from cpp_context_engine.ingestion.native import MAX_FACT_KINDS, _FactBatchBuilder, _FactRegistry
 from cpp_context_engine.models import (
     BuildConfiguration,
     BuildScope,
@@ -143,6 +144,15 @@ def test_fact_builder_caches_validated_project_paths(tmp_path: Path) -> None:
     assert first is second
 
 
+def test_fact_registry_bounds_distinct_fact_kinds() -> None:
+    with _FactRegistry() as facts:
+        for index in range(MAX_FACT_KINDS):
+            facts.add({"fact": f"kind-{index}"})
+
+        with pytest.raises(AnalyzerLimitError, match="fact-kind registry limit"):
+            facts.add({"fact": "one-kind-too-many"})
+
+
 def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path: Path) -> None:
     active = 0
     maximum_active = 0
@@ -182,9 +192,7 @@ def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path
 
     batch = NativeClangIngestor(  # type: ignore[arg-type]
         ConcurrentClient(), max_workers=3
-    ).ingest_configurations(
-        tmp_path, configurations
-    )
+    ).ingest_configurations(tmp_path, configurations)
 
     assert maximum_active == 3
     assert [item.build_configuration_id for item in batch.translation_units] == [
@@ -237,9 +245,7 @@ def test_native_worker_failure_cancels_pending_work_without_partial_batch(tmp_pa
     with pytest.raises(RuntimeError, match="injected worker failure"):
         NativeClangIngestor(  # type: ignore[arg-type]
             FailingClient(), max_workers=7
-        ).ingest_configurations(
-            tmp_path, configurations
-        )
+        ).ingest_configurations(tmp_path, configurations)
 
     assert sorted(started) == list(range(7))
 
@@ -266,21 +272,38 @@ def test_native_handshake_matches_protocol_golden() -> None:
     assert completed.stderr == ""
 
 
-def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
-    gzip_client = NativeAnalyzerClient(_binary(), timeout_seconds=30)
-    plain_client = NativeAnalyzerClient(
-        _binary(), timeout_seconds=30, prefer_compression=False
+def test_real_companion_finalizes_gzip_when_rejecting_request() -> None:
+    hello = {
+        "type": "hello",
+        "protocol": "cpp-context-clang-facts",
+        "protocol_version": 5,
+        "required_clang_major": 18,
+        "required_capabilities": [],
+        "response_transport": "gzip_jsonl_v1",
+    }
+    malformed_analyze = {"type": "analyze"}
+    completed = subprocess.run(
+        [_binary()],
+        input=(json.dumps(hello) + "\n" + json.dumps(malformed_analyze) + "\n").encode(),
+        capture_output=True,
+        check=False,
     )
 
-    gzip_batch = NativeClangIngestor(gzip_client).ingest(
-        FIXTURE, FIXTURE / "compile_commands.json"
-    )
+    assert completed.returncode == 2
+    records = [json.loads(line) for line in zlib.decompress(completed.stdout, 31).splitlines()]
+    assert [record["type"] for record in records] == ["hello", "error"]
+    assert records[-1]["code"] == "invalid_request"
+
+
+def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
+    gzip_client = NativeAnalyzerClient(_binary(), timeout_seconds=30)
+    plain_client = NativeAnalyzerClient(_binary(), timeout_seconds=30, prefer_compression=False)
+
+    gzip_batch = NativeClangIngestor(gzip_client).ingest(FIXTURE, FIXTURE / "compile_commands.json")
     plain_batch = NativeClangIngestor(plain_client).ingest(
         FIXTURE, FIXTURE / "compile_commands.json"
     )
-    repeated = NativeClangIngestor(gzip_client).ingest(
-        FIXTURE, FIXTURE / "compile_commands.json"
-    )
+    repeated = NativeClangIngestor(gzip_client).ingest(FIXTURE, FIXTURE / "compile_commands.json")
 
     assert gzip_batch == plain_batch == repeated
 
@@ -883,6 +906,31 @@ time.sleep(30)
     while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert elapsed < 2
+    assert not Path(f"/proc/{pid}").exists()
+
+
+def test_parent_exit_still_kills_inherited_pipe_descendant(tmp_path: Path) -> None:
+    if not Path("/proc").is_dir():
+        pytest.skip("process-group cleanup assertion requires Linux procfs")
+    child_pid = tmp_path / "orphan.pid"
+    script = _script(
+        tmp_path,
+        f"""import pathlib, subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))
+""",
+    )
+
+    started = time.monotonic()
+    with pytest.raises(AnalyzerProtocolError, match="handshake"):
+        NativeAnalyzerClient(script, timeout_seconds=5).probe()
+
+    elapsed = time.monotonic() - started
+    pid = int(child_pid.read_text())
+    deadline = time.monotonic() + 1
+    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert elapsed < 3
     assert not Path(f"/proc/{pid}").exists()
 
 

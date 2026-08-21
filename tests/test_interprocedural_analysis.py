@@ -632,20 +632,31 @@ def test_v5_adapter_rejects_malformed_summary_body_and_parameter_references() ->
     summaries = [fact for fact in original if fact.get("fact") == "function_summary_v1"]
     assert len(summaries) >= 2
 
-    foreign_parameter = dict(summaries[0])
+    # Streaming no longer sorts protocol records, so select the relationship
+    # under test by its keys instead of relying on incidental output positions.
+    parameter_target = next(fact for fact in summaries if fact["parameter_location_keys"])
+    foreign_location = next(
+        fact
+        for fact in original
+        if fact.get("fact") == "memory_location_v1"
+        and fact["analysis_key"] != parameter_target["analysis_key"]
+    )
+    foreign_parameter = dict(parameter_target)
     foreign_parameter["parameter_location_keys"] = [
-        summaries[1]["parameter_location_keys"][0],
+        foreign_location["key"],
         *foreign_parameter["parameter_location_keys"][1:],
     ]
     facts = list(original)
-    facts[facts.index(summaries[0])] = foreign_parameter
+    facts[facts.index(parameter_target)] = foreign_parameter
     with pytest.raises(AnalyzerProtocolError, match="inconsistent analysis references"):
         _FactBatchBuilder(FIXTURE.resolve(), configuration).build(facts)
 
-    foreign_body = dict(summaries[0])
-    foreign_body["function_key"] = summaries[1]["function_key"]
+    body_target = summaries[0]
+    body_source = next(fact for fact in summaries if fact["graph_key"] != body_target["graph_key"])
+    foreign_body = dict(body_target)
+    foreign_body["function_key"] = body_source["function_key"]
     facts = list(original)
-    facts[facts.index(summaries[0])] = foreign_body
+    facts[facts.index(body_target)] = foreign_body
     with pytest.raises(AnalyzerProtocolError, match="inconsistent graph references"):
         _FactBatchBuilder(FIXTURE.resolve(), configuration).build(facts)
 

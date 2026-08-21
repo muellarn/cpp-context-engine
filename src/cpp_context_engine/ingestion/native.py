@@ -100,6 +100,7 @@ DEFAULT_MAX_DECODED_BYTES = 256 * 1_048_576
 DEFAULT_MAX_RECORD_BYTES = 16 * 1_048_576
 DEFAULT_MAX_STDERR_BYTES = 256 * 1024
 GZIP_TRANSPORT = "gzip_jsonl_v1"
+MAX_FACT_KINDS = 64
 
 
 class AnalyzerUnavailableError(RuntimeError):
@@ -214,6 +215,10 @@ class _FactRegistry:
             raise AnalyzerProtocolError("analyzer fact has no valid kind")
         destination = self._files.get(fact_kind)
         if destination is None:
+            # One file per arbitrary kind would let tiny malformed records exhaust
+            # descriptors long before the decoded-byte limit is reached.
+            if len(self._files) >= MAX_FACT_KINDS:
+                raise AnalyzerLimitError("analyzer exceeded the fact-kind registry limit")
             destination = tempfile.TemporaryFile(  # noqa: SIM115 - registry owns lifetime
                 mode="w+b", dir=self._directory
             )
@@ -293,13 +298,17 @@ class NativeAnalyzerClient:
         prefer_compression: bool = True,
     ) -> None:
         self.binary = binary.expanduser().resolve(strict=False)
-        if timeout_seconds <= 0 or min(
-            max_input_bytes,
-            max_output_bytes,
-            max_decoded_bytes,
-            max_record_bytes,
-            max_stderr_bytes,
-        ) <= 0:
+        if (
+            timeout_seconds <= 0
+            or min(
+                max_input_bytes,
+                max_output_bytes,
+                max_decoded_bytes,
+                max_record_bytes,
+                max_stderr_bytes,
+            )
+            <= 0
+        ):
             raise ValueError("analyzer timeout and byte limits must be positive")
         self.timeout_seconds = timeout_seconds
         self.max_input_bytes = max_input_bytes
@@ -390,9 +399,7 @@ class NativeAnalyzerClient:
             record_type = record.get("type")
             if state == "hello":
                 if record_type != "hello":
-                    raise AnalyzerProtocolError(
-                        "analyzer did not repeat its validated handshake"
-                    )
+                    raise AnalyzerProtocolError("analyzer did not repeat its validated handshake")
                 if self._validate_handshake(record) != info:
                     raise AnalyzerProtocolError("analyzer handshake changed between invocations")
                 state = "begin"
@@ -474,12 +481,12 @@ class NativeAnalyzerClient:
         records: list[dict[str, Any]] = []
 
         def stop_process() -> None:
-            if process.poll() is not None:
-                return
             with suppress(ProcessLookupError, PermissionError):
                 if os.name != "nt":
+                    # The leader may exit while descendants still hold protocol
+                    # pipes open, so terminate its process group even after poll().
                     os.killpg(process.pid, signal.SIGKILL)
-                else:
+                elif process.poll() is None:
                     process.kill()
 
         def fail(error: BaseException) -> None:
@@ -563,6 +570,9 @@ class NativeAnalyzerClient:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
             process.wait(timeout=2)
+            # A successful leader exit does not imply that descendants released
+            # inherited protocol pipes; close the whole session before joining.
+            stop_process()
         except subprocess.TimeoutExpired:
             stop_process()
             with suppress(subprocess.TimeoutExpired):
@@ -1392,10 +1402,7 @@ class _FactBatchBuilder:
         sites = tuple(sorted(sites_by_key.values(), key=lambda x: x.id))
         targets = tuple(
             sorted(
-                (
-                    self._call_target_fact(fact)
-                    for fact in _fact_records(facts, "call_target_v1")
-                ),
+                (self._call_target_fact(fact) for fact in _fact_records(facts, "call_target_v1")),
                 key=lambda item: (item.callsite_id, item.target_symbol_id, item.id),
             )
         )
@@ -1557,19 +1564,13 @@ class _FactBatchBuilder:
         )
         elements = tuple(
             sorted(
-                (
-                    self._cfg_element_fact(fact)
-                    for fact in _fact_records(facts, "cfg_element_v1")
-                ),
+                (self._cfg_element_fact(fact) for fact in _fact_records(facts, "cfg_element_v1")),
                 key=lambda item: (item.graph_id, item.block_id, item.index, item.id),
             )
         )
         edges = tuple(
             sorted(
-                (
-                    self._cfg_edge_fact(fact)
-                    for fact in _fact_records(facts, "cfg_edge_v1")
-                ),
+                (self._cfg_edge_fact(fact) for fact in _fact_records(facts, "cfg_edge_v1")),
                 key=lambda item: (
                     item.graph_id,
                     item.source_block_id,

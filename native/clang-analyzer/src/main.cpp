@@ -36,6 +36,7 @@
 #include "clang/Tooling/Tooling.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -2763,6 +2764,9 @@ bool handleAnalyze(const llvm::json::Object &request) {
 } // namespace
 
 int main() {
+  // Early returns must finalize gzip before llvm::outs() is torn down; the
+  // global writer destructor runs after that function-local stream.
+  auto finishOutput = llvm::make_scope_exit([] { output.finish(); });
   std::string line;
   bool ready = false;
   while (std::getline(std::cin, line)) {
