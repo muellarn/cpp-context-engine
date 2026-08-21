@@ -418,8 +418,8 @@ def test_v7_migration_is_atomic_and_forces_old_native_reindex(
 
     monkeypatch.setattr(sqlite_module, "_execute_script", original)
     with SQLiteStore(database) as store:
-        assert SCHEMA_VERSION == 7
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 7  # noqa: SLF001
+        assert SCHEMA_VERSION == 8
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 8  # noqa: SLF001
         assert (
             store._connection.execute(  # noqa: SLF001
                 "SELECT advanced_facts_complete FROM translation_units"
@@ -437,6 +437,12 @@ def test_v7_failure_after_v6_leaves_database_at_v6(
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP TABLE interprocedural_flows;
+        DROP TABLE call_result_bindings;
+        DROP TABLE call_argument_bindings;
+        DROP TABLE summary_return_origins;
+        DROP TABLE summary_effects;
+        DROP TABLE function_summaries;
         DROP TABLE data_flow_evidence;
         DROP TABLE data_accesses;
         DROP TABLE memory_locations;

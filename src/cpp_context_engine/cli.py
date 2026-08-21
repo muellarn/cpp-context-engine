@@ -222,6 +222,7 @@ def _doctor(config: AppConfig, *, as_json: bool) -> int:
         "cfg_facts_available": False,
         "call_facts_available": False,
         "data_flow_facts_available": False,
+        "function_summary_facts_available": False,
         "analysis_backend": "libclang-baseline",
     }
     analyzer_ok = True
@@ -256,6 +257,10 @@ def _doctor(config: AppConfig, *, as_json: bool) -> int:
                     "data_flow_facts_available": {
                         "intraprocedural_dataflow_v1",
                         "points_to_v1",
+                    }.issubset(info.capabilities),
+                    "function_summary_facts_available": {
+                        "function_summaries_v1",
+                        "interprocedural_bindings_v1",
                     }.issubset(info.capabilities),
                     "analysis_backend": "clang-libtooling",
                 }

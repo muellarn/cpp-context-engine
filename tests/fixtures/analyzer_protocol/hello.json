@@ -20,10 +20,12 @@
     "macro_expansion_stack",
     "template_relationships_v1",
     "intraprocedural_dataflow_v1",
-    "points_to_v1"
+    "points_to_v1",
+    "function_summaries_v1",
+    "interprocedural_bindings_v1"
   ],
   "clang_major": 18,
   "protocol": "cpp-context-clang-facts",
-  "protocol_version": 4,
+  "protocol_version": 5,
   "type": "hello"
 }

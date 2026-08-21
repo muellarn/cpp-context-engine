@@ -1,0 +1,17 @@
+[
+  {
+    "directory": ".",
+    "file": "src/leaf.cpp",
+    "arguments": ["clang++", "-std=c++20", "-DALT_BUILD=1", "-Iinclude", "-c", "src/leaf.cpp"]
+  },
+  {
+    "directory": ".",
+    "file": "src/chain.cpp",
+    "arguments": ["clang++", "-std=c++20", "-DALT_BUILD=1", "-Iinclude", "-c", "src/chain.cpp"]
+  },
+  {
+    "directory": ".",
+    "file": "src/unrelated.cpp",
+    "arguments": ["clang++", "-std=c++20", "-DALT_BUILD=1", "-Iinclude", "-c", "src/unrelated.cpp"]
+  }
+]

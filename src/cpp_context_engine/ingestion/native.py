@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from cpp_context_engine.analysis.interprocedural import InterproceduralLimits, solve_interprocedural
 from cpp_context_engine.ingestion.compilation_database import (
     CompilationDatabase,
     libclang_arguments,
@@ -21,7 +22,9 @@ from cpp_context_engine.ingestion.compilation_database import (
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
+    CallArgumentBinding,
     CallDispatchKind,
+    CallResultBinding,
     CallSite,
     CallTarget,
     CallTargetCertainty,
@@ -38,6 +41,7 @@ from cpp_context_engine.models import (
     DataFlowCertainty,
     DataFlowEvidence,
     DataFlowRelation,
+    FunctionSummary,
     GraphEdge,
     GraphRelation,
     MacroExpansionFrame,
@@ -45,13 +49,17 @@ from cpp_context_engine.models import (
     MemoryLocationKind,
     OccurrenceKind,
     SourceSpan,
+    SummaryEffect,
+    SummaryEffectKind,
+    SummaryReturnOrigin,
+    SummaryReturnOriginKind,
     SymbolKind,
     SymbolOccurrence,
     TranslationUnit,
 )
 
 PROTOCOL = "cpp-context-clang-facts"
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 REQUIRED_CLANG_MAJOR = 18
 REQUIRED_CAPABILITIES = frozenset(
     {
@@ -75,6 +83,8 @@ REQUIRED_CAPABILITIES = frozenset(
         "template_relationships_v1",
         "intraprocedural_dataflow_v1",
         "points_to_v1",
+        "function_summaries_v1",
+        "interprocedural_bindings_v1",
     }
 )
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -360,7 +370,7 @@ class NativeClangIngestor:
         call_targets = tuple(target for batch in batches for target in batch.call_targets)
         all_edges = tuple(edge for batch in batches for edge in batch.edges)
         call_targets = _add_indexed_override_candidates(callsites, call_targets, all_edges)
-        return IngestionBatch(
+        inputs = IngestionBatch(
             build_configurations=tuple(
                 configuration for batch in batches for configuration in batch.build_configurations
             ),
@@ -384,6 +394,35 @@ class NativeClangIngestor:
             data_flow_evidence=tuple(
                 evidence for batch in batches for evidence in batch.data_flow_evidence
             ),
+            function_summaries=tuple(
+                summary for batch in batches for summary in batch.function_summaries
+            ),
+            summary_effects=tuple(effect for batch in batches for effect in batch.summary_effects),
+            summary_return_origins=tuple(
+                origin for batch in batches for origin in batch.summary_return_origins
+            ),
+            call_argument_bindings=tuple(
+                binding for batch in batches for binding in batch.call_argument_bindings
+            ),
+            call_result_bindings=tuple(
+                binding for batch in batches for binding in batch.call_result_bindings
+            ),
+        )
+        solution = solve_interprocedural(
+            inputs.function_summaries,
+            inputs.summary_effects,
+            inputs.summary_return_origins,
+            inputs.call_argument_bindings,
+            inputs.call_result_bindings,
+            inputs.callsites,
+            inputs.call_targets,
+        )
+        return replace(
+            inputs,
+            function_summaries=solution.summaries,
+            summary_effects=solution.effects,
+            summary_return_origins=solution.return_origins,
+            interprocedural_flows=solution.flows,
         )
 
 
@@ -396,6 +435,7 @@ class _FactBatchBuilder:
         self.keys: dict[str, str] = {}
         self.files: dict[str, Path] = {}
         self.cfg_graph_ids: dict[str, str] = {}
+        self.cfg_graph_function_ids: dict[str, str] = {}
         self.cfg_block_ids: dict[str, str] = {}
         self.cfg_element_ids: dict[str, str] = {}
         self.cfg_block_graph_ids: dict[str, str] = {}
@@ -407,6 +447,9 @@ class _FactBatchBuilder:
         self.memory_location_analysis_ids: dict[str, str] = {}
         self.data_access_ids: dict[str, str] = {}
         self.data_access_analysis_ids: dict[str, str] = {}
+        self.function_summary_ids: dict[str, str] = {}
+        self.function_summary_analysis_ids: dict[str, str] = {}
+        self.function_summary_parameter_counts: dict[str, int] = {}
 
     def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
         for fact in facts:
@@ -430,6 +473,9 @@ class _FactBatchBuilder:
         cfg_graphs, cfg_blocks, cfg_elements, cfg_edges = self._cfg_facts(facts)
         callsites, call_targets = self._call_facts(facts)
         analyses, locations, accesses, evidence = self._data_flow_facts(facts)
+        summaries, effects, origins, argument_bindings, result_bindings = (
+            self._interprocedural_facts(facts)
+        )
         dependencies = tuple(
             (path, _hash_bytes(path.read_bytes())) for path in sorted(set(self.files.values()))
         )
@@ -459,6 +505,11 @@ class _FactBatchBuilder:
             memory_locations=locations,
             data_accesses=accesses,
             data_flow_evidence=evidence,
+            function_summaries=summaries,
+            summary_effects=effects,
+            summary_return_origins=origins,
+            call_argument_bindings=argument_bindings,
+            call_result_bindings=result_bindings,
         )
 
     def _data_flow_facts(
@@ -550,7 +601,7 @@ class _FactBatchBuilder:
                 )
             )
         except ValueError as error:
-            # Invalid enums and model invariants are malformed protocol-v4 facts.
+            # Invalid enums and model invariants are malformed protocol-v5 facts.
             raise AnalyzerProtocolError("analyzer returned an invalid data-flow fact") from error
         return analyses, locations, accesses, evidence
 
@@ -728,6 +779,266 @@ class _FactBatchBuilder:
                 "analyzer data-flow evidence references an unknown access"
             ) from error
 
+    def _interprocedural_facts(
+        self, facts: Sequence[Mapping[str, Any]]
+    ) -> tuple[
+        tuple[FunctionSummary, ...],
+        tuple[SummaryEffect, ...],
+        tuple[SummaryReturnOrigin, ...],
+        tuple[CallArgumentBinding, ...],
+        tuple[CallResultBinding, ...],
+    ]:
+        summary_facts = [fact for fact in facts if fact.get("fact") == "function_summary_v1"]
+        for fact in summary_facts:
+            key = _string(fact, "key")
+            analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+            graph_key = _string(fact, "graph_key")
+            graph_id = self._known_cfg_graph(graph_key)
+            if self.data_flow_analysis_graph_ids.get(_string(fact, "analysis_key")) != graph_id:
+                raise AnalyzerProtocolError(
+                    "analyzer summary facts have inconsistent graph references"
+                )
+            function_id = self._known_id(_string(fact, "function_key"))
+            if self.cfg_graph_function_ids.get(graph_key) != function_id:
+                raise AnalyzerProtocolError(
+                    "analyzer summary facts have inconsistent graph references"
+                )
+            self.function_summary_ids[key] = (
+                "summary_"
+                + _hash_text(
+                    self.configuration.build_variant,
+                    self.configuration.id,
+                    self.unit_id,
+                    graph_id,
+                )[:32]
+            )
+            self.function_summary_analysis_ids[key] = analysis_id
+            self.function_summary_parameter_counts[key] = len(_string_list(fact, "parameter_modes"))
+        try:
+            summaries = tuple(
+                sorted(
+                    (self._function_summary_fact(fact) for fact in summary_facts),
+                    key=lambda item: item.id,
+                )
+            )
+            effects = tuple(
+                sorted(
+                    (
+                        self._summary_effect_fact(fact)
+                        for fact in facts
+                        if fact.get("fact") == "summary_effect_v1"
+                    ),
+                    key=lambda item: item.id,
+                )
+            )
+            origins = tuple(
+                sorted(
+                    (
+                        self._summary_return_origin_fact(fact)
+                        for fact in facts
+                        if fact.get("fact") == "summary_return_origin_v1"
+                    ),
+                    key=lambda item: item.id,
+                )
+            )
+            arguments = tuple(
+                sorted(
+                    (
+                        self._call_argument_binding_fact(fact)
+                        for fact in facts
+                        if fact.get("fact") == "call_argument_binding_v1"
+                    ),
+                    key=lambda item: item.id,
+                )
+            )
+            results = tuple(
+                sorted(
+                    (
+                        self._call_result_binding_fact(fact)
+                        for fact in facts
+                        if fact.get("fact") == "call_result_binding_v1"
+                    ),
+                    key=lambda item: item.id,
+                )
+            )
+        except ValueError as error:
+            raise AnalyzerProtocolError("analyzer returned an invalid summary fact") from error
+        return summaries, effects, origins, arguments, results
+
+    def _function_summary_fact(self, fact: Mapping[str, Any]) -> FunctionSummary:
+        key = _string(fact, "key")
+        modes = _string_list(fact, "parameter_modes")
+        location_keys = _string_list(fact, "parameter_location_keys")
+        reasons = _string_list(fact, "local_incomplete_reasons")
+        complete = _boolean(fact, "local_complete")
+        if len(modes) != len(location_keys) or complete == bool(reasons):
+            raise AnalyzerProtocolError("analyzer function summary shape is invalid")
+        analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+        if any(
+            self.memory_location_analysis_ids.get(location_key) != analysis_id
+            for location_key in location_keys
+        ):
+            raise AnalyzerProtocolError(
+                "analyzer summary facts have inconsistent analysis references"
+            )
+        limits = InterproceduralLimits()
+        return FunctionSummary(
+            id=self._known_function_summary(key),
+            function_symbol_id=self._known_id(_string(fact, "function_key")),
+            graph_id=self._known_cfg_graph(_string(fact, "graph_key")),
+            analysis_id=analysis_id,
+            parameter_modes=modes,
+            parameter_location_ids=tuple(
+                self._known_memory_location(location_key) for location_key in location_keys
+            ),
+            local_complete=complete,
+            local_incomplete_reasons=reasons,
+            complete=complete,
+            incomplete_reasons=reasons,
+            recursive=False,
+            iteration_count=0,
+            max_scc_iterations=limits.max_scc_iterations,
+            max_scc_size=limits.max_scc_size,
+            max_summary_effects=limits.max_summary_effects,
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _summary_effect_fact(self, fact: Mapping[str, Any]) -> SummaryEffect:
+        summary_key = _string(fact, "summary_key")
+        summary_id = self._known_function_summary(summary_key)
+        location_key = _optional_key(fact, "location_key")
+        access_key = _optional_key(fact, "source_access_key")
+        self._validate_summary_analysis(summary_key, location_key, access_key)
+        key = _string(fact, "key")
+        parameter_index = _optional_non_negative_integer(fact, "parameter_index")
+        if (
+            parameter_index is not None
+            and parameter_index >= self.function_summary_parameter_counts[summary_key]
+        ):
+            raise AnalyzerProtocolError("analyzer summary effect has an invalid parameter index")
+        return SummaryEffect(
+            id="summary_effect_" + _hash_text(summary_id, key)[:32],
+            summary_id=summary_id,
+            kind=SummaryEffectKind(_string(fact, "kind")),
+            location_kind=MemoryLocationKind(_string(fact, "location_kind")),
+            certainty=DataFlowCertainty(_string(fact, "certainty")),
+            reason=_string(fact, "reason"),
+            parameter_index=parameter_index,
+            access_path=_string_list(fact, "access_path"),
+            location_id=self._known_memory_location(location_key) if location_key else None,
+            source_access_id=self._known_data_access(access_key) if access_key else None,
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _summary_return_origin_fact(self, fact: Mapping[str, Any]) -> SummaryReturnOrigin:
+        summary_key = _string(fact, "summary_key")
+        summary_id = self._known_function_summary(summary_key)
+        location_key = _optional_key(fact, "location_key")
+        self._validate_summary_analysis(summary_key, location_key, None)
+        callsite_key = _optional_key(fact, "callsite_key")
+        location_kind = _optional_string(fact, "location_kind")
+        key = _string(fact, "key")
+        parameter_index = _optional_non_negative_integer(fact, "parameter_index")
+        if (
+            parameter_index is not None
+            and parameter_index >= self.function_summary_parameter_counts[summary_key]
+        ):
+            raise AnalyzerProtocolError("analyzer summary origin has an invalid parameter index")
+        return SummaryReturnOrigin(
+            id="summary_return_" + _hash_text(summary_id, key)[:32],
+            summary_id=summary_id,
+            kind=SummaryReturnOriginKind(_string(fact, "kind")),
+            certainty=DataFlowCertainty(_string(fact, "certainty")),
+            reason=_string(fact, "reason"),
+            location_kind=MemoryLocationKind(location_kind) if location_kind else None,
+            parameter_index=parameter_index,
+            access_path=_string_list(fact, "access_path"),
+            location_id=self._known_memory_location(location_key) if location_key else None,
+            callsite_id=self._known_callsite(callsite_key) if callsite_key else None,
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _call_argument_binding_fact(self, fact: Mapping[str, Any]) -> CallArgumentBinding:
+        summary_key = _string(fact, "summary_key")
+        summary_id = self._known_function_summary(summary_key)
+        location_key = _optional_key(fact, "location_key")
+        self._validate_summary_analysis(summary_key, location_key, None)
+        complete = _boolean(fact, "complete")
+        reason = _optional_string(fact, "incomplete_reason")
+        if complete == bool(reason):
+            raise AnalyzerProtocolError("analyzer call argument completeness is invalid")
+        callsite_id = self._known_callsite(_string(fact, "callsite_key"))
+        index = _non_negative_integer(fact, "argument_index")
+        parameter_index = _optional_non_negative_integer(fact, "parameter_index")
+        if (
+            parameter_index is not None
+            and parameter_index >= self.function_summary_parameter_counts[summary_key]
+        ):
+            raise AnalyzerProtocolError("analyzer call binding has an invalid parameter index")
+        return CallArgumentBinding(
+            id="call_argument_" + _hash_text(summary_id, callsite_id, str(index))[:32],
+            caller_summary_id=summary_id,
+            callsite_id=callsite_id,
+            argument_index=index,
+            location_id=self._known_memory_location(location_key) if location_key else None,
+            location_kind=MemoryLocationKind(_string(fact, "location_kind")),
+            parameter_index=parameter_index,
+            access_path=_string_list(fact, "access_path"),
+            writeback_candidate=_boolean(fact, "writeback_candidate"),
+            complete=complete,
+            incomplete_reason=reason,
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _call_result_binding_fact(self, fact: Mapping[str, Any]) -> CallResultBinding:
+        summary_key = _string(fact, "summary_key")
+        summary_id = self._known_function_summary(summary_key)
+        location_key = _string(fact, "location_key")
+        access_key = _string(fact, "definition_access_key")
+        self._validate_summary_analysis(summary_key, location_key, access_key)
+        callsite_id = self._known_callsite(_string(fact, "callsite_key"))
+        return CallResultBinding(
+            id="call_result_" + _hash_text(summary_id, callsite_id)[:32],
+            caller_summary_id=summary_id,
+            callsite_id=callsite_id,
+            location_id=self._known_memory_location(location_key),
+            definition_access_id=self._known_data_access(access_key),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _validate_summary_analysis(
+        self, summary_key: str, location_key: str | None, access_key: str | None
+    ) -> None:
+        analysis_id = self.function_summary_analysis_ids.get(summary_key)
+        if analysis_id is None:
+            raise AnalyzerProtocolError("analyzer fact references an unknown function summary")
+        if location_key and self.memory_location_analysis_ids.get(location_key) != analysis_id:
+            raise AnalyzerProtocolError(
+                "analyzer summary facts have inconsistent analysis references"
+            )
+        if access_key and self.data_access_analysis_ids.get(access_key) != analysis_id:
+            raise AnalyzerProtocolError(
+                "analyzer summary facts have inconsistent analysis references"
+            )
+
+    def _known_function_summary(self, key: str) -> str:
+        try:
+            return self.function_summary_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError(
+                "analyzer fact references an unknown function summary"
+            ) from error
+
     def _call_facts(
         self, facts: Sequence[Mapping[str, Any]]
     ) -> tuple[tuple[CallSite, ...], tuple[CallTarget, ...]]:
@@ -875,6 +1186,7 @@ class _FactBatchBuilder:
         for fact in graph_facts:
             graph_key = _string(fact, "key")
             function_id = self._known_id(_string(fact, "function_key"))
+            self.cfg_graph_function_ids[graph_key] = function_id
             self.cfg_graph_ids[graph_key] = (
                 "cfg_"
                 + _hash_text(
@@ -1314,6 +1626,29 @@ def _non_negative_integer(record: Mapping[str, Any], name: str) -> int:
     if value < 0:
         raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
     return value
+
+
+def _optional_non_negative_integer(record: Mapping[str, Any], name: str) -> int | None:
+    value = record.get(name)
+    if value is None:
+        return None
+    return _non_negative_integer(record, name)
+
+
+def _optional_key(record: Mapping[str, Any], name: str) -> str | None:
+    value = record.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+    return value
+
+
+def _string_list(record: Mapping[str, Any], name: str) -> tuple[str, ...]:
+    value = record.get(name)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+    return tuple(value)
 
 
 def _positive_mapping_integer(record: Mapping[str, Any], name: str) -> int:
