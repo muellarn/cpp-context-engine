@@ -431,12 +431,46 @@ class _FactBatchBuilder:
                     function_id,
                 )[:32]
             )
+        block_graph_ids: dict[str, str] = {}
         for fact in block_facts:
             graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
             index = _non_negative_integer(fact, "index")
-            self.cfg_block_ids[_string(fact, "key")] = (
-                "cfg_block_" + _hash_text(graph_id, str(index))[:32]
-            )
+            block_key = _string(fact, "key")
+            block_graph_ids[block_key] = graph_id
+            self.cfg_block_ids[block_key] = "cfg_block_" + _hash_text(graph_id, str(index))[:32]
+
+        # A compromised or mismatched companion must not be able to persist a CFG
+        # relation that crosses graph boundaries while still satisfying SQLite FKs.
+        for fact in graph_facts:
+            graph_id = self._known_cfg_graph(_string(fact, "key"))
+            endpoint_keys = [
+                _string(fact, "entry_block_key"),
+                _string(fact, "normal_exit_block_key"),
+            ]
+            exceptional_key = fact.get("exceptional_exit_block_key")
+            if exceptional_key is not None:
+                if not isinstance(exceptional_key, str) or not exceptional_key:
+                    raise AnalyzerProtocolError("analyzer CFG exceptional exit key is invalid")
+                endpoint_keys.append(exceptional_key)
+            if any(block_graph_ids.get(key) != graph_id for key in endpoint_keys):
+                raise AnalyzerProtocolError("analyzer CFG facts have inconsistent graph references")
+        for fact in facts:
+            fact_kind = fact.get("fact")
+            if fact_kind == "cfg_element_v1":
+                graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+                if block_graph_ids.get(_string(fact, "block_key")) != graph_id:
+                    raise AnalyzerProtocolError(
+                        "analyzer CFG facts have inconsistent graph references"
+                    )
+            elif fact_kind == "cfg_edge_v1":
+                graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+                if any(
+                    block_graph_ids.get(_string(fact, key)) != graph_id
+                    for key in ("source_block_key", "target_block_key")
+                ):
+                    raise AnalyzerProtocolError(
+                        "analyzer CFG facts have inconsistent graph references"
+                    )
 
         graphs = tuple(
             sorted((self._cfg_graph_fact(fact) for fact in graph_facts), key=lambda item: item.id)

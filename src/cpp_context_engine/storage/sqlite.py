@@ -536,7 +536,7 @@ class SQLiteStore:
                 "ALTER TABLE translation_units "
                 "ADD COLUMN advanced_facts_complete INTEGER NOT NULL DEFAULT 0"
             )
-            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._connection.execute("PRAGMA user_version = 4")
         except BaseException:
             self._connection.rollback()
             raise

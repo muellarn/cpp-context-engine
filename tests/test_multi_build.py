@@ -336,3 +336,26 @@ def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
             )
         }
         assert {"cfg_graphs", "cfg_blocks", "cfg_elements", "cfg_edges"} <= tables
+
+
+def test_v4_migration_does_not_claim_v5_before_cfg_schema_exists(tmp_path: Path) -> None:
+    database = tmp_path / "v3.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE occurrences(id TEXT);
+        CREATE TABLE translation_units(id TEXT);
+        PRAGMA user_version = 3;
+        """
+    )
+    store = SQLiteStore.__new__(SQLiteStore)
+    store._connection = connection  # noqa: SLF001 - exercise one migration boundary directly
+    try:
+        store._migrate_v4()  # noqa: SLF001
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert (
+            connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'cfg_graphs'").fetchone()
+            is None
+        )
+    finally:
+        connection.close()

@@ -23,6 +23,7 @@ from cpp_context_engine.ingestion import (
 from cpp_context_engine.ingestion.clang import ClangIngestor, ClangUnavailableError
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
+from cpp_context_engine.ingestion.native import _FactBatchBuilder
 from cpp_context_engine.models import (
     BuildScope,
     BuildVariant,
@@ -268,6 +269,22 @@ def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(tmp_path: Path) 
         assert not store.cfg_edges(graph.id).truncated
         with pytest.raises(ValueError, match="CFG page limit"):
             store.cfg_blocks(graph.id, limit=0)
+
+
+def test_cfg_adapter_rejects_cross_graph_block_references() -> None:
+    client = NativeAnalyzerClient(_binary(), timeout_seconds=30)
+    configuration = CompilationDatabase.load(CFG_FIXTURE / "compile_commands.json").configurations[
+        0
+    ]
+    facts = list(client.analyze(CFG_FIXTURE, configuration))
+    graph_keys = [fact["key"] for fact in facts if fact.get("fact") == "cfg_graph_v1"]
+    element = next(fact for fact in facts if fact.get("fact") == "cfg_element_v1")
+    malformed = dict(element)
+    malformed["graph_key"] = next(key for key in graph_keys if key != element["graph_key"])
+    facts[facts.index(element)] = malformed
+
+    with pytest.raises(AnalyzerProtocolError, match="inconsistent graph references"):
+        _FactBatchBuilder(CFG_FIXTURE.resolve(), configuration).build(facts)
 
 
 def test_cfg_exception_edges_follow_build_configuration_and_build_scope(tmp_path: Path) -> None:
