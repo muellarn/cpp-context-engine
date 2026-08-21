@@ -115,6 +115,9 @@ class IndexProjectResult(ToolOutput):
     indexed_edges: int = Field(ge=0)
     embedded_symbols: int = Field(ge=0)
     embedding_model: str
+    analysis_backend: str
+    advanced_facts_complete: bool
+    analyzer_capabilities: list[str] = Field(default_factory=list)
 
 
 class AnswerSource(ToolOutput):

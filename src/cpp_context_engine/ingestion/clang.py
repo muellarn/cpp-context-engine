@@ -346,6 +346,10 @@ class _TranslationUnitCollector:
             translation_unit_id=self.translation_unit_id,
             build_configuration_id=self.configuration.id,
             build_variant=self.configuration.build_variant,
+            metadata={
+                "analysis_backend": "libclang-baseline",
+                "advanced_facts_complete": False,
+            },
         )
 
     def _file_symbol(self, path: Path) -> CodeSymbol:
@@ -372,7 +376,11 @@ class _TranslationUnitCollector:
             + _hash_text(self.configuration.build_variant, self.translation_unit_id, symbol_id)[
                 :32
             ],
-            metadata={"relative_path": relative},
+            metadata={
+                "relative_path": relative,
+                "analysis_backend": "libclang-baseline",
+                "advanced_facts_complete": False,
+            },
         )
         self.symbols[symbol_id] = symbol
         return symbol
@@ -411,6 +419,8 @@ class _TranslationUnitCollector:
                 "is_definition": self._is_definition(cursor),
                 "start_offset": cursor.extent.start.offset,
                 "end_offset_exclusive": cursor.extent.end.offset,
+                "analysis_backend": "libclang-baseline",
+                "advanced_facts_complete": False,
             },
         )
 
@@ -505,6 +515,9 @@ class ClangIngestor:
         self._cindex = _load_cindex(library_file)
         self._fail_on_error = fail_on_error
 
+    analysis_backend = "libclang-baseline"
+    advanced_facts_complete = False
+
     def ingest(
         self,
         project_root: Path,
@@ -570,6 +583,8 @@ class ClangIngestor:
                     dependencies=dependencies,
                     diagnostics=diagnostics,
                     build_variant=configuration.build_variant,
+                    analysis_backend=self.analysis_backend,
+                    advanced_facts_complete=self.advanced_facts_complete,
                 )
             )
             symbols.extend(collector.symbols.values())

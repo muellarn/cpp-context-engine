@@ -107,6 +107,13 @@ def _add_project_options(
     if include_compile_commands:
         parser.add_argument("--compile-commands", type=Path, help="path to compile_commands.json")
         parser.add_argument("--libclang", type=Path, help="path to compatible libclang")
+        parser.add_argument(
+            "--clang-analyzer", type=Path, help="path to the Clang-18 LibTooling companion"
+        )
+        parser.add_argument("--analyzer-timeout", type=float, help="per-process timeout seconds")
+        parser.add_argument("--analyzer-max-input-bytes", type=int)
+        parser.add_argument("--analyzer-max-output-bytes", type=int)
+        parser.add_argument("--analyzer-max-stderr-bytes", type=int)
 
 
 def _add_embedding_options(parser: argparse.ArgumentParser) -> None:
@@ -163,6 +170,15 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         build_variants=configured_variants,
         build_scope=build_scope,
         libclang_library_file=getattr(args, "libclang", None) or base.libclang_library_file,
+        clang_analyzer_path=getattr(args, "clang_analyzer", None) or base.clang_analyzer_path,
+        analyzer_timeout_seconds=getattr(args, "analyzer_timeout", None)
+        or base.analyzer_timeout_seconds,
+        analyzer_max_input_bytes=getattr(args, "analyzer_max_input_bytes", None)
+        or base.analyzer_max_input_bytes,
+        analyzer_max_output_bytes=getattr(args, "analyzer_max_output_bytes", None)
+        or base.analyzer_max_output_bytes,
+        analyzer_max_stderr_bytes=getattr(args, "analyzer_max_stderr_bytes", None)
+        or base.analyzer_max_stderr_bytes,
         embedding_provider=getattr(args, "embedding_provider", None) or base.embedding_provider,
         embedding_base_url=getattr(args, "embedding_base_url", None) or base.embedding_base_url,
         embedding_model=getattr(args, "embedding_model", None) or base.embedding_model,
@@ -187,6 +203,7 @@ def _parse_build_variants(values: Sequence[str]) -> tuple[BuildVariant, ...]:
 
 def _doctor(config: AppConfig, *, as_json: bool) -> int:
     from cpp_context_engine.ingestion.clang import _discover_libclang
+    from cpp_context_engine.ingestion.native import NativeAnalyzerClient
 
     supported_python = sys.version_info >= (3, 11)
     try:
@@ -194,6 +211,43 @@ def _doctor(config: AppConfig, *, as_json: bool) -> int:
     except ModuleNotFoundError:
         clang_bindings = False
     discovered = config.libclang_library_file or _discover_libclang()
+    analyzer_report: dict[str, Any] = {
+        "clang_analyzer": str(config.clang_analyzer_path) if config.clang_analyzer_path else None,
+        "clang_analyzer_executable": False,
+        "clang_analyzer_protocol": None,
+        "clang_analyzer_version": None,
+        "clang_analyzer_clang_major": None,
+        "clang_analyzer_capabilities": [],
+        "advanced_facts_complete": False,
+        "analysis_backend": "libclang-baseline",
+    }
+    analyzer_ok = True
+    if config.clang_analyzer_path is not None:
+        analyzer_report["clang_analyzer_executable"] = bool(
+            config.clang_analyzer_path.is_file() and os.access(config.clang_analyzer_path, os.X_OK)
+        )
+        try:
+            info = NativeAnalyzerClient(
+                config.clang_analyzer_path,
+                timeout_seconds=config.analyzer_timeout_seconds,
+                max_input_bytes=config.analyzer_max_input_bytes,
+                max_output_bytes=config.analyzer_max_output_bytes,
+                max_stderr_bytes=config.analyzer_max_stderr_bytes,
+            ).probe()
+        except (OSError, RuntimeError, ValueError) as error:
+            analyzer_ok = False
+            analyzer_report["clang_analyzer_error"] = str(error)
+        else:
+            analyzer_report.update(
+                {
+                    "clang_analyzer_protocol": info.protocol_version,
+                    "clang_analyzer_version": info.analyzer_version,
+                    "clang_analyzer_clang_major": info.clang_major,
+                    "clang_analyzer_capabilities": sorted(info.capabilities),
+                    "advanced_facts_complete": True,
+                    "analysis_backend": "clang-libtooling",
+                }
+            )
     report: dict[str, Any] = {
         "clang_bindings_installed": clang_bindings,
         "compile_commands": str(config.compilation_database),
@@ -211,7 +265,10 @@ def _doctor(config: AppConfig, *, as_json: bool) -> int:
         "project_root_exists": config.project_root.is_dir(),
         "python": sys.version.split()[0],
         "python_supported": supported_python,
-        "status": "ok" if supported_python and config.project_root.is_dir() else "error",
+        "status": "ok"
+        if supported_python and config.project_root.is_dir() and analyzer_ok
+        else "error",
+        **analyzer_report,
     }
     if as_json:
         print(json.dumps(report, sort_keys=True))
@@ -231,6 +288,9 @@ def _run_index(config: AppConfig, *, as_json: bool) -> int:
         **asdict(result.indexing),
         "embedded_symbols": result.embedded_symbols,
         "embedding_model": result.embedding_model,
+        "analysis_backend": result.analysis_backend,
+        "advanced_facts_complete": result.advanced_facts_complete,
+        "analyzer_capabilities": list(result.analyzer_capabilities),
         "database": str(config.database_path),
         "project_root": str(config.project_root),
     }
@@ -246,6 +306,10 @@ def _run_index(config: AppConfig, *, as_json: bool) -> int:
         print(
             f"symbols: {payload['indexed_symbols']}; graph edges: {payload['indexed_edges']}; "
             f"new embeddings: {payload['embedded_symbols']} ({payload['embedding_model']})"
+        )
+        print(
+            f"analysis backend: {payload['analysis_backend']}; "
+            f"advanced facts complete: {payload['advanced_facts_complete']}"
         )
         print(f"database: {payload['database']}")
     return 0

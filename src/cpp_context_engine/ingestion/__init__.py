@@ -10,6 +10,14 @@ from cpp_context_engine.ingestion.compilation_database import (
     CompilationDatabaseError,
 )
 from cpp_context_engine.ingestion.indexer import IndexingResult, ProjectIndexer
+from cpp_context_engine.ingestion.native import (
+    AnalyzerInfo,
+    AnalyzerLimitError,
+    AnalyzerProtocolError,
+    AnalyzerUnavailableError,
+    NativeAnalyzerClient,
+    NativeClangIngestor,
+)
 from cpp_context_engine.ingestion.protocols import IngestionBatch, Ingestor
 
 __all__ = [
@@ -20,6 +28,12 @@ __all__ = [
     "IndexingResult",
     "IngestionBatch",
     "Ingestor",
+    "AnalyzerInfo",
+    "AnalyzerLimitError",
+    "AnalyzerProtocolError",
+    "AnalyzerUnavailableError",
+    "NativeAnalyzerClient",
+    "NativeClangIngestor",
     "ProjectIndexer",
     "TranslationUnitError",
 ]

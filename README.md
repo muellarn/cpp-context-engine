@@ -15,7 +15,7 @@ an LLM without loading the whole repository.
 ## Quickstart
 
 Requirements are Python 3.11+, Clang/libclang 18, and a C++ compilation database.
-On Ubuntu, `clang-18` and `libclang-18-dev` provide the native compiler pieces.
+On Ubuntu, `clang-18`, `libclang-18-dev`, and `llvm-18-dev` provide the compiler pieces.
 Install the engine with compiler, HTTP, and MCP support:
 
 ```bash
@@ -42,6 +42,24 @@ If libclang is not discovered automatically, select the native library explicitl
 ```bash
 export LIBCLANG_LIBRARY_FILE=/usr/lib/llvm-18/lib/libclang.so
 ```
+
+For full AST, SourceManager, preprocessor, template, and lambda facts, build the
+small version-locked LibTooling companion. No native executable is vendored:
+
+```bash
+cmake -S native/clang-analyzer -B build/clang-analyzer \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+  -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang
+cmake --build build/clang-analyzer --parallel
+export CPP_CONTEXT_CLANG_ANALYZER="$PWD/build/clang-analyzer/cpp-context-clang-analyzer"
+```
+
+The companion is currently supported on Linux with LLVM/Clang 18. It uses a
+versioned JSONL stdin/stdout protocol; stdout contains protocol records only and
+Clang diagnostics go to stderr. The Python adapter validates protocol version,
+Clang major, and required capabilities before indexing, invokes the executable
+without a shell, bounds input/output/stderr bytes, and enforces a timeout.
 
 Then diagnose, index, and search:
 
@@ -225,6 +243,11 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_BUILDS` | comma-separated named databases (`NAME=PATH`) | unset |
 | `CPP_CONTEXT_BUILD_SCOPE` | comma-separated query/MCP build names | `default` |
 | `LIBCLANG_LIBRARY_FILE` | exact compatible native libclang | auto-discovered |
+| `CPP_CONTEXT_CLANG_ANALYZER` | Clang-18 LibTooling companion executable | unset (baseline mode) |
+| `CPP_CONTEXT_ANALYZER_TIMEOUT` | companion process timeout in seconds | `30` |
+| `CPP_CONTEXT_ANALYZER_MAX_INPUT_BYTES` | maximum JSONL request bytes | `1048576` |
+| `CPP_CONTEXT_ANALYZER_MAX_OUTPUT_BYTES` | maximum JSONL fact bytes | `67108864` |
+| `CPP_CONTEXT_ANALYZER_MAX_STDERR_BYTES` | maximum diagnostic bytes | `262144` |
 | `CPP_CONTEXT_MAX_TOKENS` | default packed context budget | `16000` |
 | `CPP_CONTEXT_RETRIEVAL_LIMIT` | candidates per search backend | `20` |
 | `CPP_CONTEXT_EMBEDDING_PROVIDER` | `local` or `openai` | `local` |
@@ -272,6 +295,15 @@ The package is split along the intended processing pipeline:
 Shared immutable domain types live in `models.py`. Application paths and
 environment-driven settings live in `config.py`. Python `Protocol` interfaces
 keep implementations replaceable and tests easy to isolate.
+
+Without `CPP_CONTEXT_CLANG_ANALYZER`, indexing continues through the portable
+libclang CIndex baseline and marks `advanced_facts_complete=false`. Configuring a
+companion makes protocol/Clang/capability mismatches hard pre-index failures and
+forces baseline translation units to be reindexed. The companion preserves named
+build provenance and emits the existing symbol/occurrence/direct-call/include/
+inheritance/override facts plus separate macro spelling and expansion spans,
+template-instantiation metadata, and stable lambda call-operator metadata. CFG,
+indirect dispatch, and dataflow are intentionally not part of this protocol yet.
 
 See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,
 incremental behavior, libclang configuration, and current guarantees.

@@ -184,6 +184,9 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                 indexed_edges=indexing.indexed_edges,
                 embedded_symbols=result.embedded_symbols,
                 embedding_model=result.embedding_model,
+                analysis_backend=result.analysis_backend,
+                advanced_facts_complete=result.advanced_facts_complete,
+                analyzer_capabilities=list(result.analyzer_capabilities),
             )
 
         return await _call_tool(

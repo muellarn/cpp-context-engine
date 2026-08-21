@@ -1,0 +1,1 @@
+recursive-include native/clang-analyzer CMakeLists.txt *.cpp

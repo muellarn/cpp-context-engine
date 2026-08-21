@@ -33,7 +33,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +44,8 @@ class TranslationUnitState:
     content_hash: str
     dependencies: tuple[tuple[Path, str], ...]
     build_variant: str = DEFAULT_BUILD_VARIANT
+    analysis_backend: str = "unknown"
+    advanced_facts_complete: bool = False
 
 
 class SQLiteStore:
@@ -286,6 +288,8 @@ class SQLiteStore:
                 )
         if current <= 2:
             self._migrate_v3()
+        if current <= 3:
+            self._migrate_v4()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -498,9 +502,32 @@ class SQLiteStore:
                     ON edges(project_id, build_variant, target_id, relation);
                 """,
             )
-            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._connection.execute("PRAGMA user_version = 3")
         except BaseException:
             # DDL is transactional in SQLite as long as executescript does not commit it early.
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _migrate_v4(self) -> None:
+        """Persist analyzer-specific occurrence evidence such as macro provenance."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                "ALTER TABLE occurrences ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            self._connection.execute(
+                "ALTER TABLE translation_units "
+                "ADD COLUMN analysis_backend TEXT NOT NULL DEFAULT 'unknown'"
+            )
+            self._connection.execute(
+                "ALTER TABLE translation_units "
+                "ADD COLUMN advanced_facts_complete INTEGER NOT NULL DEFAULT 0"
+            )
+            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except BaseException:
             self._connection.rollback()
             raise
         else:
@@ -606,8 +633,9 @@ class SQLiteStore:
                     """
                     INSERT INTO translation_units(
                         project_id, id, build_configuration_id, source_path,
-                        content_hash, diagnostics_json, build_variant
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        content_hash, diagnostics_json, build_variant,
+                        analysis_backend, advanced_facts_complete
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         project_id,
@@ -617,6 +645,8 @@ class SQLiteStore:
                         unit.content_hash,
                         json.dumps(unit.diagnostics),
                         unit.build_variant,
+                        unit.analysis_backend,
+                        int(unit.advanced_facts_complete),
                     ),
                 )
                 self._connection.executemany(
@@ -1056,8 +1086,8 @@ class SQLiteStore:
             INSERT OR REPLACE INTO occurrences(
                 project_id, translation_unit_id, id, symbol_id, enclosing_symbol_id,
                 kind, path, start_line, end_line, start_column, end_column,
-                build_configuration_id, build_variant
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                build_configuration_id, build_variant, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -1074,6 +1104,7 @@ class SQLiteStore:
                     occurrence.span.end_column,
                     occurrence.build_configuration_id,
                     occurrence.build_variant,
+                    json.dumps(dict(occurrence.metadata), sort_keys=True),
                 )
                 for occurrence in occurrences
             ),
@@ -1125,7 +1156,8 @@ class SQLiteStore:
         rows = self._connection.execute(
             f"""
             SELECT units.id, units.build_configuration_id, configs.command_hash,
-                   units.content_hash, units.build_variant
+                   units.content_hash, units.build_variant, units.analysis_backend,
+                   units.advanced_facts_complete
             FROM translation_units units
             JOIN build_configurations configs
               ON configs.project_id = units.project_id
@@ -1153,6 +1185,8 @@ class SQLiteStore:
                 content_hash=row["content_hash"],
                 dependencies=dependencies,
                 build_variant=row["build_variant"],
+                analysis_backend=row["analysis_backend"],
+                advanced_facts_complete=bool(row["advanced_facts_complete"]),
             )
         return result
 
@@ -1304,6 +1338,7 @@ class SQLiteStore:
                 translation_unit_id=row["translation_unit_id"],
                 build_configuration_id=row["build_configuration_id"],
                 build_variant=row["build_variant"],
+                metadata=json.loads(row["metadata_json"]),
             )
             for row in self._connection.execute(
                 f"""

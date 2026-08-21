@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from cpp_context_engine.ingestion.clang import ClangIngestor
 from cpp_context_engine.ingestion.compilation_database import (
     CompilationDatabase,
     translation_unit_id,
@@ -33,7 +33,7 @@ class IndexingResult:
 class ProjectIndexer:
     """Reparse only units whose command, source, or project dependency changed."""
 
-    def __init__(self, ingestor: ClangIngestor, store: SQLiteStore) -> None:
+    def __init__(self, ingestor: Any, store: SQLiteStore) -> None:
         self._ingestor = ingestor
         self._store = store
 
@@ -54,7 +54,14 @@ class ProjectIndexer:
         changed = [
             configuration
             for configuration in database.configurations
-            if self._needs_reindex(configuration, previous.get(translation_unit_id(configuration)))
+            if self._needs_reindex(
+                configuration,
+                previous.get(translation_unit_id(configuration)),
+                analysis_backend=getattr(self._ingestor, "analysis_backend", "unknown"),
+                advanced_facts_complete=bool(
+                    getattr(self._ingestor, "advanced_facts_complete", False)
+                ),
+            )
         ]
         if changed:
             batch = self._ingestor.ingest_configurations(project_root, changed)
@@ -87,11 +94,20 @@ class ProjectIndexer:
 
     @staticmethod
     def _needs_reindex(
-        configuration: BuildConfiguration, state: TranslationUnitState | None
+        configuration: BuildConfiguration,
+        state: TranslationUnitState | None,
+        *,
+        analysis_backend: str,
+        advanced_facts_complete: bool,
     ) -> bool:
         if state is None:
             return True
         if state.command_hash != configuration.command_hash:
+            return True
+        if (
+            state.analysis_backend != analysis_backend
+            or state.advanced_facts_complete != advanced_facts_complete
+        ):
             return True
         source_path = configuration.source_path
         if not source_path.is_file() or _file_hash(source_path) != state.content_hash:
