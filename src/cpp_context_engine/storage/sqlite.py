@@ -290,8 +290,10 @@ class SQLiteStore:
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
 
-        with self._connection:
-            self._connection.executescript(
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            _execute_script(
+                self._connection,
                 """
                 CREATE TABLE build_variants (
                     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -367,8 +369,7 @@ class SQLiteStore:
                     ON edges(project_id, build_variant, source_id, relation);
                 CREATE INDEX edges_scope_target
                     ON edges(project_id, build_variant, target_id, relation);
-                PRAGMA user_version = 3;
-                """
+                """,
             )
             projects = self._connection.execute("SELECT id FROM projects").fetchall()
             for project in projects:
@@ -460,7 +461,8 @@ class SQLiteStore:
                     (project_id,),
                 )
             self._rebuild_variant_fts()
-            self._connection.executescript(
+            _execute_script(
+                self._connection,
                 """
                 CREATE TABLE edges_v3 (
                     project_id INTEGER NOT NULL,
@@ -494,8 +496,15 @@ class SQLiteStore:
                     ON edges(project_id, build_variant, source_id, relation);
                 CREATE INDEX edges_scope_target
                     ON edges(project_id, build_variant, target_id, relation);
-                """
+                """,
             )
+            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except BaseException:
+            # DDL is transactional in SQLite as long as executescript does not commit it early.
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
 
     def _rebuild_variant_fts(self) -> None:
         self._connection.execute("DELETE FROM symbol_variant_fts")
@@ -1728,3 +1737,18 @@ def _stable_id(prefix: str, *parts: str) -> str:
         digest.update(part.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
     return f"{prefix}_{digest.hexdigest()[:32]}"
+
+
+def _execute_script(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a multi-statement script without sqlite3's implicit pre-script commit."""
+
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                connection.execute(statement)
+            pending = ""
+    if pending.strip():
+        raise ValueError("incomplete SQLite migration statement")

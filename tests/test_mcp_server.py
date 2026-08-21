@@ -196,6 +196,12 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
             callers = await client.call_tool("callers", {"symbol_id": "cxx:callee"})
             assert callers.structured_content["direction"] == "incoming"
             assert callers.structured_content["edges"][0]["source"]["symbol_id"] == "cxx:caller"
+            callers_by_variant = await client.call_tool(
+                "callers", {"symbol_id": first["symbol"]["variant_id"]}
+            )
+            assert callers_by_variant.structured_content["edges"][0]["source"]["symbol_id"] == (
+                "cxx:caller"
+            )
             callees = await client.call_tool("callees", {"symbol_id": "cxx:caller"})
             assert callees.structured_content["direction"] == "outgoing"
             assert callees.structured_content["edges"][0]["target"]["symbol_id"] == "cxx:callee"

@@ -456,28 +456,31 @@ async def _graph_tool(
     def operation() -> GraphResult:
         runtime = state.require_runtime()
         origin = _get_symbol(runtime, symbol_id)
+        edge_scope = (origin.build_variant,)
         edges = tuple(
             runtime.store.neighbors(
-                symbol_id,
+                origin.id,
                 relations=frozenset(relations) if relations else None,
                 depth=depth,
                 direction=direction,
                 max_edges=max_results + 1,
                 per_node_limit=per_node_fanout,
                 project_root=state.config.project_root,
+                build_scope=edge_scope,
             )
         )
         truncated = len(edges) > max_results
         if not truncated and len(edges) >= per_node_fanout:
             # The primary query cannot reveal when its per-node SQL limit hid one more edge.
             probe = runtime.store.neighbors(
-                symbol_id,
+                origin.id,
                 relations=frozenset(relations) if relations else None,
                 depth=depth,
                 direction=direction,
                 max_edges=max_results + 1,
                 per_node_limit=per_node_fanout + 1,
                 project_root=state.config.project_root,
+                build_scope=edge_scope,
             )
             known_edge_ids = {edge.id for edge in edges}
             truncated = any(edge.id not in known_edge_ids for edge in probe)

@@ -64,6 +64,7 @@ def create_app(
                     "path": str(source.path),
                     "start_line": source.start_line,
                     "end_line": source.end_line,
+                    "build_variant": source.build_variant,
                 }
                 for source in response.sources
             ],

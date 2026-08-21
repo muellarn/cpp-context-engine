@@ -49,6 +49,7 @@ def test_answer_endpoint_returns_structured_citations() -> None:
                 "path": "net/parser.cpp",
                 "start_line": 10,
                 "end_line": 20,
+                "build_variant": "default",
             }
         ],
         "steps": 1,

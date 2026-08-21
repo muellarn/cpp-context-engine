@@ -146,6 +146,68 @@ def test_variant_and_fact_ids_are_deterministic(tmp_path: Path) -> None:
     assert snapshots[0] == snapshots[1]
 
 
+def test_v3_migration_rolls_back_all_schema_changes_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "legacy.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE projects(id INTEGER PRIMARY KEY, root TEXT NOT NULL UNIQUE);
+        CREATE TABLE build_configurations(
+          project_id INTEGER NOT NULL, id TEXT NOT NULL, source_path TEXT NOT NULL,
+          directory TEXT NOT NULL, arguments_json TEXT NOT NULL, command_hash TEXT NOT NULL,
+          output TEXT, PRIMARY KEY(project_id,id));
+        CREATE TABLE translation_units(
+          project_id INTEGER NOT NULL, id TEXT NOT NULL, build_configuration_id TEXT NOT NULL,
+          source_path TEXT NOT NULL, content_hash TEXT NOT NULL, diagnostics_json TEXT NOT NULL,
+          indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(project_id,id));
+        CREATE TABLE symbols(
+          project_id INTEGER NOT NULL, id TEXT NOT NULL, qualified_name TEXT NOT NULL,
+          kind TEXT NOT NULL, path TEXT NOT NULL, start_line INTEGER NOT NULL,
+          end_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_column INTEGER NOT NULL,
+          signature TEXT NOT NULL, documentation TEXT NOT NULL, source_hash TEXT NOT NULL,
+          source_text TEXT NOT NULL, build_configuration_id TEXT NOT NULL,
+          metadata_json TEXT NOT NULL, PRIMARY KEY(project_id,id));
+        CREATE TABLE translation_unit_symbols(
+          project_id INTEGER, translation_unit_id TEXT, symbol_id TEXT, is_definition INTEGER,
+          snapshot_json TEXT, PRIMARY KEY(project_id,translation_unit_id,symbol_id));
+        CREATE TABLE occurrences(
+          project_id INTEGER, translation_unit_id TEXT, id TEXT, symbol_id TEXT,
+          enclosing_symbol_id TEXT, kind TEXT, path TEXT, start_line INTEGER, end_line INTEGER,
+          start_column INTEGER, end_column INTEGER,
+          PRIMARY KEY(project_id,translation_unit_id,id));
+        CREATE TABLE edges(
+          project_id INTEGER, translation_unit_id TEXT, source_id TEXT, target_id TEXT,
+          relation TEXT, PRIMARY KEY(project_id,translation_unit_id,source_id,target_id,relation));
+        PRAGMA user_version=2;
+        """
+    )
+    connection.close()
+
+    def fail_rebuild(_store: SQLiteStore) -> None:
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(SQLiteStore, "_rebuild_variant_fts", fail_rebuild)
+    with pytest.raises(RuntimeError, match="injected migration failure"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'build_variants'"
+            ).fetchone()
+            is None
+        )
+        assert "id" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(edges)").fetchall()
+        }
+    finally:
+        connection.close()
+
+
 def test_v2_migration_preserves_baseline_search_and_requests_reindex(tmp_path: Path) -> None:
     root = (tmp_path / "project").resolve()
     root.mkdir()

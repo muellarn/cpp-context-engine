@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from cpp_context_engine.models import (
@@ -127,6 +128,71 @@ def test_inverse_graph_expansion_preserves_the_compiler_edge_direction() -> None
 
     caller_item = next(item for item in bundle.items if item.hit.symbol.id == "caller")
     assert caller_item.path == (ContextPathStep("caller", "callee", GraphRelation.CALLS),)
+
+
+def test_union_graph_expansion_stays_within_the_seed_build() -> None:
+    alpha_seed = replace(symbol("seed"), build_variant="alpha", variant_id="variant-alpha-seed")
+    alpha_neighbor = replace(
+        symbol("alpha-neighbor"),
+        build_variant="alpha",
+        variant_id="variant-alpha-neighbor",
+    )
+    beta_neighbor = replace(
+        symbol("beta-neighbor"), build_variant="beta", variant_id="variant-beta-neighbor"
+    )
+
+    class ScopedGraph(GraphStub):
+        def neighbors(self, symbol_id: str, **kwargs: object) -> Sequence[GraphEdge]:
+            build_scope = kwargs.pop("build_scope")
+            assert build_scope == ("alpha",)
+            return [
+                edge
+                for edge in self.edges
+                if edge.build_variant in build_scope
+                and symbol_id in (edge.source_id, edge.target_id)
+            ]
+
+    class ScopedStore:
+        def get_symbol(self, symbol_id: str, *, build_scope: tuple[str, ...]) -> CodeSymbol | None:
+            return {
+                ("alpha", "seed"): alpha_seed,
+                ("alpha", "alpha-neighbor"): alpha_neighbor,
+                ("beta", "beta-neighbor"): beta_neighbor,
+            }.get((build_scope[0], symbol_id))
+
+    retriever = HybridRetriever(
+        lexical_search=SearchStub([alpha_seed]),
+        symbol_search=SearchStub([]),
+        vector_search=SearchStub([]),
+        symbol_store=ScopedStore(),  # type: ignore[arg-type]
+        source_reader=SourceStub(),
+        graph=ScopedGraph(
+            [
+                GraphEdge(
+                    "seed",
+                    "alpha-neighbor",
+                    GraphRelation.CALLS,
+                    id="edge-alpha",
+                    build_variant="alpha",
+                ),
+                GraphEdge(
+                    "seed",
+                    "beta-neighbor",
+                    GraphRelation.CALLS,
+                    id="edge-beta",
+                    build_variant="beta",
+                ),
+            ]
+        ),
+        config=RetrievalConfig(seed_limit=1, graph_depth=1),
+    )
+
+    bundle = retriever.retrieve("seed", max_tokens=1_000)
+
+    assert {item.hit.symbol.variant_id for item in bundle.items} == {
+        "variant-alpha-seed",
+        "variant-alpha-neighbor",
+    }
 
 
 def test_graph_hub_is_penalized_and_expansion_respects_node_budget() -> None:

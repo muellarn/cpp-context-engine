@@ -200,13 +200,24 @@ class HybridRetriever:
                 budget_exhausted = True
                 continue
             try:
-                raw_edges = list(
-                    self._graph.neighbors(
-                        current.symbol.id,
-                        relations=self._config.relations,
-                        depth=1,
+                try:
+                    raw_edges = list(
+                        self._graph.neighbors(  # type: ignore[call-arg]
+                            current.symbol.id,
+                            relations=self._config.relations,
+                            depth=1,
+                            build_scope=(current.symbol.build_variant,),
+                        )
                     )
-                )
+                except TypeError:
+                    # Third-party graph adapters may still implement the original protocol.
+                    raw_edges = list(
+                        self._graph.neighbors(
+                            current.symbol.id,
+                            relations=self._config.relations,
+                            depth=1,
+                        )
+                    )
             except Exception as exc:  # graph adapters are another explicit boundary
                 diagnostics.append(
                     f"graph expansion failed for {current.symbol.id}: {type(exc).__name__}"
