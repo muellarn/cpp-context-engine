@@ -64,6 +64,14 @@ It also persists per-function Clang CFG graphs, blocks, source and implicit
 lifetime elements, terminators, entry reachability, and typed successor edges
 with exact build/TU provenance. `doctor --json` reports `cfg_facts_available`.
 
+Project indexing consumes completed translation units in compilation-database
+order and retires each in-memory batch after staging it in SQLite. The number of
+active or completed analyzer batches is therefore bounded by the configured
+worker limit rather than project size. Publication is still one transaction:
+other database connections see the previous complete index until commit, and an
+analyzer error or cancellation rolls the entire run back. The SQLite WAL can grow
+with a large run, so operators should keep sufficient temporary disk space.
+
 Then diagnose, index, and search:
 
 ```bash

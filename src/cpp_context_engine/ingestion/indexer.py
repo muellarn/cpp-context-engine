@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,66 +81,45 @@ class ProjectIndexer:
                 ),
             )
         ]
+        counts = {result_name: 0 for result_name, _batch_name in _BATCH_COUNT_FIELDS}
         if changed:
-            batch = self._ingestor.ingest_configurations(project_root, changed)
+            iter_batches = getattr(self._ingestor, "iter_configuration_batches", None)
+            if iter_batches is None:
+                batch_stream: Iterator[IngestionBatch] = iter(
+                    (self._ingestor.ingest_configurations(project_root, changed),)
+                )
+            else:
+                batch_stream = iter(iter_batches(project_root, changed))
         else:
-            batch = IngestionBatch((), (), (), (), (), (variant,))
-        if changed:
-            batch = IngestionBatch(
-                build_configurations=batch.build_configurations,
-                translation_units=batch.translation_units,
-                symbols=batch.symbols,
-                occurrences=batch.occurrences,
-                edges=batch.edges,
-                build_variants=(variant,),
-                cfg_graphs=batch.cfg_graphs,
-                cfg_blocks=batch.cfg_blocks,
-                cfg_elements=batch.cfg_elements,
-                cfg_edges=batch.cfg_edges,
-                callsites=batch.callsites,
-                call_targets=batch.call_targets,
-                data_flow_analyses=batch.data_flow_analyses,
-                memory_locations=batch.memory_locations,
-                data_accesses=batch.data_accesses,
-                data_flow_evidence=batch.data_flow_evidence,
-                function_summaries=batch.function_summaries,
-                summary_effects=batch.summary_effects,
-                summary_return_origins=batch.summary_return_origins,
-                call_argument_bindings=batch.call_argument_bindings,
-                call_result_bindings=batch.call_result_bindings,
-                interprocedural_flows=batch.interprocedural_flows,
-            )
+            batch_stream = iter(())
+
+        def counted_batches() -> Iterator[IngestionBatch]:
+            for batch in batch_stream:
+                for result_name, batch_name in _BATCH_COUNT_FIELDS:
+                    counts[result_name] += len(getattr(batch, batch_name))
+                yield batch
+
         removed = len(set(previous) - current_ids)
-        invalidated_summaries = self._store.apply_ingestion(
-            project_root,
-            batch,
-            current_translation_unit_ids=current_ids,
-            build_variant=variant,
-        )
+        try:
+            invalidated_summaries = self._store.apply_ingestion_batches(
+                project_root,
+                counted_batches(),
+                current_translation_unit_ids=current_ids,
+                changed_translation_unit_ids=frozenset(
+                    translation_unit_id(configuration) for configuration in changed
+                ),
+                build_variant=variant,
+            )
+        finally:
+            close = getattr(batch_stream, "close", None)
+            if close is not None:
+                close()
         return IndexingResult(
             indexed_translation_units=len(changed),
             skipped_translation_units=len(database.configurations) - len(changed),
             removed_translation_units=removed,
-            indexed_symbols=len(batch.symbols),
-            indexed_occurrences=len(batch.occurrences),
-            indexed_edges=len(batch.edges),
-            indexed_cfg_graphs=len(batch.cfg_graphs),
-            indexed_cfg_blocks=len(batch.cfg_blocks),
-            indexed_cfg_elements=len(batch.cfg_elements),
-            indexed_cfg_edges=len(batch.cfg_edges),
-            indexed_callsites=len(batch.callsites),
-            indexed_call_targets=len(batch.call_targets),
-            indexed_data_flow_analyses=len(batch.data_flow_analyses),
-            indexed_memory_locations=len(batch.memory_locations),
-            indexed_data_accesses=len(batch.data_accesses),
-            indexed_data_flow_evidence=len(batch.data_flow_evidence),
-            indexed_function_summaries=len(batch.function_summaries),
-            indexed_summary_effects=len(batch.summary_effects),
-            indexed_summary_return_origins=len(batch.summary_return_origins),
-            indexed_call_argument_bindings=len(batch.call_argument_bindings),
-            indexed_call_result_bindings=len(batch.call_result_bindings),
-            indexed_interprocedural_flows=len(batch.interprocedural_flows),
             invalidated_function_summaries=invalidated_summaries,
+            **counts,
         )
 
     @staticmethod
@@ -170,3 +150,26 @@ class ProjectIndexer:
 
 def _file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+_BATCH_COUNT_FIELDS = (
+    ("indexed_symbols", "symbols"),
+    ("indexed_occurrences", "occurrences"),
+    ("indexed_edges", "edges"),
+    ("indexed_cfg_graphs", "cfg_graphs"),
+    ("indexed_cfg_blocks", "cfg_blocks"),
+    ("indexed_cfg_elements", "cfg_elements"),
+    ("indexed_cfg_edges", "cfg_edges"),
+    ("indexed_callsites", "callsites"),
+    ("indexed_call_targets", "call_targets"),
+    ("indexed_data_flow_analyses", "data_flow_analyses"),
+    ("indexed_memory_locations", "memory_locations"),
+    ("indexed_data_accesses", "data_accesses"),
+    ("indexed_data_flow_evidence", "data_flow_evidence"),
+    ("indexed_function_summaries", "function_summaries"),
+    ("indexed_summary_effects", "summary_effects"),
+    ("indexed_summary_return_origins", "summary_return_origins"),
+    ("indexed_call_argument_bindings", "call_argument_bindings"),
+    ("indexed_call_result_bindings", "call_result_bindings"),
+    ("indexed_interprocedural_flows", "interprocedural_flows"),
+)
