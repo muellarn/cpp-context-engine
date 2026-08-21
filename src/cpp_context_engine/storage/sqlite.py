@@ -918,6 +918,7 @@ class SQLiteStore:
                 batch.cfg_edges,
             )
             self._put_call_facts(project_id, batch.callsites, batch.call_targets)
+            self._refresh_indexed_override_candidates(project_id, selected_variant.name)
             self._refresh_symbols(
                 project_id, affected_symbols | {symbol.id for symbol in batch.symbols}
             )
@@ -1568,6 +1569,89 @@ class SQLiteStore:
                     target.build_variant,
                 )
                 for target in targets
+            ),
+        )
+
+    def _refresh_indexed_override_candidates(self, project_id: int, build_variant: str) -> None:
+        """Rebuild build-wide virtual candidates after any incremental TU replacement."""
+
+        derivation = "indexed_override_candidate"
+        self._connection.execute(
+            """
+            DELETE FROM call_targets
+            WHERE project_id = ? AND build_variant = ? AND derivation = ?
+            """,
+            (project_id, build_variant, derivation),
+        )
+        # Override edges can live in a different TU from an unchanged callsite, so deriving
+        # candidates only from the current ingestion batch loses targets after incremental edits.
+        rows = self._connection.execute(
+            """
+            WITH RECURSIVE override_closure(base_id, target_id) AS (
+                SELECT target_id, source_id FROM edges
+                WHERE project_id = ? AND build_variant = ? AND relation = 'overrides'
+                UNION
+                SELECT closure.base_id, edges.source_id
+                FROM override_closure AS closure
+                JOIN edges
+                  ON edges.project_id = ?
+                 AND edges.build_variant = ?
+                 AND edges.relation = 'overrides'
+                 AND edges.target_id = closure.target_id
+            )
+            SELECT sites.id AS callsite_id, closure.target_id,
+                   sites.expansion_span_json, sites.translation_unit_id,
+                   sites.build_configuration_id, sites.build_variant
+            FROM callsites AS sites
+            JOIN override_closure AS closure
+              ON closure.base_id = sites.static_target_symbol_id
+            WHERE sites.project_id = ? AND sites.build_variant = ?
+              AND sites.dispatch_kind = 'virtual'
+              AND NOT EXISTS (
+                  SELECT 1 FROM call_targets AS existing
+                  WHERE existing.project_id = sites.project_id
+                    AND existing.callsite_id = sites.id
+                    AND existing.target_symbol_id = closure.target_id
+              )
+            ORDER BY sites.id, closure.target_id
+            """,
+            (project_id, build_variant, project_id, build_variant, project_id, build_variant),
+        ).fetchall()
+        reason = (
+            "target overrides the statically selected virtual method in this build; "
+            "the value is deterministic ranking evidence, not a probability"
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO call_targets(
+                project_id, id, callsite_id, target_symbol_id, certainty,
+                confidence, confidence_reason, derivation, evidence_span_json,
+                translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, 'possible', 0.5, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    _stable_id(
+                        "call_target",
+                        row["build_variant"],
+                        row["build_configuration_id"],
+                        row["translation_unit_id"],
+                        row["callsite_id"],
+                        row["target_id"],
+                        CallTargetCertainty.POSSIBLE.value,
+                        derivation,
+                    ),
+                    row["callsite_id"],
+                    row["target_id"],
+                    reason,
+                    derivation,
+                    row["expansion_span_json"],
+                    row["translation_unit_id"],
+                    row["build_configuration_id"],
+                    row["build_variant"],
+                )
+                for row in rows
             ),
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -218,6 +219,80 @@ def test_call_ids_provenance_storage_bounds_and_incremental_cleanup(tmp_path: Pa
         assert store.remove_build_variant("extra")
         assert not store.callsites(build_scope=BuildScope.single("extra"), limit=100).items
         assert store.callsites(build_scope=BuildScope.single("default"), limit=100).items
+
+
+def test_incremental_override_change_refreshes_unchanged_callsite_targets(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    include = project / "include"
+    source = project / "src"
+    include.mkdir(parents=True)
+    source.mkdir()
+    (include / "base.hpp").write_text(
+        "struct Root { virtual int run() const { return 0; } };\n",
+        encoding="utf-8",
+    )
+    (source / "caller.cpp").write_text(
+        '#include "base.hpp"\nint invoke(const Root& root) { return root.run(); }\n',
+        encoding="utf-8",
+    )
+    overrides = source / "overrides.cpp"
+    overrides.write_text(
+        '#include "base.hpp"\nstruct First : Root { int run() const override { return 1; } };\n',
+        encoding="utf-8",
+    )
+    compile_commands = project / "compile_commands.json"
+    compile_commands.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(project),
+                    "file": str(path),
+                    "arguments": [
+                        "clang++",
+                        "-std=c++20",
+                        f"-I{include}",
+                        "-c",
+                        str(path),
+                    ],
+                }
+                for path in (source / "caller.cpp", overrides)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    database = tmp_path / "index.db"
+    variant = BuildVariant("default", compile_commands)
+    with SQLiteStore(database, project_root=project) as store:
+        indexer = ProjectIndexer(_ingestor(), store)
+        first = indexer.index(project, compile_commands, build_variant=variant)
+        assert first.indexed_translation_units == 2
+
+        overrides.write_text(
+            '#include "base.hpp"\n'
+            "struct First : Root { int run() const override { return 1; } };\n"
+            "struct Second : Root { int run() const override { return 2; } };\n",
+            encoding="utf-8",
+        )
+        second = indexer.index(project, compile_commands, build_variant=variant)
+        assert second.indexed_translation_units == 1
+        assert second.skipped_translation_units == 1
+
+        callsite = next(
+            site
+            for site in store.callsites(build_scope=BuildScope.single("default")).items
+            if site.dispatch_kind == CallDispatchKind.VIRTUAL
+        )
+        target_names = {
+            store.get_symbol(
+                target.target_symbol_id,
+                build_scope=BuildScope.single("default"),
+            ).qualified_name
+            for target in store.call_targets(
+                callsite.id,
+                build_scope=BuildScope.single("default"),
+            ).items
+        }
+        assert target_names == {"Root::run", "First::run", "Second::run"}
 
 
 def test_v6_migration_is_atomic_and_marks_old_native_rows_incomplete(
