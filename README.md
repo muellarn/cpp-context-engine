@@ -307,9 +307,12 @@ build provenance and emits the existing symbol/occurrence/direct-call/include/
 inheritance/override facts plus separate macro spelling and expansion spans,
 template-instantiation metadata, and stable lambda call-operator metadata. CFGs
 use separate schema-v5 records rather than fake symbols and retain branch,
-switch, loop, jump, return, and supported exception flow. Indirect dispatch,
-def-use/dataflow, and dead-code judgments remain out of scope. Dedicated
-CLI/API/MCP CFG reads are intentionally deferred to the interface issue.
+switch, loop, jump, return, and supported exception flow. Direct, virtual,
+devirtualized, lambda/functor, template, and macro-generated calls use separate
+schema-v6 callsite/target evidence with explicit certainty and completeness.
+Local pointer points-to, def-use/dataflow, and dead-code judgments remain out of
+scope. Dedicated CLI/API/MCP CFG and advanced callsite reads are intentionally
+deferred to the interface issue.
 
 See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,
 incremental behavior, libclang configuration, and current guarantees.

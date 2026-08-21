@@ -30,11 +30,12 @@ cpp-context index /workspace/project \
   --clang-analyzer build/clang-analyzer/cpp-context-clang-analyzer
 ```
 
-Protocol 2 is newline-delimited JSON. A process must receive `hello` first and
+Protocol 3 is newline-delimited JSON. A process must receive `hello` first and
 returns `hello` with analyzer version, Clang major, and capabilities. An analysis
 then returns `begin`, zero or more `fact` records, and `complete`. Fact records
 are `file`, `symbol`, `occurrence`, `edge`, `include`, and the versioned
-`cfg_graph_v1`, `cfg_block_v1`, `cfg_element_v1`, and `cfg_edge_v1` types;
+`cfg_graph_v1`, `cfg_block_v1`, `cfg_element_v1`, `cfg_edge_v1`, `callsite_v1`,
+and `call_target_v1` types;
 references use stable
 USR or location-derived keys that the Python adapter converts to canonical IDs.
 Macro expansions carry independent `spelling_span` and `expansion_span` objects.
@@ -46,7 +47,40 @@ no command string, invokes no shell, confines fact paths to the project, validat
 the handshake before analysis, and enforces operator-owned timeout and byte
 limits. This companion currently supports Linux and exactly Clang major 18. Its
 handshake must include `function_cfg_v1`; `cpp-context doctor` exposes that as
-`cfg_facts_available=true`.
+`cfg_facts_available=true`. The callsite capabilities similarly produce
+`call_facts_available=true`.
+
+### Callsites and C++ dispatch
+
+The companion stores every syntactic call separately, including consecutive
+identical calls. A callsite records its owner, dispatch form, static target when
+known, independent spelling and expansion ranges, the innermost-to-outermost
+project-macro expansion stack, and exact build/configuration/TU provenance.
+`target_set_complete` is false whenever Clang cannot prove a closed target set;
+`unresolved_reason` then states the gap instead of silently dropping the call.
+
+Each target edge records `certain` or `possible`, a deterministic confidence in
+`[0,1]`, its confidence reason, derivation, evidence range, and build provenance.
+Confidence is ranking evidence, not a runtime probability. Direct AST calls,
+qualified virtual calls, final dispatch, and targets proven by
+`CXXMethodDecl::getDevirtualizedMethod` are certain. Otherwise the static virtual
+method and build-local transitive overrides are possible; the set remains
+incomplete because external unindexed derived types can add overriders. Concrete
+lambda, generic-lambda specialization, and function-object `operator()` targets
+are retained.
+
+Function and class template specializations and instantiations retain template
+kind, arguments, any Clang-provided point of instantiation, and
+`SPECIALIZES`/`INSTANTIATES` graph edges. Calls emitted through project macros
+retain expansion frames and a `GENERATED_BY_MACRO` relation. Local function- and
+member-pointer points-to analysis is not guessed: those sites are explicit
+unresolved indirect calls. Dependent, uninstantiated template calls likewise
+remain explicit and never gain a certain target.
+
+`SQLiteStore.callsites`, `get_callsite`, and `call_targets` are build-scoped,
+bounded internal reads with deterministic ordering and explicit truncation.
+They are not exposed through CLI, HTTP, or MCP until the dedicated advanced
+interface work.
 
 ### Function control-flow graphs
 
@@ -83,8 +117,9 @@ issue.
 The libclang path remains a baseline fallback. Baseline symbols and occurrences
 are explicitly marked `analysis_backend=libclang-baseline` and
 `advanced_facts_complete=false`; selecting a validated companion invalidates and
-reindexes such translation units. The baseline does not emit CFG facts. Indirect
-calls, def-use/dataflow, and dead-code judgments remain out of scope.
+reindexes such translation units. The baseline does not emit CFG or callsite
+facts. Local pointer points-to, def-use/dataflow, and dead-code judgments remain
+out of scope.
 
 ## Indexing from Python
 
@@ -158,6 +193,11 @@ entire named build.
 Schema v5 adds build/TU-specific CFG graph, block, element, and edge tables.
 Replacing or removing a translation unit cascades only its CFG rows; other
 translation units and build variants remain intact.
+
+Schema v6 adds separate callsite and call-target tables with foreign keys to
+symbols and translation units. TU replacement and build removal cascade their
+call facts. Existing native rows are marked incomplete on migration so they
+cannot masquerade as complete dispatch evidence; the migration is atomic.
 
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by model ID and dimension. `SQLiteVectorSearch` accepts any provider

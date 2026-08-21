@@ -1,0 +1,14 @@
+[
+  {
+    "directory": ".",
+    "file": "src/dispatch.cpp",
+    "arguments": [
+      "clang++",
+      "-std=c++20",
+      "-DEXTRA_OVERRIDE",
+      "-Iinclude",
+      "-c",
+      "src/dispatch.cpp"
+    ]
+  }
+]

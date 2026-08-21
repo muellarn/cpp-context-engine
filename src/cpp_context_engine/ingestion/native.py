@@ -21,6 +21,10 @@ from cpp_context_engine.ingestion.compilation_database import (
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
+    CallDispatchKind,
+    CallSite,
+    CallTarget,
+    CallTargetCertainty,
     CfgBlock,
     CfgBlockRole,
     CfgEdge,
@@ -30,6 +34,7 @@ from cpp_context_engine.models import (
     CodeSymbol,
     GraphEdge,
     GraphRelation,
+    MacroExpansionFrame,
     OccurrenceKind,
     SourceSpan,
     SymbolKind,
@@ -38,7 +43,7 @@ from cpp_context_engine.models import (
 )
 
 PROTOCOL = "cpp-context-clang-facts"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 REQUIRED_CLANG_MAJOR = 18
 REQUIRED_CAPABILITIES = frozenset(
     {
@@ -56,6 +61,10 @@ REQUIRED_CAPABILITIES = frozenset(
         "template_metadata",
         "uses_type",
         "function_cfg_v1",
+        "callsites_v1",
+        "dispatch_targets_v1",
+        "macro_expansion_stack",
+        "template_relationships_v1",
     }
 )
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -337,6 +346,10 @@ class NativeClangIngestor:
             _FactBatchBuilder(root, configuration).build(self.client.analyze(root, configuration))
             for configuration in configurations
         ]
+        callsites = tuple(site for batch in batches for site in batch.callsites)
+        call_targets = tuple(target for batch in batches for target in batch.call_targets)
+        all_edges = tuple(edge for batch in batches for edge in batch.edges)
+        call_targets = _add_indexed_override_candidates(callsites, call_targets, all_edges)
         return IngestionBatch(
             build_configurations=tuple(
                 configuration for batch in batches for configuration in batch.build_configurations
@@ -344,11 +357,13 @@ class NativeClangIngestor:
             translation_units=tuple(unit for batch in batches for unit in batch.translation_units),
             symbols=tuple(symbol for batch in batches for symbol in batch.symbols),
             occurrences=tuple(occurrence for batch in batches for occurrence in batch.occurrences),
-            edges=tuple(edge for batch in batches for edge in batch.edges),
+            edges=all_edges,
             cfg_graphs=tuple(graph for batch in batches for graph in batch.cfg_graphs),
             cfg_blocks=tuple(block for batch in batches for block in batch.cfg_blocks),
             cfg_elements=tuple(element for batch in batches for element in batch.cfg_elements),
             cfg_edges=tuple(edge for batch in batches for edge in batch.cfg_edges),
+            callsites=callsites,
+            call_targets=call_targets,
         )
 
 
@@ -362,6 +377,7 @@ class _FactBatchBuilder:
         self.files: dict[str, Path] = {}
         self.cfg_graph_ids: dict[str, str] = {}
         self.cfg_block_ids: dict[str, str] = {}
+        self.callsite_ids: dict[str, str] = {}
 
     def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
         for fact in facts:
@@ -383,6 +399,7 @@ class _FactBatchBuilder:
                 if edge is not None:
                     edges[edge.id] = edge
         cfg_graphs, cfg_blocks, cfg_elements, cfg_edges = self._cfg_facts(facts)
+        callsites, call_targets = self._call_facts(facts)
         dependencies = tuple(
             (path, _hash_bytes(path.read_bytes())) for path in sorted(set(self.files.values()))
         )
@@ -397,17 +414,134 @@ class _FactBatchBuilder:
             advanced_facts_complete=NativeClangIngestor.advanced_facts_complete,
         )
         return IngestionBatch(
-            (self.configuration,),
-            (unit,),
-            tuple(sorted(self.symbols.values(), key=lambda item: item.id)),
-            tuple(sorted(occurrences.values(), key=lambda item: item.id)),
-            tuple(sorted(edges.values(), key=lambda item: item.id)),
-            (),
-            cfg_graphs,
-            cfg_blocks,
-            cfg_elements,
-            cfg_edges,
+            build_configurations=(self.configuration,),
+            translation_units=(unit,),
+            symbols=tuple(sorted(self.symbols.values(), key=lambda item: item.id)),
+            occurrences=tuple(sorted(occurrences.values(), key=lambda item: item.id)),
+            edges=tuple(sorted(edges.values(), key=lambda item: item.id)),
+            cfg_graphs=cfg_graphs,
+            cfg_blocks=cfg_blocks,
+            cfg_elements=cfg_elements,
+            cfg_edges=cfg_edges,
+            callsites=callsites,
+            call_targets=call_targets,
         )
+
+    def _call_facts(
+        self, facts: Sequence[Mapping[str, Any]]
+    ) -> tuple[tuple[CallSite, ...], tuple[CallTarget, ...]]:
+        site_facts = [fact for fact in facts if fact.get("fact") == "callsite_v1"]
+        for fact in site_facts:
+            key = _string(fact, "key")
+            owner_id = self._known_id(_string(fact, "owner_key"))
+            spelling = self._span(_mapping(fact, "spelling_span"))
+            expansion = self._span(_mapping(fact, "expansion_span"))
+            self.callsite_ids[key] = (
+                "callsite_"
+                + _hash_text(
+                    self.configuration.build_variant,
+                    self.configuration.id,
+                    self.unit_id,
+                    owner_id,
+                    str(spelling.path),
+                    str(spelling.start_line),
+                    str(spelling.start_column),
+                    str(spelling.end_line),
+                    str(spelling.end_column),
+                    str(expansion.path),
+                    str(expansion.start_line),
+                    str(expansion.start_column),
+                    str(expansion.end_line),
+                    str(expansion.end_column),
+                    key,
+                )[:32]
+            )
+        sites = tuple(
+            sorted((self._callsite_fact(fact) for fact in site_facts), key=lambda x: x.id)
+        )
+        targets = tuple(
+            sorted(
+                (
+                    self._call_target_fact(fact)
+                    for fact in facts
+                    if fact.get("fact") == "call_target_v1"
+                ),
+                key=lambda item: (item.callsite_id, item.target_symbol_id, item.id),
+            )
+        )
+        return sites, targets
+
+    def _callsite_fact(self, fact: Mapping[str, Any]) -> CallSite:
+        key = _string(fact, "key")
+        static_key = fact.get("static_target_key")
+        if static_key is not None and not isinstance(static_key, str):
+            raise AnalyzerProtocolError("analyzer callsite has invalid static target")
+        raw_stack = fact.get("expansion_stack", [])
+        if not isinstance(raw_stack, list):
+            raise AnalyzerProtocolError("analyzer callsite has invalid macro expansion stack")
+        stack: list[MacroExpansionFrame] = []
+        for raw_frame in raw_stack:
+            if not isinstance(raw_frame, dict):
+                raise AnalyzerProtocolError("analyzer callsite has invalid macro expansion frame")
+            stack.append(
+                MacroExpansionFrame(
+                    macro_symbol_id=self._known_id(_string(raw_frame, "macro_key")),
+                    name=_string(raw_frame, "name"),
+                    spelling_span=self._span(_mapping(raw_frame, "spelling_span")),
+                    expansion_span=self._span(_mapping(raw_frame, "expansion_span")),
+                )
+            )
+        return CallSite(
+            id=self._known_callsite(key),
+            owner_symbol_id=self._known_id(_string(fact, "owner_key")),
+            dispatch_kind=CallDispatchKind(_string(fact, "dispatch_kind")),
+            spelling_span=self._span(_mapping(fact, "spelling_span")),
+            expansion_span=self._span(_mapping(fact, "expansion_span")),
+            target_set_complete=_boolean(fact, "target_set_complete"),
+            static_target_symbol_id=(self._known_id(static_key) if static_key else None),
+            unresolved_reason=_optional_string(fact, "unresolved_reason"),
+            callee_text=_optional_string(fact, "callee_text"),
+            expansion_stack=tuple(stack),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _call_target_fact(self, fact: Mapping[str, Any]) -> CallTarget:
+        callsite_id = self._known_callsite(_string(fact, "callsite_key"))
+        target_id = self._known_id(_string(fact, "target_key"))
+        certainty = CallTargetCertainty(_string(fact, "certainty"))
+        confidence = _number(fact, "confidence")
+        evidence = self._span(_mapping(fact, "evidence_span"))
+        derivation = _string(fact, "derivation")
+        return CallTarget(
+            id="call_target_"
+            + _hash_text(
+                self.configuration.build_variant,
+                self.configuration.id,
+                self.unit_id,
+                callsite_id,
+                target_id,
+                certainty.value,
+                derivation,
+            )[:32],
+            callsite_id=callsite_id,
+            target_symbol_id=target_id,
+            certainty=certainty,
+            confidence=confidence,
+            confidence_reason=_string(fact, "confidence_reason"),
+            derivation=derivation,
+            evidence_span=evidence,
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _known_callsite(self, key: str) -> str:
+        try:
+            return self.callsite_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError("analyzer target references an unknown callsite") from error
 
     def _cfg_facts(
         self, facts: Sequence[Mapping[str, Any]]
@@ -851,6 +985,16 @@ def _boolean(record: Mapping[str, Any], name: str) -> bool:
     return value
 
 
+def _number(record: Mapping[str, Any], name: str) -> float:
+    value = record.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+    result = float(value)
+    if not 0.0 <= result <= 1.0:
+        raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+    return result
+
+
 def _span_payload(span: SourceSpan) -> dict[str, Any]:
     return {
         "path": str(span.path),
@@ -859,3 +1003,64 @@ def _span_payload(span: SourceSpan) -> dict[str, Any]:
         "start_column": span.start_column,
         "end_column": span.end_column,
     }
+
+
+def _add_indexed_override_candidates(
+    callsites: Sequence[CallSite],
+    targets: Sequence[CallTarget],
+    edges: Sequence[GraphEdge],
+) -> tuple[CallTarget, ...]:
+    """Add build-local transitive overrides without claiming an open-world complete set."""
+
+    direct_overrides: dict[tuple[str, str], set[str]] = {}
+    for edge in edges:
+        if edge.relation == GraphRelation.OVERRIDES:
+            direct_overrides.setdefault((edge.build_variant, edge.target_id), set()).add(
+                edge.source_id
+            )
+    result = {(target.callsite_id, target.target_symbol_id): target for target in targets}
+    for site in callsites:
+        if site.dispatch_kind != CallDispatchKind.VIRTUAL or site.static_target_symbol_id is None:
+            continue
+        pending = sorted(
+            direct_overrides.get((site.build_variant, site.static_target_symbol_id), ())
+        )
+        visited: set[str] = set()
+        while pending:
+            target_id = pending.pop(0)
+            if target_id in visited:
+                continue
+            visited.add(target_id)
+            pending.extend(sorted(direct_overrides.get((site.build_variant, target_id), ())))
+            key = (site.id, target_id)
+            if key in result:
+                continue
+            derivation = "indexed_override_candidate"
+            result[key] = CallTarget(
+                id="call_target_"
+                + _hash_text(
+                    site.build_variant,
+                    site.build_configuration_id,
+                    site.translation_unit_id,
+                    site.id,
+                    target_id,
+                    CallTargetCertainty.POSSIBLE.value,
+                    derivation,
+                )[:32],
+                callsite_id=site.id,
+                target_symbol_id=target_id,
+                certainty=CallTargetCertainty.POSSIBLE,
+                confidence=0.5,
+                confidence_reason=(
+                    "target overrides the statically selected virtual method in this build; "
+                    "the value is deterministic ranking evidence, not a probability"
+                ),
+                derivation=derivation,
+                evidence_span=site.expansion_span,
+                translation_unit_id=site.translation_unit_id,
+                build_configuration_id=site.build_configuration_id,
+                build_variant=site.build_variant,
+            )
+    return tuple(
+        sorted(result.values(), key=lambda item: (item.callsite_id, item.target_symbol_id, item.id))
+    )

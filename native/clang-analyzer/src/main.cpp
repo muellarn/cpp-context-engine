@@ -11,6 +11,8 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTTypeTraits.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/ParentMapContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Analysis/CFG.h"
@@ -34,7 +36,7 @@ namespace {
 static_assert(CLANG_VERSION_MAJOR == 18, "cpp-context-clang-analyzer requires Clang 18");
 
 constexpr llvm::StringLiteral kProtocol = "cpp-context-clang-facts";
-constexpr std::int64_t kProtocolVersion = 2;
+constexpr std::int64_t kProtocolVersion = 3;
 constexpr std::int64_t kClangMajor = 18;
 
 const std::vector<std::string> kCapabilities = {
@@ -43,7 +45,8 @@ const std::vector<std::string> kCapabilities = {
     "inherits",           "lambda_metadata",   "macro_provenance",
     "occurrences",        "overrides",         "pp_callbacks",
     "source_manager",     "symbols",           "template_metadata",
-    "uses_type"};
+    "uses_type",          "callsites_v1",     "dispatch_targets_v1",
+    "macro_expansion_stack", "template_relationships_v1"};
 
 void emit(llvm::json::Object object) {
   llvm::outs() << llvm::formatv("{0}\n", llvm::json::Value(std::move(object)));
@@ -96,6 +99,13 @@ public:
 
 private:
   std::vector<std::pair<std::string, llvm::json::Object>> entries_;
+};
+
+struct MacroExpansionRecord {
+  std::string name;
+  std::string key;
+  clang::SourceRange definitionRange;
+  clang::SourceRange expansionRange;
 };
 
 class SourceFacts {
@@ -201,6 +211,48 @@ public:
             static_cast<std::int64_t>(sourceManager_.getFileOffset(fileRange.getEnd()))};
   }
 
+  llvm::json::Array
+  expansionStack(clang::SourceLocation location,
+                 const std::vector<MacroExpansionRecord> &records) const {
+    llvm::json::Array result;
+    auto current = location;
+    for (unsigned depth = 0; current.isMacroID() && depth < 64; ++depth) {
+      auto immediate = sourceManager_.getImmediateExpansionRange(current).getAsRange();
+      const MacroExpansionRecord *matched = nullptr;
+      for (auto iterator = records.rbegin(); iterator != records.rend(); ++iterator) {
+        if (iterator->expansionRange.getBegin() == immediate.getBegin()) {
+          matched = &*iterator;
+          break;
+        }
+      }
+      if (!matched) {
+        for (auto iterator = records.rbegin(); iterator != records.rend(); ++iterator) {
+          if (offset(iterator->expansionRange.getBegin(), false) ==
+                  offset(immediate.getBegin(), false) &&
+              path(iterator->expansionRange.getBegin(), false) ==
+                  path(immediate.getBegin(), false)) {
+            matched = &*iterator;
+            break;
+          }
+        }
+      }
+      if (matched) {
+        auto spelling = span(matched->definitionRange, true);
+        auto expansion = span(immediate, false);
+        if (spelling && expansion)
+          result.push_back(llvm::json::Object{{"macro_key", matched->key},
+                                              {"name", matched->name},
+                                              {"spelling_span", std::move(*spelling)},
+                                              {"expansion_span", std::move(*expansion)}});
+      }
+      auto next = sourceManager_.getImmediateMacroCallerLoc(current);
+      if (next == current)
+        break;
+      current = next;
+    }
+    return result;
+  }
+
   std::string fileKey(const std::filesystem::path &path) const {
     return "file:" + canonical(path).lexically_relative(projectRoot_).generic_string();
   }
@@ -212,9 +264,16 @@ public:
            method->getOverloadedOperator() == clang::OO_Call)) {
         const auto loc = sourceManager_.getSpellingLoc(method->getParent()->getBeginLoc());
         auto rel = relative(loc).value_or("unknown");
-        return "lambda:" + rel + ":" +
-               std::to_string(sourceManager_.getSpellingLineNumber(loc)) + ":" +
-               std::to_string(sourceManager_.getSpellingColumnNumber(loc)) + ":operator()";
+        auto key = "lambda:" + rel + ":" +
+                   std::to_string(sourceManager_.getSpellingLineNumber(loc)) + ":" +
+                   std::to_string(sourceManager_.getSpellingColumnNumber(loc)) + ":operator()";
+        if (method->getTemplateSpecializationKind() != clang::TSK_Undeclared) {
+          llvm::SmallString<256> specializationUsr;
+          if (!clang::index::generateUSRForDecl(method, specializationUsr) &&
+              !specializationUsr.empty())
+            key += ":specialization:" + specializationUsr.str().str();
+        }
+        return key;
       }
     }
     llvm::SmallString<256> usr;
@@ -248,7 +307,9 @@ class Collector;
 
 class PreprocessorCollector final : public clang::PPCallbacks {
 public:
-  PreprocessorCollector(FactSink &sink, SourceFacts &source) : sink_(sink), source_(source) {}
+  PreprocessorCollector(FactSink &sink, SourceFacts &source,
+                        std::vector<MacroExpansionRecord> &macroExpansions)
+      : sink_(sink), source_(source), macroExpansions_(macroExpansions) {}
 
   void InclusionDirective(clang::SourceLocation hashLoc, const clang::Token &,
                           llvm::StringRef fileName, bool isAngled,
@@ -321,6 +382,9 @@ public:
       return;
     auto name = macroName.getIdentifierInfo()->getName().str();
     auto key = source_.macroKey(name, info->getDefinitionLoc());
+    macroExpansions_.push_back(
+        {name, key,
+         clang::SourceRange(info->getDefinitionLoc(), info->getDefinitionEndLoc()), range});
     auto spelling = source_.span(range, true);
     auto expansion = source_.span(range, false);
     if (!spelling || !expansion)
@@ -338,13 +402,16 @@ public:
 private:
   FactSink &sink_;
   SourceFacts &source_;
+  std::vector<MacroExpansionRecord> &macroExpansions_;
 };
 
 class Collector final : public clang::RecursiveASTVisitor<Collector> {
 public:
-  Collector(clang::ASTContext &context, FactSink &sink, std::filesystem::path projectRoot)
+  Collector(clang::ASTContext &context, FactSink &sink, std::filesystem::path projectRoot,
+            const std::vector<MacroExpansionRecord> &macroExpansions)
       : context_(context), sink_(sink),
-        source_(context.getSourceManager(), context.getLangOpts(), std::move(projectRoot)) {}
+        source_(context.getSourceManager(), context.getLangOpts(), std::move(projectRoot)),
+        macroExpansions_(macroExpansions) {}
 
   SourceFacts &sourceFacts() { return source_; }
 
@@ -361,6 +428,7 @@ public:
         owner && owner->isImplicit() && !isRequiredImplicit(owner))
       return true;
     emitSymbol(decl, *kind);
+    emitTemplateRelationship(decl);
     return true;
   }
 
@@ -370,17 +438,20 @@ public:
         (function->isImplicit() && !isRequiredImplicit(function)))
       return true;
     emitCFG(function);
+    emitTemplateRelationship(function);
     return true;
   }
 
   bool VisitCallExpr(clang::CallExpr *expression) {
     auto *callee = expression->getDirectCallee();
     auto *owner = enclosingCallable(expression);
-    if (callee && owner && source_.relative(expression->getExprLoc()) &&
-        source_.relative(callee->getLocation())) {
+    if (!owner || !source_.relative(expression->getExprLoc(), false))
+      return true;
+    if (callee && source_.relative(callee->getLocation())) {
       emitSymbol(callee, llvm::isa<clang::CXXMethodDecl>(callee) ? "method" : "function");
       emitRelationship(owner, callee, "calls", expression->getSourceRange(), "call");
     }
+    emitCallsite(expression, owner, callee);
     return true;
   }
 
@@ -392,6 +463,10 @@ public:
       emitSymbol(constructor, "method");
       emitRelationship(owner, constructor, "calls", expression->getSourceRange(), "call");
     }
+    if (constructor && owner && source_.relative(expression->getExprLoc(), false))
+      emitResolvedCallsite(expression, owner, constructor, constructor, "constructor", true,
+                           "", "certain", 1.0, "direct_constructor",
+                           "Clang resolved the constructed type and constructor directly");
     return true;
   }
 
@@ -447,6 +522,170 @@ public:
   }
 
 private:
+  void emitCallsite(const clang::CallExpr *expression, const clang::FunctionDecl *owner,
+                    const clang::FunctionDecl *staticTarget) {
+    if (!staticTarget) {
+      const auto *calleeExpression = expression->getCallee();
+      const bool dependent = expression->isTypeDependent() || expression->isValueDependent() ||
+                             calleeExpression->isTypeDependent() ||
+                             calleeExpression->isValueDependent();
+      emitResolvedCallsite(expression, owner, nullptr, nullptr,
+                           dependent ? "dependent_template" : "unresolved_indirect", false,
+                           dependent ? "dependent_or_uninstantiated_template"
+                                     : "indirect_function_or_member_pointer_not_resolved",
+                           "", 0.0, "", "");
+      return;
+    }
+
+    const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(staticTarget);
+    if (!method) {
+      emitResolvedCallsite(expression, owner, staticTarget, staticTarget, "direct", true, "",
+                           "certain", 1.0, "direct_ast",
+                           "CallExpr::getDirectCallee selected one non-virtual function");
+      return;
+    }
+    const auto *parent = method->getParent();
+    if (parent && parent->isLambda() && method->getOverloadedOperator() == clang::OO_Call) {
+      const bool generic = method->getPrimaryTemplate() != nullptr;
+      emitResolvedCallsite(expression, owner, staticTarget, staticTarget,
+                           generic ? "generic_lambda" : "lambda", true, "", "certain", 1.0,
+                           "direct_ast",
+                           generic ? "Clang selected a concrete generic-lambda specialization"
+                                   : "Clang selected the concrete lambda call operator");
+      return;
+    }
+    if (method->getOverloadedOperator() == clang::OO_Call) {
+      emitResolvedCallsite(expression, owner, staticTarget, staticTarget, "functor", true, "",
+                           "certain", 1.0, "direct_ast",
+                           "Clang selected the concrete function-object call operator");
+      return;
+    }
+    if (!method->isVirtual()) {
+      emitResolvedCallsite(expression, owner, staticTarget, staticTarget, "direct", true, "",
+                           "certain", 1.0, "direct_ast",
+                           "CallExpr::getDirectCallee selected one non-virtual method");
+      return;
+    }
+
+    const auto *memberCall = llvm::dyn_cast<clang::CXXMemberCallExpr>(expression);
+    const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+        expression->getCallee()->IgnoreParenImpCasts());
+    if (member && member->hasQualifier()) {
+      emitResolvedCallsite(expression, owner, staticTarget, staticTarget, "direct", true, "",
+                           "certain", 1.0, "qualified_direct_ast",
+                           "a qualified member call suppresses virtual dispatch");
+      return;
+    }
+    if (method->hasAttr<clang::FinalAttr>() || (parent && parent->isEffectivelyFinal())) {
+      emitResolvedCallsite(expression, owner, staticTarget, staticTarget, "devirtualized", true,
+                           "", "certain", 1.0, "final_dispatch",
+                           "the selected method or its declaring class is final");
+      return;
+    }
+    if (memberCall) {
+      const auto *base = memberCall->getImplicitObjectArgument();
+      if (base) {
+        if (const auto *devirtualized = method->getDevirtualizedMethod(base, false)) {
+          emitResolvedCallsite(expression, owner, staticTarget, devirtualized,
+                               "devirtualized", true, "", "certain", 1.0,
+                               "clang_devirtualized",
+                               "CXXMethodDecl::getDevirtualizedMethod proved one target");
+          return;
+        }
+      }
+    }
+    emitResolvedCallsite(expression, owner, staticTarget, staticTarget, "virtual", false,
+                         "open_world_external_overrides_possible", "possible", 0.75,
+                         "static_virtual_candidate",
+                         "the statically selected method is a candidate; confidence is a "
+                         "deterministic ranking value, not a probability");
+  }
+
+  template <typename Expression>
+  void emitResolvedCallsite(const Expression *expression, const clang::FunctionDecl *owner,
+                            const clang::FunctionDecl *staticTarget,
+                            const clang::FunctionDecl *resolvedTarget,
+                            llvm::StringRef dispatchKind, bool complete,
+                            llvm::StringRef unresolvedReason, llvm::StringRef certainty,
+                            double confidence, llvm::StringRef derivation,
+                            llvm::StringRef confidenceReason) {
+    auto spelling = source_.span(expression->getSourceRange(), true);
+    auto expansion = source_.span(expression->getSourceRange(), false);
+    auto ownerKind = symbolKind(owner);
+    if (!spelling || !expansion || !ownerKind)
+      return;
+    emitSymbol(owner, *ownerKind);
+    const bool staticTargetIndexed =
+        staticTarget && source_.relative(staticTarget->getLocation()).has_value();
+    const bool resolvedTargetIndexed =
+        resolvedTarget && source_.relative(resolvedTarget->getLocation()).has_value();
+    if (staticTargetIndexed)
+      emitSymbol(staticTarget, llvm::isa<clang::CXXMethodDecl>(staticTarget) ? "method"
+                                                                           : "function");
+    if (resolvedTargetIndexed)
+      emitSymbol(resolvedTarget, llvm::isa<clang::CXXMethodDecl>(resolvedTarget) ? "method"
+                                                                                : "function");
+    if ((staticTarget && !staticTargetIndexed) || (resolvedTarget && !resolvedTargetIndexed)) {
+      complete = false;
+      unresolvedReason = "resolved_target_external_or_unindexed";
+      certainty = "";
+      derivation = "";
+      confidenceReason = "";
+    }
+    auto ownerKey = source_.declKey(owner, *ownerKind);
+    auto range = expression->getSourceRange();
+    auto callsiteKey = "callsite:" + ownerKey + ":" + expression->getStmtClassName() + ":" +
+                       std::to_string(source_.offset(range.getBegin(), true)) + ":" +
+                       std::to_string(source_.offset(range.getBegin(), false)) + ":" +
+                       std::to_string(source_.offset(range.getEnd(), false));
+    llvm::json::Object site{{"fact", "callsite_v1"},
+                            {"key", callsiteKey},
+                            {"owner_key", ownerKey},
+                            {"dispatch_kind", dispatchKind.str()},
+                            {"spelling_span", std::move(*spelling)},
+                            {"expansion_span", std::move(*expansion)},
+                            {"expansion_stack",
+                             source_.expansionStack(range.getBegin(), macroExpansions_)},
+                            {"target_set_complete", complete},
+                            {"unresolved_reason", unresolvedReason.str()},
+                            {"callee_text", source_.source(range)}};
+    if (staticTargetIndexed)
+      site["static_target_key"] = source_.declKey(
+          staticTarget, llvm::isa<clang::CXXMethodDecl>(staticTarget) ? "method" : "function");
+    sink_.add("callsite:" + callsiteKey, std::move(site));
+
+    if (resolvedTargetIndexed && !certainty.empty()) {
+      auto targetKey = source_.declKey(
+          resolvedTarget, llvm::isa<clang::CXXMethodDecl>(resolvedTarget) ? "method" : "function");
+      sink_.add("call-target:" + callsiteKey + ":" + targetKey,
+                {{"fact", "call_target_v1"},
+                 {"callsite_key", callsiteKey},
+                 {"target_key", targetKey},
+                 {"certainty", certainty.str()},
+                 {"confidence", confidence},
+                 {"confidence_reason", confidenceReason.str()},
+                 {"derivation", derivation.str()},
+                 {"evidence_span", std::move(*source_.span(range, false))}});
+    }
+    for (const auto &frame : macroExpansions_) {
+      auto stack = source_.expansionStack(range.getBegin(), macroExpansions_);
+      for (const auto &value : stack) {
+        const auto *object = value.getAsObject();
+        auto macroKey = object ? object->getString("macro_key") : std::nullopt;
+        if (!macroKey || *macroKey != frame.key)
+          continue;
+        sink_.add("edge:generated_by_macro:" + ownerKey + ":" + frame.key + ":" +
+                      std::to_string(source_.offset(range.getBegin(), false)),
+                  {{"fact", "edge"},
+                   {"source_key", ownerKey},
+                   {"target_key", frame.key},
+                   {"relation", "generated_by_macro"},
+                   {"span", std::move(*source_.span(range, false))}});
+        break;
+      }
+    }
+  }
+
   static clang::CFG::BuildOptions cfgBuildOptions(const clang::LangOptions &language) {
     clang::CFG::BuildOptions options;
     options.PruneTriviallyFalseEdges = false;
@@ -843,6 +1082,10 @@ private:
           arguments.push_back(stream.str());
         }
       }
+      if (auto location = function->getPointOfInstantiation(); location.isValid()) {
+        if (auto point = source_.span(clang::SourceRange(location, location), false))
+          metadata["point_of_instantiation"] = std::move(*point);
+      }
     }
     if (record) {
       switch (record->getSpecializationKind()) {
@@ -867,10 +1110,47 @@ private:
         argument.print(context_.getPrintingPolicy(), stream, true);
         arguments.push_back(stream.str());
       }
+      if (auto location = record->getPointOfInstantiation(); location.isValid()) {
+        if (auto point = source_.span(clang::SourceRange(location, location), false))
+          metadata["point_of_instantiation"] = std::move(*point);
+      }
     }
     metadata["template_kind"] = kind;
     metadata["template_arguments"] = std::move(arguments);
     return metadata;
+  }
+
+  void emitTemplateRelationship(const clang::NamedDecl *decl) {
+    if (const auto *function = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      auto specializationKind = function->getTemplateSpecializationKind();
+      if (specializationKind == clang::TSK_Undeclared)
+        return;
+      const clang::FunctionDecl *pattern = function->getTemplateInstantiationPattern();
+      if (!pattern) {
+        if (const auto *primary = function->getPrimaryTemplate())
+          pattern = primary->getTemplatedDecl();
+      }
+      if (!pattern || pattern == function || !source_.relative(pattern->getLocation()))
+        return;
+      emitRelationship(function, pattern,
+                       specializationKind == clang::TSK_ExplicitSpecialization
+                           ? "specializes"
+                           : "instantiates",
+                       function->getSourceRange(), "reference", false);
+      return;
+    }
+    if (const auto *record =
+            llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(decl)) {
+      const auto *primary = record->getSpecializedTemplate();
+      const auto *pattern = primary ? primary->getTemplatedDecl() : nullptr;
+      if (!pattern || pattern == record || !source_.relative(pattern->getLocation()))
+        return;
+      emitRelationship(record, pattern,
+                       record->getSpecializationKind() == clang::TSK_ExplicitSpecialization
+                           ? "specializes"
+                           : "instantiates",
+                       record->getSourceRange(), "reference", false);
+    }
   }
 
   void emitFile(const std::filesystem::path &path) {
@@ -1022,12 +1302,14 @@ private:
   clang::ASTContext &context_;
   FactSink &sink_;
   SourceFacts source_;
+  const std::vector<MacroExpansionRecord> &macroExpansions_;
 };
 
 class Consumer final : public clang::ASTConsumer {
 public:
-  Consumer(clang::ASTContext &context, FactSink &sink, const std::filesystem::path &root)
-      : collector_(context, sink, root) {}
+  Consumer(clang::ASTContext &context, FactSink &sink, const std::filesystem::path &root,
+           const std::vector<MacroExpansionRecord> &macroExpansions)
+      : collector_(context, sink, root, macroExpansions) {}
   void HandleTranslationUnit(clang::ASTContext &context) override {
     collector_.TraverseDecl(context.getTranslationUnitDecl());
   }
@@ -1044,19 +1326,21 @@ public:
     source_ = std::make_unique<SourceFacts>(compiler.getSourceManager(), compiler.getLangOpts(),
                                             root_);
     compiler.getPreprocessor().addPPCallbacks(
-        std::make_unique<PreprocessorCollector>(sink_, *source_));
+        std::make_unique<PreprocessorCollector>(sink_, *source_, macroExpansions_));
     return true;
   }
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &compiler, llvm::StringRef) override {
-    return std::make_unique<Consumer>(compiler.getASTContext(), sink_, root_);
+    return std::make_unique<Consumer>(compiler.getASTContext(), sink_, root_,
+                                      macroExpansions_);
   }
 
 private:
   FactSink &sink_;
   std::filesystem::path root_;
   std::unique_ptr<SourceFacts> source_;
+  std::vector<MacroExpansionRecord> macroExpansions_;
 };
 
 class ActionFactory final : public clang::tooling::FrontendActionFactory {

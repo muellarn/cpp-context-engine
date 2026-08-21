@@ -19,6 +19,10 @@ from cpp_context_engine.models import (
     BoundedCfgResult,
     BuildScope,
     BuildVariant,
+    CallDispatchKind,
+    CallSite,
+    CallTarget,
+    CallTargetCertainty,
     CfgBlock,
     CfgBlockRole,
     CfgEdge,
@@ -29,6 +33,7 @@ from cpp_context_engine.models import (
     GraphDirection,
     GraphEdge,
     GraphRelation,
+    MacroExpansionFrame,
     OccurrenceKind,
     SearchHit,
     SearchQuery,
@@ -40,8 +45,9 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_CFG_PAGE_SIZE = 10_000
+MAX_CALL_PAGE_SIZE = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +306,8 @@ class SQLiteStore:
             self._migrate_v4()
         if current <= 4:
             self._migrate_v5()
+        if current <= 5:
+            self._migrate_v6()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -668,6 +676,85 @@ class SQLiteStore:
                 "UPDATE translation_units SET advanced_facts_complete = 0 "
                 "WHERE analysis_backend = 'clang-libtooling'"
             )
+            self._connection.execute("PRAGMA user_version = 5")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _migrate_v6(self) -> None:
+        """Add build-scoped callsite and dispatch-target evidence atomically."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            _execute_script(
+                self._connection,
+                """
+                CREATE TABLE callsites (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    owner_symbol_id TEXT NOT NULL,
+                    dispatch_kind TEXT NOT NULL,
+                    spelling_span_json TEXT NOT NULL,
+                    expansion_span_json TEXT NOT NULL,
+                    expansion_stack_json TEXT NOT NULL,
+                    static_target_symbol_id TEXT,
+                    target_set_complete INTEGER NOT NULL,
+                    unresolved_reason TEXT NOT NULL,
+                    callee_text TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, owner_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, static_target_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE call_targets (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    callsite_id TEXT NOT NULL,
+                    target_symbol_id TEXT NOT NULL,
+                    certainty TEXT NOT NULL,
+                    confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+                    confidence_reason TEXT NOT NULL,
+                    derivation TEXT NOT NULL,
+                    evidence_span_json TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, callsite_id, target_symbol_id),
+                    FOREIGN KEY (project_id, callsite_id)
+                        REFERENCES callsites(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX callsites_owner_scope
+                    ON callsites(project_id, owner_symbol_id, build_variant, id);
+                CREATE INDEX callsites_static_target_scope
+                    ON callsites(project_id, static_target_symbol_id, build_variant, id);
+                CREATE INDEX callsites_tu ON callsites(project_id, translation_unit_id);
+                CREATE INDEX call_targets_callsite_order
+                    ON call_targets(project_id, callsite_id, certainty, target_symbol_id, id);
+                CREATE INDEX call_targets_target_scope
+                    ON call_targets(project_id, target_symbol_id, build_variant, id);
+                """,
+            )
+            # Older native rows did not contain explicit unresolved indirect calls or
+            # dispatch certainty, so a normal incremental run must replace them.
+            self._connection.execute(
+                "UPDATE translation_units SET advanced_facts_complete = 0 "
+                "WHERE analysis_backend = 'clang-libtooling'"
+            )
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except BaseException:
             self._connection.rollback()
@@ -830,6 +917,7 @@ class SQLiteStore:
                 batch.cfg_elements,
                 batch.cfg_edges,
             )
+            self._put_call_facts(project_id, batch.callsites, batch.call_targets)
             self._refresh_symbols(
                 project_id, affected_symbols | {symbol.id for symbol in batch.symbols}
             )
@@ -1410,6 +1498,79 @@ class SQLiteStore:
             ),
         )
 
+    def _put_call_facts(
+        self,
+        project_id: int,
+        callsites: Iterable[CallSite],
+        targets: Iterable[CallTarget],
+    ) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO callsites(
+                project_id, id, owner_symbol_id, dispatch_kind,
+                spelling_span_json, expansion_span_json, expansion_stack_json,
+                static_target_symbol_id, target_set_complete, unresolved_reason,
+                callee_text, translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    site.id,
+                    site.owner_symbol_id,
+                    site.dispatch_kind.value,
+                    _span_json(site.spelling_span),
+                    _span_json(site.expansion_span),
+                    json.dumps(
+                        [
+                            {
+                                "macro_symbol_id": frame.macro_symbol_id,
+                                "name": frame.name,
+                                "spelling_span": _span_payload(frame.spelling_span),
+                                "expansion_span": _span_payload(frame.expansion_span),
+                            }
+                            for frame in site.expansion_stack
+                        ],
+                        sort_keys=True,
+                    ),
+                    site.static_target_symbol_id,
+                    int(site.target_set_complete),
+                    site.unresolved_reason,
+                    site.callee_text,
+                    site.translation_unit_id,
+                    site.build_configuration_id,
+                    site.build_variant,
+                )
+                for site in callsites
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO call_targets(
+                project_id, id, callsite_id, target_symbol_id, certainty,
+                confidence, confidence_reason, derivation, evidence_span_json,
+                translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    target.id,
+                    target.callsite_id,
+                    target.target_symbol_id,
+                    target.certainty.value,
+                    target.confidence,
+                    target.confidence_reason,
+                    target.derivation,
+                    _span_json(target.evidence_span),
+                    target.translation_unit_id,
+                    target.build_configuration_id,
+                    target.build_variant,
+                )
+                for target in targets
+            ),
+        )
+
     def translation_unit_states(
         self,
         project_root: Path | None = None,
@@ -1613,6 +1774,132 @@ class SQLiteStore:
         ).fetchall()
         return BoundedCfgResult(
             tuple(self._row_to_cfg_graph(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def callsites(
+        self,
+        owner_symbol_id: str | None = None,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> BoundedCfgResult[CallSite]:
+        """Return compiler callsites in stable order with explicit truncation."""
+
+        limit = _call_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        owner_sql = ""
+        parameters: list[object] = [project_id, *names]
+        if owner_symbol_id is not None:
+            owner_sql = " AND owner_symbol_id = ?"
+            parameters.append(owner_symbol_id)
+        parameters.append(limit + 1)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM callsites
+            WHERE project_id = ? AND build_variant IN ({placeholders}){owner_sql}
+            ORDER BY build_variant, build_configuration_id, translation_unit_id,
+                     json_extract(expansion_span_json, '$.path'),
+                     json_extract(expansion_span_json, '$.start_line'),
+                     json_extract(expansion_span_json, '$.start_column'), id
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_callsite(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def get_callsite(
+        self,
+        callsite_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> CallSite | None:
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        row = self._connection.execute(
+            f"""
+            SELECT * FROM callsites
+            WHERE project_id = ? AND id = ? AND build_variant IN ({placeholders})
+            """,
+            (project_id, callsite_id, *names),
+        ).fetchone()
+        return self._row_to_callsite(row) if row else None
+
+    def call_targets(
+        self,
+        callsite_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> BoundedCfgResult[CallTarget]:
+        limit = _call_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM call_targets
+            WHERE project_id = ? AND callsite_id = ?
+              AND build_variant IN ({placeholders})
+            ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
+                     confidence DESC, target_symbol_id, derivation, id
+            LIMIT ?
+            """,
+            (project_id, callsite_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_call_target(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    @staticmethod
+    def _row_to_callsite(row: sqlite3.Row) -> CallSite:
+        stack: list[MacroExpansionFrame] = []
+        for frame in json.loads(row["expansion_stack_json"]):
+            stack.append(
+                MacroExpansionFrame(
+                    macro_symbol_id=frame["macro_symbol_id"],
+                    name=frame["name"],
+                    spelling_span=_span_from_payload(frame["spelling_span"]),
+                    expansion_span=_span_from_payload(frame["expansion_span"]),
+                )
+            )
+        return CallSite(
+            id=row["id"],
+            owner_symbol_id=row["owner_symbol_id"],
+            dispatch_kind=CallDispatchKind(row["dispatch_kind"]),
+            spelling_span=_required_span_from_json(row["spelling_span_json"]),
+            expansion_span=_required_span_from_json(row["expansion_span_json"]),
+            target_set_complete=bool(row["target_set_complete"]),
+            static_target_symbol_id=row["static_target_symbol_id"],
+            unresolved_reason=row["unresolved_reason"],
+            callee_text=row["callee_text"],
+            expansion_stack=tuple(stack),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_call_target(row: sqlite3.Row) -> CallTarget:
+        return CallTarget(
+            id=row["id"],
+            callsite_id=row["callsite_id"],
+            target_symbol_id=row["target_symbol_id"],
+            certainty=CallTargetCertainty(row["certainty"]),
+            confidence=row["confidence"],
+            confidence_reason=row["confidence_reason"],
+            derivation=row["derivation"],
+            evidence_span=_required_span_from_json(row["evidence_span_json"]),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
         )
 
     def get_cfg_graph(
@@ -2251,6 +2538,22 @@ def _cfg_limit(limit: int) -> int:
     return limit
 
 
+def _call_limit(limit: int) -> int:
+    if not 1 <= limit <= MAX_CALL_PAGE_SIZE:
+        raise ValueError(f"call page limit must be between 1 and {MAX_CALL_PAGE_SIZE}")
+    return limit
+
+
+def _span_payload(span: SourceSpan) -> dict[str, object]:
+    return {
+        "path": str(span.path),
+        "start_line": span.start_line,
+        "end_line": span.end_line,
+        "start_column": span.start_column,
+        "end_column": span.end_column,
+    }
+
+
 def _span_json(span: SourceSpan | None) -> str | None:
     if span is None:
         return None
@@ -2270,12 +2573,23 @@ def _span_from_json(payload: str | None) -> SourceSpan | None:
     if payload is None:
         return None
     value = json.loads(payload)
+    return _span_from_payload(value)
+
+
+def _required_span_from_json(payload: str) -> SourceSpan:
+    span = _span_from_json(payload)
+    if span is None:  # pragma: no cover - NOT NULL storage invariant
+        raise ValueError("required source span is missing")
+    return span
+
+
+def _span_from_payload(value: dict[str, object]) -> SourceSpan:
     return SourceSpan(
         Path(value["path"]),
-        value["start_line"],
-        value["end_line"],
-        value["start_column"],
-        value["end_column"],
+        int(value["start_line"]),
+        int(value["end_line"]),
+        int(value["start_column"]),
+        int(value["end_column"]),
     )
 
 

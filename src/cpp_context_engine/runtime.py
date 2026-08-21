@@ -135,6 +135,8 @@ def index_project(config: AppConfig) -> IndexOperationResult:
             indexed_cfg_blocks=sum(item.indexed_cfg_blocks for item in results),
             indexed_cfg_elements=sum(item.indexed_cfg_elements for item in results),
             indexed_cfg_edges=sum(item.indexed_cfg_edges for item in results),
+            indexed_callsites=sum(item.indexed_callsites for item in results),
+            indexed_call_targets=sum(item.indexed_call_targets for item in results),
         )
         vector_search = SQLiteVectorSearch(
             store,

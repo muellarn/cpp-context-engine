@@ -9,6 +9,8 @@ from typing import Protocol
 from cpp_context_engine.models import (
     BuildConfiguration,
     BuildVariant,
+    CallSite,
+    CallTarget,
     CfgBlock,
     CfgEdge,
     CfgElement,
@@ -32,6 +34,8 @@ class IngestionBatch:
     cfg_blocks: tuple[CfgBlock, ...] = ()
     cfg_elements: tuple[CfgElement, ...] = ()
     cfg_edges: tuple[CfgEdge, ...] = ()
+    callsites: tuple[CallSite, ...] = ()
+    call_targets: tuple[CallTarget, ...] = ()
 
 
 class Ingestor(Protocol):
