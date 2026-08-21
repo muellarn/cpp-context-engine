@@ -34,14 +34,17 @@ from cpp_context_engine.models import (
     CfgGraph,
     CodeSymbol,
     DataAccess,
+    DataAccessKind,
     DataFlowAnalysis,
     DataFlowCertainty,
     DataFlowEvidence,
+    DataFlowRelation,
     FunctionSummary,
     GraphDirection,
     GraphEdge,
     GraphRelation,
     InterproceduralFlow,
+    InterproceduralFlowKind,
     MacroExpansionFrame,
     MemoryLocation,
     MemoryLocationKind,
@@ -1369,11 +1372,17 @@ class SQLiteStore:
             ),
         )
 
-    def build_variants(self, project_root: Path | None = None) -> tuple[BuildVariant, ...]:
+    def build_variants(
+        self, project_root: Path | None = None, *, limit: int | None = None
+    ) -> tuple[BuildVariant, ...]:
         try:
             project_id = self._project_id(project_root)
         except KeyError:
             return ()
+        if limit is not None and not 1 <= limit <= 10_000:
+            raise ValueError("build variant limit must be in [1, 10000]")
+        limit_sql = " LIMIT ?" if limit is not None else ""
+        parameters: tuple[object, ...] = (project_id, limit) if limit is not None else (project_id,)
         return tuple(
             BuildVariant(
                 row["name"],
@@ -1383,8 +1392,8 @@ class SQLiteStore:
                 json.loads(row["metadata_json"]),
             )
             for row in self._connection.execute(
-                "SELECT * FROM build_variants WHERE project_id = ? ORDER BY name",
-                (project_id,),
+                "SELECT * FROM build_variants WHERE project_id = ? ORDER BY name" + limit_sql,
+                parameters,
             )
         )
 
@@ -3018,6 +3027,70 @@ class SQLiteStore:
             tuple(self._row_to_call_target(row) for row in rows[:limit]), len(rows) > limit
         )
 
+    def call_evidence(
+        self,
+        symbol_id: str,
+        *,
+        incoming: bool,
+        project_root: Path | None = None,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> BoundedCfgResult[tuple[CallSite, CallTarget]]:
+        """Return bounded callsite/target evidence, with certain targets ranked first."""
+
+        limit = _call_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        endpoint = "targets.target_symbol_id" if incoming else "sites.owner_symbol_id"
+        rows = self._connection.execute(
+            f"""
+            SELECT sites.*, targets.id AS target_id,
+                   targets.target_symbol_id AS target_target_symbol_id,
+                   targets.certainty AS target_certainty,
+                   targets.confidence AS target_confidence,
+                   targets.confidence_reason AS target_confidence_reason,
+                   targets.derivation AS target_derivation,
+                   targets.evidence_span_json AS target_evidence_span_json,
+                   targets.translation_unit_id AS target_translation_unit_id,
+                   targets.build_configuration_id AS target_build_configuration_id,
+                   targets.build_variant AS target_build_variant
+            FROM callsites sites
+            JOIN call_targets targets
+              ON targets.project_id = sites.project_id AND targets.callsite_id = sites.id
+            WHERE sites.project_id = ? AND {endpoint} = ?
+              AND sites.build_variant IN ({placeholders})
+            ORDER BY CASE targets.certainty WHEN 'certain' THEN 0 ELSE 1 END,
+                     targets.confidence DESC, sites.build_variant,
+                     json_extract(sites.expansion_span_json, '$.path'),
+                     json_extract(sites.expansion_span_json, '$.start_line'),
+                     json_extract(sites.expansion_span_json, '$.start_column'),
+                     sites.id, targets.target_symbol_id, targets.id
+            LIMIT ?
+            """,
+            (project_id, symbol_id, *names, limit + 1),
+        ).fetchall()
+        items = tuple(
+            (
+                self._row_to_callsite(row),
+                CallTarget(
+                    id=row["target_id"],
+                    callsite_id=row["id"],
+                    target_symbol_id=row["target_target_symbol_id"],
+                    certainty=CallTargetCertainty(row["target_certainty"]),
+                    confidence=row["target_confidence"],
+                    confidence_reason=row["target_confidence_reason"],
+                    derivation=row["target_derivation"],
+                    evidence_span=_required_span_from_json(row["target_evidence_span_json"]),
+                    translation_unit_id=row["target_translation_unit_id"],
+                    build_configuration_id=row["target_build_configuration_id"],
+                    build_variant=row["target_build_variant"],
+                ),
+            )
+            for row in rows[:limit]
+        )
+        return BoundedCfgResult(items, len(rows) > limit)
+
     @staticmethod
     def _row_to_callsite(row: sqlite3.Row) -> CallSite:
         stack: list[MacroExpansionFrame] = []
@@ -3080,6 +3153,224 @@ class SQLiteStore:
             (project_id, graph_id, *names),
         ).fetchone()
         return self._row_to_cfg_graph(row) if row else None
+
+    def data_flow_analyses(
+        self,
+        graph_id: str | None = None,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> BoundedCfgResult[DataFlowAnalysis]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        graph_sql = ""
+        parameters: list[object] = [project_id, *names]
+        if graph_id is not None:
+            graph_sql = " AND graph_id = ?"
+            parameters.append(graph_id)
+        parameters.append(limit + 1)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM data_flow_analyses
+            WHERE project_id = ? AND build_variant IN ({placeholders}){graph_sql}
+            ORDER BY build_variant, graph_id, id LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_data_flow_analysis(row) for row in rows[:limit]),
+            len(rows) > limit,
+        )
+
+    def memory_locations(
+        self,
+        analysis_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 1_000,
+    ) -> BoundedCfgResult[MemoryLocation]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM memory_locations
+            WHERE project_id = ? AND analysis_id = ?
+              AND build_variant IN ({placeholders})
+            ORDER BY kind, name, id LIMIT ?
+            """,
+            (project_id, analysis_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_memory_location(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def data_accesses(
+        self,
+        analysis_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 2_000,
+    ) -> BoundedCfgResult[DataAccess]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT accesses.* FROM data_accesses accesses
+            JOIN cfg_blocks blocks
+              ON blocks.project_id = accesses.project_id AND blocks.id = accesses.block_id
+            WHERE accesses.project_id = ? AND accesses.analysis_id = ?
+              AND accesses.build_variant IN ({placeholders})
+            ORDER BY blocks.block_index, accesses.sequence, accesses.id LIMIT ?
+            """,
+            (project_id, analysis_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_data_access(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def data_flow_evidence(
+        self,
+        analysis_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 2_000,
+    ) -> BoundedCfgResult[DataFlowEvidence]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM data_flow_evidence
+            WHERE project_id = ? AND analysis_id = ?
+              AND build_variant IN ({placeholders})
+            ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
+                     relation, source_access_id, source_location_id,
+                     target_access_id, target_location_id, id LIMIT ?
+            """,
+            (project_id, analysis_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_data_flow_evidence(row) for row in rows[:limit]),
+            len(rows) > limit,
+        )
+
+    def function_summaries(
+        self,
+        function_symbol_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> BoundedCfgResult[FunctionSummary]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM function_summaries
+            WHERE project_id = ? AND function_symbol_id = ?
+              AND build_variant IN ({placeholders})
+            ORDER BY build_variant, build_configuration_id, translation_unit_id, id LIMIT ?
+            """,
+            (project_id, function_symbol_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_function_summary(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def summary_effects(
+        self,
+        summary_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 1_000,
+    ) -> BoundedCfgResult[SummaryEffect]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM summary_effects
+            WHERE project_id = ? AND summary_id = ?
+              AND build_variant IN ({placeholders})
+            ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
+                     is_local DESC, kind, id LIMIT ?
+            """,
+            (project_id, summary_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_summary_effect(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def summary_return_origins(
+        self,
+        summary_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 1_000,
+    ) -> BoundedCfgResult[SummaryReturnOrigin]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM summary_return_origins
+            WHERE project_id = ? AND summary_id = ?
+              AND build_variant IN ({placeholders})
+            ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
+                     is_local DESC, kind, id LIMIT ?
+            """,
+            (project_id, summary_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_summary_return_origin(row) for row in rows[:limit]),
+            len(rows) > limit,
+        )
+
+    def interprocedural_flows(
+        self,
+        summary_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 1_000,
+    ) -> BoundedCfgResult[InterproceduralFlow]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM interprocedural_flows
+            WHERE project_id = ?
+              AND (caller_summary_id = ? OR callee_summary_id = ?)
+              AND build_variant IN ({placeholders})
+            ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
+                     CASE target_certainty WHEN 'certain' THEN 0 ELSE 1 END,
+                     kind, callsite_id, id LIMIT ?
+            """,
+            (project_id, summary_id, summary_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_interprocedural_flow(row) for row in rows[:limit]),
+            len(rows) > limit,
+        )
 
     def cfg_blocks(
         self,
@@ -3233,6 +3524,102 @@ class SQLiteStore:
             kind=CfgEdgeKind(row["kind"]),
             successor_index=row["successor_index"],
             feasible=bool(row["feasible"]),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_data_flow_analysis(row: sqlite3.Row) -> DataFlowAnalysis:
+        return DataFlowAnalysis(
+            id=row["id"],
+            graph_id=row["graph_id"],
+            complete=bool(row["complete"]),
+            incomplete_reasons=tuple(json.loads(row["incomplete_reasons_json"])),
+            iteration_count=row["iteration_count"],
+            max_iterations=row["max_iterations"],
+            max_alias_targets=row["max_alias_targets"],
+            max_access_path_depth=row["max_access_path_depth"],
+            max_locations=row["max_locations"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_memory_location(row: sqlite3.Row) -> MemoryLocation:
+        return MemoryLocation(
+            id=row["id"],
+            analysis_id=row["analysis_id"],
+            graph_id=row["graph_id"],
+            kind=MemoryLocationKind(row["kind"]),
+            name=row["name"],
+            type_name=row["type_name"],
+            declaration_symbol_id=row["declaration_symbol_id"],
+            base_location_id=row["base_location_id"],
+            access_path=tuple(json.loads(row["access_path_json"])),
+            is_volatile=bool(row["is_volatile"]),
+            is_atomic=bool(row["is_atomic"]),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_data_access(row: sqlite3.Row) -> DataAccess:
+        return DataAccess(
+            id=row["id"],
+            analysis_id=row["analysis_id"],
+            graph_id=row["graph_id"],
+            block_id=row["block_id"],
+            location_id=row["location_id"],
+            kind=DataAccessKind(row["kind"]),
+            sequence=row["sequence"],
+            cfg_element_id=row["cfg_element_id"],
+            span=_span_from_json(row["span_json"]),
+            expression=row["expression"],
+            pointee_symbol_ids=tuple(json.loads(row["pointee_symbol_ids_json"])),
+            points_to_complete=bool(row["points_to_complete"]),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_data_flow_evidence(row: sqlite3.Row) -> DataFlowEvidence:
+        return DataFlowEvidence(
+            id=row["id"],
+            analysis_id=row["analysis_id"],
+            graph_id=row["graph_id"],
+            relation=DataFlowRelation(row["relation"]),
+            certainty=DataFlowCertainty(row["certainty"]),
+            reason=row["reason"],
+            source_access_id=row["source_access_id"],
+            target_access_id=row["target_access_id"],
+            source_location_id=row["source_location_id"],
+            target_location_id=row["target_location_id"],
+            evidence_span=_span_from_json(row["evidence_span_json"]),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_interprocedural_flow(row: sqlite3.Row) -> InterproceduralFlow:
+        return InterproceduralFlow(
+            id=row["id"],
+            kind=InterproceduralFlowKind(row["kind"]),
+            caller_summary_id=row["caller_summary_id"],
+            callee_summary_id=row["callee_summary_id"],
+            callsite_id=row["callsite_id"],
+            target_symbol_id=row["target_symbol_id"],
+            target_certainty=CallTargetCertainty(row["target_certainty"]),
+            certainty=DataFlowCertainty(row["certainty"]),
+            reason=row["reason"],
+            argument_index=row["argument_index"],
+            caller_location_id=row["caller_location_id"],
+            callee_location_id=row["callee_location_id"],
+            caller_access_id=row["caller_access_id"],
             translation_unit_id=row["translation_unit_id"],
             build_configuration_id=row["build_configuration_id"],
             build_variant=row["build_variant"],

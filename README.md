@@ -97,6 +97,9 @@ cpp-context index /path/to/project \
 cpp-context search "feature handler" --project /path/to/project --build debug
 cpp-context search "feature handler" --project /path/to/project \
   --build debug --build release --json
+cpp-context builds --project /path/to/project --json
+cpp-context cfg SYMBOL_ID --project /path/to/project --build debug --json
+cpp-context flow SYMBOL_ID --project /path/to/project --build debug --json
 ```
 
 A single-build query is strictly filtered. A union query returns separate evidence
@@ -153,7 +156,11 @@ cpp-context ask "How does an incoming packet reach the decoder?"
 cpp-context serve --host 127.0.0.1 --port 8000
 ```
 
-`serve` exposes `GET /health`, `POST /v1/context`, and `POST /v1/answer`.
+`serve` exposes `GET /health`, `GET /v1/builds`, `POST /v1/context`,
+`POST /v1/answer`, `POST /v1/calls`, `POST /v1/cfg`, and `POST /v1/flow`.
+Every analysis response identifies its selected build or explicit union and keeps
+call certainty, completeness, derivation, confidence-ranking evidence, and
+build/configuration/translation-unit provenance separate from source text.
 The answer route returns HTTP 503 when the server was started without LLM
 configuration; local context search continues to work.
 
@@ -186,11 +193,14 @@ cpp-context mcp \
 ```
 
 The server may start before an index exists. An MCP client can call `index_project`,
-then `search_code`, `read_symbol`, `neighbors`, `callers`, and `callees`. `ask_code`
-is available when an LLM endpoint is configured. Every tool has a Pydantic structured
-output schema. Locations contain exact symbol IDs, project-relative POSIX paths, and
-one-based line ranges. Query length, result count, graph depth/fanout, packed context,
-source size, and answer steps all have hard server-side limits.
+then `list_builds`, `search_code`, `read_symbol`, `neighbors`, `callers`, `callees`,
+`control_flow`, and `data_flow`. `ask_code` is available when an LLM endpoint is
+configured. Existing tool names remain unchanged. Every tool has a Pydantic structured
+output schema. Locations contain exact symbol/callsite IDs, project-relative POSIX
+paths, and one-based line ranges. Query length, build count, result/evidence count,
+graph depth/fanout, packed context, source size, and answer steps all have hard
+server-side limits. A tool may select only a subset of the operator-enabled build
+scope; omitting `builds` returns that scope and labels multi-build results as a union.
 
 For Codex or another stdio-capable MCP client, add a local server using the generic
 command/environment shape below. The exact settings file or UI varies by client:
@@ -319,8 +329,9 @@ components with hard limits, keeps possible dispatch possible, and marks unknown
 external, or budget-limited paths incomplete. Incremental updates recompute only
 changed summaries and their transitive callers plus required callees. It emits
 evidence only: dead-code and redundant-call judgments remain the LLM's
-responsibility. Dedicated CLI/API/MCP CFG, callsite, and data-flow reads are
-intentionally deferred to the interface issue.
+responsibility. Shared bounded contracts expose these facts consistently through
+the store/service layer, stable CLI JSON, HTTP, and MCP. Certain call and flow
+evidence ranks before possible evidence without discarding the possible paths.
 
 See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,
 incremental behavior, libclang configuration, and current guarantees.
@@ -339,7 +350,9 @@ reader, and code graph. It then:
    absolute character budgets.
 
 Each packed item contains a stable symbol ID, file and line range, selection
-reason, and graph path. Adapter failures are returned as sanitized diagnostics;
+reason, build label, and graph path. Call-derived expansion reasons also include
+compact certainty, confidence-ranking, and derivation labels. Adapter failures are
+returned as sanitized diagnostics;
 one failing candidate source does not hide successful sources.
 
 `FilesystemSourceReader` confines reads to an explicit project root and rejects
@@ -373,14 +386,19 @@ from cpp_context_engine.api.http import create_app
 app = create_app(
     retrieval_service=retrieval_service,
     answer_service=answer_service,
+    analysis_service=analysis_service,
 )
 ```
 
 The routes are:
 
 - `GET /health`
+- `GET /v1/builds` for safe build labels and active scope
 - `POST /v1/context` for source context and provenance
 - `POST /v1/answer` for a bounded answer with validated citations
+- `POST /v1/calls` for evidence-rich caller/callee targets
+- `POST /v1/cfg` for bounded control-flow graphs
+- `POST /v1/flow` for bounded local and interprocedural data-flow evidence
 
 The CLI composition root creates project-scoped SQLite lexical, symbol, vector,
 graph, source-reader, retrieval, and optional LLM adapters. Library consumers can

@@ -6,7 +6,12 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from cpp_context_engine.models import GraphDirection, GraphRelation, SymbolKind
+from cpp_context_engine.models import (
+    CallTargetCertainty,
+    GraphDirection,
+    GraphRelation,
+    SymbolKind,
+)
 
 MAX_QUERY_CHARS = 2_048
 MAX_SYMBOL_ID_CHARS = 2_048
@@ -21,6 +26,11 @@ MAX_SOURCE_CHARS = 50_000
 MIN_SOURCE_CHARS = 256
 MAX_DIAGNOSTICS = 20
 MAX_ANSWER_CHARS = 50_000
+MAX_BUILD_VARIANTS = 16
+MAX_BUILD_NAME_CHARS = 128
+MAX_ANALYSIS_GRAPHS = 20
+MAX_ANALYSIS_BLOCKS = 500
+MAX_ANALYSIS_ITEMS = 2_000
 
 QueryText = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_QUERY_CHARS)
@@ -36,6 +46,19 @@ ContextTokens = Annotated[int, Field(ge=MIN_CONTEXT_TOKENS, le=MAX_CONTEXT_TOKEN
 AnswerSteps = Annotated[int, Field(ge=1, le=MAX_ANSWER_STEPS)]
 SourceChars = Annotated[int, Field(ge=MIN_SOURCE_CHARS, le=MAX_SOURCE_CHARS)]
 Relations = Annotated[list[GraphRelation] | None, Field(max_length=len(GraphRelation))]
+Builds = Annotated[
+    list[
+        Annotated[
+            str,
+            StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_BUILD_NAME_CHARS),
+        ]
+    ]
+    | None,
+    Field(max_length=MAX_BUILD_VARIANTS),
+]
+AnalysisGraphs = Annotated[int, Field(ge=1, le=MAX_ANALYSIS_GRAPHS)]
+AnalysisBlocks = Annotated[int, Field(ge=1, le=MAX_ANALYSIS_BLOCKS)]
+AnalysisItems = Annotated[int, Field(ge=1, le=MAX_ANALYSIS_ITEMS)]
 
 
 class ToolOutput(BaseModel):
@@ -82,12 +105,18 @@ class SearchCodeResult(ToolOutput):
     estimated_tokens: int = Field(ge=0)
     truncated: bool
     diagnostics: Annotated[list[str], Field(max_length=MAX_DIAGNOSTICS)]
+    scope_kind: str = "single"
+    scope_label: str = "build:default"
+    scope_variants: list[str] = Field(default_factory=lambda: ["default"])
 
 
 class ReadSymbolResult(ToolOutput):
     symbol: SymbolReference
     source_text: str
     truncated: bool
+    scope_kind: str = "single"
+    scope_label: str = "build:default"
+    scope_variants: list[str] = Field(default_factory=lambda: ["default"])
 
 
 class GraphEdgeResult(ToolOutput):
@@ -96,6 +125,14 @@ class GraphEdgeResult(ToolOutput):
     source: SymbolReference
     target: SymbolReference
     relation: GraphRelation
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    callsite_id: str | None = None
+    certainty: CallTargetCertainty | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence_reason: str | None = None
+    derivation: str | None = None
+    target_set_complete: bool | None = None
 
 
 class GraphResult(ToolOutput):
@@ -104,6 +141,9 @@ class GraphResult(ToolOutput):
     depth: int = Field(ge=1, le=MAX_GRAPH_DEPTH)
     edges: Annotated[list[GraphEdgeResult], Field(max_length=MAX_GRAPH_RESULTS)]
     truncated: bool
+    scope_kind: str = "single"
+    scope_label: str = "build:default"
+    scope_variants: list[str] = Field(default_factory=lambda: ["default"])
 
 
 class IndexProjectResult(ToolOutput):
@@ -133,3 +173,6 @@ class AskCodeResult(ToolOutput):
     steps: int = Field(ge=1, le=MAX_ANSWER_STEPS)
     sources: Annotated[list[AnswerSource], Field(max_length=MAX_SEARCH_RESULTS)]
     diagnostics: Annotated[list[str], Field(max_length=MAX_DIAGNOSTICS)]
+    scope_kind: str = "single"
+    scope_label: str = "build:default"
+    scope_variants: list[str] = Field(default_factory=lambda: ["default"])

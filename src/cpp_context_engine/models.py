@@ -10,6 +10,8 @@ from types import MappingProxyType
 from typing import Any, Generic, TypeVar
 
 DEFAULT_BUILD_VARIANT = "default"
+MAX_BUILD_VARIANTS = 16
+MAX_BUILD_VARIANT_NAME_CHARS = 128
 
 
 class SymbolKind(StrEnum):
@@ -183,6 +185,10 @@ class BuildVariant:
         name = self.name.strip()
         if not name or any(character.isspace() for character in name):
             raise ValueError("build variant name must be non-empty and contain no whitespace")
+        if len(name) > MAX_BUILD_VARIANT_NAME_CHARS:
+            raise ValueError(
+                f"build variant name must not exceed {MAX_BUILD_VARIANT_NAME_CHARS} characters"
+            )
         object.__setattr__(self, "name", name)
         object.__setattr__(
             self,
@@ -202,6 +208,14 @@ class BuildScope:
         normalized = tuple(dict.fromkeys(name.strip() for name in self.variants if name.strip()))
         if not normalized:
             raise ValueError("build scope must contain at least one variant")
+        if any(any(character.isspace() for character in name) for name in normalized):
+            raise ValueError("build scope names must not contain whitespace")
+        if len(normalized) > MAX_BUILD_VARIANTS:
+            raise ValueError(f"build scope must not exceed {MAX_BUILD_VARIANTS} variants")
+        if any(len(name) > MAX_BUILD_VARIANT_NAME_CHARS for name in normalized):
+            raise ValueError(
+                f"build variant names must not exceed {MAX_BUILD_VARIANT_NAME_CHARS} characters"
+            )
         object.__setattr__(self, "variants", normalized)
 
     @classmethod

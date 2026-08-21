@@ -15,7 +15,9 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+  "pydantic>=2,<3",
+]
 
 [project.optional-dependencies]
 clang = [

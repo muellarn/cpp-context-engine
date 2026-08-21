@@ -15,7 +15,10 @@ from cpp_context_engine.api.contracts import (
     SourceCitation,
 )
 from cpp_context_engine.llm import LLMProvider
+from cpp_context_engine.models import BuildScope
 from cpp_context_engine.retrieval import ContextBundle, ContextItem, Retriever
+
+MAX_QUERY_CHARS = 2_048
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,17 +28,27 @@ class ContextRetrievalService:
     retriever: Retriever
     default_max_context_tokens: int = 16_000
     max_context_tokens: int = 64_000
+    build_scope: BuildScope = BuildScope.single()
+    default_max_results: int | None = None
+    max_results: int = 100
 
     def __post_init__(self) -> None:
         if min(self.default_max_context_tokens, self.max_context_tokens) <= 0:
             raise ValueError("context token limits must be positive")
         if self.default_max_context_tokens > self.max_context_tokens:
             raise ValueError("default context limit must not exceed the hard limit")
+        if (
+            self.default_max_results is not None
+            and not 1 <= self.default_max_results <= self.max_results
+        ):
+            raise ValueError("default result limit must be within the hard result limit")
 
     def query(self, request: QueryRequest) -> QueryResponse:
         query = request.query.strip()
         if not query:
             raise ValueError("query must not be empty")
+        if len(query) > MAX_QUERY_CHARS:
+            raise ValueError(f"query must not exceed {MAX_QUERY_CHARS} characters")
         max_tokens = (
             self.default_max_context_tokens
             if request.max_context_tokens is None
@@ -43,7 +56,18 @@ class ContextRetrievalService:
         )
         if max_tokens <= 0 or max_tokens > self.max_context_tokens:
             raise ValueError(f"max_context_tokens must be in [1, {self.max_context_tokens}]")
-        return QueryResponse(self.retriever.retrieve(query, max_tokens=max_tokens))
+        if request.builds is not None and tuple(request.builds) != self.build_scope.variants:
+            raise ValueError("query build scope does not match the retrieval service scope")
+        selected_results = request.max_results or self.default_max_results
+        if selected_results is not None and not 1 <= selected_results <= self.max_results:
+            raise ValueError(f"max_results must be in [1, {self.max_results}]")
+        if selected_results is None:
+            context = self.retriever.retrieve(query, max_tokens=max_tokens)
+        else:
+            context = self.retriever.retrieve(  # type: ignore[call-arg]
+                query, max_tokens=max_tokens, max_results=selected_results
+            )
+        return QueryResponse(context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +89,8 @@ class IterativeAnswerService:
         original_query = request.query.strip()
         if not original_query:
             raise ValueError("query must not be empty")
+        if len(original_query) > MAX_QUERY_CHARS:
+            raise ValueError(f"query must not exceed {MAX_QUERY_CHARS} characters")
         step_limit = self.default_max_steps if request.max_steps is None else request.max_steps
         if step_limit <= 0 or step_limit > self.max_steps:
             raise ValueError(f"max_steps must be in [1, {self.max_steps}]")
@@ -76,7 +102,7 @@ class IterativeAnswerService:
         cited_ids: tuple[str, ...] = ()
         for step in range(1, step_limit + 1):
             bundle = self.retrieval_service.query(
-                QueryRequest(search_query, request.max_context_tokens)
+                QueryRequest(search_query, request.max_context_tokens, request.builds)
             ).context
             diagnostics.extend(bundle.diagnostics)
             for item in bundle.items:
@@ -101,6 +127,8 @@ class IterativeAnswerService:
                     steps=step,
                     complete=True,
                     diagnostics=tuple(dict.fromkeys(diagnostics)),
+                    build_variants=self.retrieval_service.build_scope.variants,
+                    scope_label=_scope_label(self.retrieval_service.build_scope),
                 )
             next_query = decision.get("query")
             if action != "search" or not isinstance(next_query, str) or not next_query.strip():
@@ -111,6 +139,8 @@ class IterativeAnswerService:
                     steps=step,
                     complete=False,
                     diagnostics=tuple(dict.fromkeys(diagnostics)),
+                    build_variants=self.retrieval_service.build_scope.variants,
+                    scope_label=_scope_label(self.retrieval_service.build_scope),
                 )
             search_query = next_query.strip()
 
@@ -121,6 +151,8 @@ class IterativeAnswerService:
             steps=step_limit,
             complete=False,
             diagnostics=tuple(dict.fromkeys(diagnostics)),
+            build_variants=self.retrieval_service.build_scope.variants,
+            scope_label=_scope_label(self.retrieval_service.build_scope),
         )
 
     @staticmethod
@@ -180,3 +212,8 @@ class IterativeAnswerService:
                 )
             )
         return tuple(citations)
+
+
+def _scope_label(scope: BuildScope) -> str:
+    prefix = "union" if scope.is_union else "build"
+    return f"{prefix}:{','.join(scope.variants)}"
