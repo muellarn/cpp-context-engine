@@ -309,3 +309,30 @@ def test_v2_migration_preserves_baseline_search_and_requests_reindex(tmp_path: P
         assert store._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION  # noqa: SLF001
         assert store.search(SearchQuery("legacy"))[0].symbol.id == "legacy-symbol"
         assert store.reindex_required_variants() == ("default",)
+
+
+def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
+    database = tmp_path / "v4.db"
+    with SQLiteStore(database):
+        pass
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        DROP TABLE cfg_edges;
+        DROP TABLE cfg_elements;
+        DROP TABLE cfg_blocks;
+        DROP TABLE cfg_graphs;
+        PRAGMA user_version = 4;
+        """
+    )
+    connection.close()
+
+    with SQLiteStore(database) as store:
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 5  # noqa: SLF001
+        tables = {
+            row[0]
+            for row in store._connection.execute(  # noqa: SLF001
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"cfg_graphs", "cfg_blocks", "cfg_elements", "cfg_edges"} <= tables

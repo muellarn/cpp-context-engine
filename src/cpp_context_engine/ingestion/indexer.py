@@ -28,6 +28,10 @@ class IndexingResult:
     indexed_symbols: int
     indexed_occurrences: int
     indexed_edges: int
+    indexed_cfg_graphs: int = 0
+    indexed_cfg_blocks: int = 0
+    indexed_cfg_elements: int = 0
+    indexed_cfg_edges: int = 0
 
 
 class ProjectIndexer:
@@ -75,6 +79,10 @@ class ProjectIndexer:
                 batch.occurrences,
                 batch.edges,
                 (variant,),
+                batch.cfg_graphs,
+                batch.cfg_blocks,
+                batch.cfg_elements,
+                batch.cfg_edges,
             )
         removed = len(set(previous) - current_ids)
         self._store.apply_ingestion(
@@ -90,6 +98,10 @@ class ProjectIndexer:
             indexed_symbols=len(batch.symbols),
             indexed_occurrences=len(batch.occurrences),
             indexed_edges=len(batch.edges),
+            indexed_cfg_graphs=len(batch.cfg_graphs),
+            indexed_cfg_blocks=len(batch.cfg_blocks),
+            indexed_cfg_elements=len(batch.cfg_elements),
+            indexed_cfg_edges=len(batch.cfg_edges),
         )
 
     @staticmethod

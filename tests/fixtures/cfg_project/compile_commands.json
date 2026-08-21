@@ -1,0 +1,16 @@
+[
+  {
+    "directory": ".",
+    "file": "src/control_flow.cpp",
+    "arguments": [
+      "clang++",
+      "-std=c++20",
+      "-fexceptions",
+      "-fcxx-exceptions",
+      "-c",
+      "src/control_flow.cpp",
+      "-o",
+      "control_flow.o"
+    ]
+  }
+]

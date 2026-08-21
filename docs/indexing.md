@@ -30,10 +30,12 @@ cpp-context index /workspace/project \
   --clang-analyzer build/clang-analyzer/cpp-context-clang-analyzer
 ```
 
-Protocol 1 is newline-delimited JSON. A process must receive `hello` first and
+Protocol 2 is newline-delimited JSON. A process must receive `hello` first and
 returns `hello` with analyzer version, Clang major, and capabilities. An analysis
 then returns `begin`, zero or more `fact` records, and `complete`. Fact records
-are `file`, `symbol`, `occurrence`, `edge`, and `include`; references use stable
+are `file`, `symbol`, `occurrence`, `edge`, `include`, and the versioned
+`cfg_graph_v1`, `cfg_block_v1`, `cfg_element_v1`, and `cfg_edge_v1` types;
+references use stable
 USR or location-derived keys that the Python adapter converts to canonical IDs.
 Macro expansions carry independent `spelling_span` and `expansion_span` objects.
 Symbols can carry `template_kind`, `template_arguments`,
@@ -42,13 +44,47 @@ Symbols can carry `template_kind`, `template_arguments`,
 Only stdout is protocol data. Native diagnostics use stderr. The adapter accepts
 no command string, invokes no shell, confines fact paths to the project, validates
 the handshake before analysis, and enforces operator-owned timeout and byte
-limits. This companion currently supports Linux and exactly Clang major 18.
+limits. This companion currently supports Linux and exactly Clang major 18. Its
+handshake must include `function_cfg_v1`; `cpp-context doctor` exposes that as
+`cfg_facts_available=true`.
+
+### Function control-flow graphs
+
+For every project-local function definition, the companion calls
+`clang::CFG::buildCFG` with one fixed profile. It disables trivial-false-edge
+pruning and enables all-statement retention, constructor initializers, implicit
+and temporary destructors, lifetime ends, loop exits, scopes, static-initializer
+branches, `new` allocators, default initializer expressions, rich constructors,
+elided-constructor marking, and virtual-base branches. EH edges are enabled only
+when the concrete compiler invocation enables C++ exceptions. Every graph stores
+the complete option profile.
+
+CFG graphs, blocks, elements, and edges are independent domain records and SQLite
+tables, not synthetic `CodeSymbol` records. Stable IDs include the build variant,
+build configuration, translation unit, function identity, Clang block index, and
+element or successor position. Blocks retain entry reachability and unreachable
+blocks. Elements retain build/TU provenance and independent spelling/expansion
+spans when Clang maps those locations inside the project. Terminators and labels
+remain block facts. Edges are classified as `fallthrough`, `true`, `false`,
+`case`, `default`, `loop_back`, `break`, `continue`, `return`, `goto`, or
+`exception`; infeasible alternate successors are retained and marked.
+
+Clang 18 exposes one function exit block rather than distinct normal and uncaught
+exception sinks. `normal_exit_block_id` therefore identifies that exit and
+`exceptional_exit_block_id` is null. Catch dispatch and supported EH flow are
+still stored as exception edges. Exact block shape, lifetime elements, and EH
+edges depend on the pinned Clang version and concrete build configuration.
+
+`SQLiteStore.cfg_graphs`, `cfg_blocks`, `cfg_elements`, and `cfg_edges` are
+bounded, build-scoped reads with deterministic ordering and an explicit
+`truncated` flag. Dedicated CLI/API/MCP CFG tools belong to the later interface
+issue.
 
 The libclang path remains a baseline fallback. Baseline symbols and occurrences
 are explicitly marked `analysis_backend=libclang-baseline` and
 `advanced_facts_complete=false`; selecting a validated companion invalidates and
-reindexes such translation units. CFG, indirect calls, and dataflow remain out of
-scope until their dedicated analysis stages are implemented.
+reindexes such translation units. The baseline does not emit CFG facts. Indirect
+calls, def-use/dataflow, and dead-code judgments remain out of scope.
 
 ## Indexing from Python
 
@@ -118,6 +154,10 @@ between the same endpoint symbols remain distinct callsites. Build-filtered FTS,
 vector, symbol and graph reads use `BuildScope`; union results retain their build
 labels. `SQLiteStore.remove_build_variant` is the only operation that removes an
 entire named build.
+
+Schema v5 adds build/TU-specific CFG graph, block, element, and edge tables.
+Replacing or removing a translation unit cascades only its CFG rows; other
+translation units and build variants remain intact.
 
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by model ID and dimension. `SQLiteVectorSearch` accepts any provider

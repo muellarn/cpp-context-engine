@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sqlite3
 import stat
 import subprocess
 import time
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,11 +23,18 @@ from cpp_context_engine.ingestion import (
 from cpp_context_engine.ingestion.clang import ClangIngestor, ClangUnavailableError
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
-from cpp_context_engine.models import GraphRelation, OccurrenceKind
+from cpp_context_engine.models import (
+    BuildScope,
+    BuildVariant,
+    CfgEdgeKind,
+    GraphRelation,
+    OccurrenceKind,
+)
 from cpp_context_engine.storage import SQLiteStore
 
 FIXTURE = Path(__file__).parent / "fixtures" / "analyzer_project"
 PARITY_FIXTURE = Path(__file__).parent / "fixtures" / "cpp_project"
+CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
 
 
 def _binary() -> Path:
@@ -49,7 +60,7 @@ def test_native_handshake_matches_protocol_golden() -> None:
     request = {
         "type": "hello",
         "protocol": "cpp-context-clang-facts",
-        "protocol_version": 1,
+        "protocol_version": 2,
         "required_clang_major": 18,
     }
     completed = subprocess.run(  # noqa: S603 - repository-built test binary
@@ -127,6 +138,234 @@ def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
     )
 
 
+def _cfg_batch(*, database: str = "compile_commands.json", variant: str = "default"):
+    return NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
+        CFG_FIXTURE, CFG_FIXTURE / database, build_variant=variant
+    )
+
+
+def _cfg_for(batch, qualified_name: str):
+    symbol = next(symbol for symbol in batch.symbols if symbol.qualified_name == qualified_name)
+    return next(graph for graph in batch.cfg_graphs if graph.function_symbol_id == symbol.id)
+
+
+def test_real_cfg_snapshot_covers_control_flow_macro_and_lifetime_facts() -> None:
+    batch = _cfg_batch()
+    snapshot = {}
+    for graph in batch.cfg_graphs:
+        symbol = next(symbol for symbol in batch.symbols if symbol.id == graph.function_symbol_id)
+        blocks = [block for block in batch.cfg_blocks if block.graph_id == graph.id]
+        edges = [edge for edge in batch.cfg_edges if edge.graph_id == graph.id]
+        snapshot[symbol.qualified_name] = (
+            len(blocks),
+            sum(not block.reachable for block in blocks),
+            Counter(edge.kind.value for edge in edges),
+        )
+
+    assert snapshot["cfg_fixture::branching"] == (
+        6,
+        0,
+        Counter({"fallthrough": 3, "true": 1, "false": 1, "return": 1}),
+    )
+    assert snapshot["cfg_fixture::choose"] == (
+        6,
+        0,
+        Counter({"return": 3, "case": 2, "default": 1, "fallthrough": 1}),
+    )
+    assert snapshot["cfg_fixture::loop"] == (
+        11,
+        0,
+        Counter(
+            {
+                "true": 3,
+                "false": 3,
+                "fallthrough": 3,
+                "break": 1,
+                "continue": 1,
+                "loop_back": 1,
+                "return": 1,
+            }
+        ),
+    )
+    assert snapshot["cfg_fixture::early_return"][2]["return"] == 2
+    assert snapshot["cfg_fixture::jump"][2]["goto"] == 1
+    assert snapshot["cfg_fixture::exception_flow"][2]["exception"] == 3
+    assert snapshot["cfg_fixture::unreachable_after_return"][1] == 1
+
+    all_edge_kinds = {edge.kind for edge in batch.cfg_edges}
+    assert set(CfgEdgeKind) <= all_edge_kinds
+    graph = _cfg_for(batch, "cfg_fixture::branching")
+    blocks = [block for block in batch.cfg_blocks if block.graph_id == graph.id]
+    assert {block.id for block in blocks if block.role.value == "entry"} == {graph.entry_block_id}
+    assert {block.id for block in blocks if block.role.value == "normal_exit"} == {
+        graph.normal_exit_block_id
+    }
+    assert graph.exceptional_exit_block_id is None
+    assert graph.build_options == {
+        "add_cxx_default_init_expr_in_aggregates": True,
+        "add_cxx_default_init_expr_in_ctors": True,
+        "add_cxx_new_allocator": True,
+        "add_eh_edges": True,
+        "add_implicit_dtors": True,
+        "add_initializers": True,
+        "add_lifetime": True,
+        "add_loop_exit": True,
+        "add_rich_cxx_constructors": True,
+        "add_scopes": True,
+        "add_static_init_branches": True,
+        "add_temporary_dtors": True,
+        "add_virtual_base_branches": True,
+        "always_add_all_statements": True,
+        "mark_elided_cxx_constructors": True,
+        "omit_implicit_value_initializers": False,
+        "prune_trivially_false_edges": False,
+    }
+    branch_elements = [element for element in batch.cfg_elements if element.graph_id == graph.id]
+    assert any(
+        element.spelling_span != element.expansion_span
+        for element in branch_elements
+        if element.spelling_span and element.expansion_span
+    )
+    lifetime = _cfg_for(batch, "cfg_fixture::lifetime")
+    lifetime_kinds = {
+        element.kind for element in batch.cfg_elements if element.graph_id == lifetime.id
+    }
+    assert {"constructor", "automatic_object_destructor", "lifetime_end"} <= lifetime_kinds
+    assert all(
+        item.translation_unit_id == graph.translation_unit_id
+        and item.build_configuration_id == graph.build_configuration_id
+        and item.build_variant == graph.build_variant
+        for item in (
+            *blocks,
+            *branch_elements,
+            *(edge for edge in batch.cfg_edges if edge.graph_id == graph.id),
+        )
+    )
+
+
+def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(tmp_path: Path) -> None:
+    first = _cfg_batch()
+    second = _cfg_batch()
+    for attribute in ("cfg_graphs", "cfg_blocks", "cfg_elements", "cfg_edges"):
+        assert [item.id for item in getattr(first, attribute)] == [
+            item.id for item in getattr(second, attribute)
+        ]
+
+    with SQLiteStore(tmp_path / "index.db", project_root=CFG_FIXTURE) as store:
+        store.apply_ingestion(CFG_FIXTURE, first)
+        graphs = store.cfg_graphs(limit=3)
+        assert len(graphs.items) == 3
+        assert graphs.truncated
+        graph = _cfg_for(first, "cfg_fixture::branching")
+        assert store.get_cfg_graph(graph.id) == graph
+        assert store.cfg_blocks(graph.id).items == tuple(
+            sorted(
+                (block for block in first.cfg_blocks if block.graph_id == graph.id),
+                key=lambda block: (block.index, block.id),
+            )
+        )
+        assert store.cfg_elements(graph.id, limit=2).truncated
+        assert not store.cfg_edges(graph.id).truncated
+        with pytest.raises(ValueError, match="CFG page limit"):
+            store.cfg_blocks(graph.id, limit=0)
+
+
+def test_cfg_exception_edges_follow_build_configuration_and_build_scope(tmp_path: Path) -> None:
+    enabled = _cfg_batch(variant="exceptions")
+    disabled = _cfg_batch(database="compile_commands_no_eh.json", variant="no-exceptions")
+    enabled_graph = _cfg_for(enabled, "cfg_fixture::exception_flow")
+    disabled_graph = _cfg_for(disabled, "cfg_fixture::exception_flow")
+    assert enabled_graph.build_options["add_eh_edges"] is True
+    assert disabled_graph.build_options["add_eh_edges"] is False
+    assert any(
+        edge.kind == CfgEdgeKind.EXCEPTION
+        for edge in enabled.cfg_edges
+        if edge.graph_id == enabled_graph.id
+    )
+    assert not any(
+        edge.kind == CfgEdgeKind.EXCEPTION
+        for edge in disabled.cfg_edges
+        if edge.graph_id == disabled_graph.id
+    )
+
+    with SQLiteStore(tmp_path / "index.db", project_root=CFG_FIXTURE) as store:
+        store.apply_ingestion(
+            CFG_FIXTURE,
+            enabled,
+            build_variant=BuildVariant("exceptions", CFG_FIXTURE / "compile_commands.json"),
+        )
+        store.apply_ingestion(
+            CFG_FIXTURE,
+            disabled,
+            build_variant=BuildVariant(
+                "no-exceptions", CFG_FIXTURE / "compile_commands_no_eh.json"
+            ),
+        )
+        assert store.cfg_graphs(
+            enabled_graph.function_symbol_id, build_scope=BuildScope.single("exceptions")
+        ).items == (enabled_graph,)
+        assert store.cfg_graphs(
+            disabled_graph.function_symbol_id,
+            build_scope=BuildScope.single("no-exceptions"),
+        ).items == (disabled_graph,)
+        assert store.remove_build_variant("exceptions")
+        assert not store.cfg_graphs(build_scope=BuildScope.single("exceptions")).items
+        assert (
+            store.get_cfg_graph(disabled_graph.id, build_scope=BuildScope.single("no-exceptions"))
+            == disabled_graph
+        )
+
+
+def test_cfg_reindex_replaces_only_changed_tu_and_rolls_back_atomically(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    shutil.copytree(PARITY_FIXTURE, project)
+    database = project / "compile_commands.json"
+    ingestor = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30))
+    with SQLiteStore(tmp_path / "index.db", project_root=project) as store:
+        indexer = ProjectIndexer(ingestor, store)
+        first = indexer.index(project, database)
+        assert first.indexed_cfg_graphs > 0
+        units = store._connection.execute(  # noqa: SLF001
+            "SELECT id, source_path FROM translation_units ORDER BY source_path"
+        ).fetchall()
+        unchanged_unit = next(
+            row["id"] for row in units if row["source_path"].endswith("model.cpp")
+        )
+        unchanged_before = tuple(
+            tuple(row)
+            for row in store._connection.execute(  # noqa: SLF001
+                "SELECT id, function_symbol_id FROM cfg_graphs "
+                "WHERE translation_unit_id = ? ORDER BY id",
+                (unchanged_unit,),
+            )
+        )
+        old_graph_count = len(store.cfg_graphs(limit=10_000).items)
+        source = project / "src" / "main.cpp"
+        source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        changed = indexer.index(project, database)
+        assert changed.indexed_translation_units == 1
+        assert (
+            tuple(
+                tuple(row)
+                for row in store._connection.execute(  # noqa: SLF001
+                    "SELECT id, function_symbol_id FROM cfg_graphs "
+                    "WHERE translation_unit_id = ? ORDER BY id",
+                    (unchanged_unit,),
+                )
+            )
+            == unchanged_before
+        )
+        assert len(store.cfg_graphs(limit=10_000).items) == old_graph_count
+
+        current = ingestor.ingest(project, database)
+        broken = replace(
+            current.cfg_edges[0], id="broken-cfg-edge", target_block_id="missing-block"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.apply_ingestion(project, replace(current, cfg_edges=(*current.cfg_edges, broken)))
+        assert len(store.cfg_graphs(limit=10_000).items) == old_graph_count
+
+
 @pytest.mark.clang
 def test_companion_preserves_baseline_canonical_ids_and_relation_parity() -> None:
     try:
@@ -196,12 +435,13 @@ def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
     valid = {
         "type": "hello",
         "protocol": "cpp-context-clang-facts",
-        "protocol_version": 1,
+        "protocol_version": 2,
         "analyzer_version": "test",
         "clang_major": 18,
         "capabilities": [
             "direct_calls",
             "full_ast",
+            "function_cfg_v1",
             "includes",
             "inherits",
             "lambda_metadata",
@@ -300,9 +540,11 @@ def test_doctor_checks_real_companion(capsys: pytest.CaptureFixture[str]) -> Non
     )
     report = json.loads(capsys.readouterr().out)
     assert report["clang_analyzer_executable"] is True
-    assert report["clang_analyzer_protocol"] == 1
+    assert report["clang_analyzer_protocol"] == 2
     assert report["clang_analyzer_clang_major"] == 18
     assert report["advanced_facts_complete"] is True
+    assert report["cfg_facts_available"] is True
+    assert "function_cfg_v1" in report["clang_analyzer_capabilities"]
     assert "macro_provenance" in report["clang_analyzer_capabilities"]
 
 

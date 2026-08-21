@@ -60,6 +60,9 @@ versioned JSONL stdin/stdout protocol; stdout contains protocol records only and
 Clang diagnostics go to stderr. The Python adapter validates protocol version,
 Clang major, and required capabilities before indexing, invokes the executable
 without a shell, bounds input/output/stderr bytes, and enforces a timeout.
+It also persists per-function Clang CFG graphs, blocks, source and implicit
+lifetime elements, terminators, entry reachability, and typed successor edges
+with exact build/TU provenance. `doctor --json` reports `cfg_facts_available`.
 
 Then diagnose, index, and search:
 
@@ -302,8 +305,11 @@ companion makes protocol/Clang/capability mismatches hard pre-index failures and
 forces baseline translation units to be reindexed. The companion preserves named
 build provenance and emits the existing symbol/occurrence/direct-call/include/
 inheritance/override facts plus separate macro spelling and expansion spans,
-template-instantiation metadata, and stable lambda call-operator metadata. CFG,
-indirect dispatch, and dataflow are intentionally not part of this protocol yet.
+template-instantiation metadata, and stable lambda call-operator metadata. CFGs
+use separate schema-v5 records rather than fake symbols and retain branch,
+switch, loop, jump, return, and supported exception flow. Indirect dispatch,
+def-use/dataflow, and dead-code judgments remain out of scope. Dedicated
+CLI/API/MCP CFG reads are intentionally deferred to the interface issue.
 
 See [Compiler-aware indexing](docs/indexing.md) for the ingestion/storage API,
 incremental behavior, libclang configuration, and current guarantees.
