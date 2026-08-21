@@ -138,10 +138,12 @@ def index_project(config: AppConfig) -> IndexOperationResult:
                 timeout_seconds=config.analyzer_timeout_seconds,
                 max_input_bytes=config.analyzer_max_input_bytes,
                 max_output_bytes=config.analyzer_max_output_bytes,
+                max_decoded_bytes=config.analyzer_max_decoded_bytes,
+                max_record_bytes=config.analyzer_max_record_bytes,
                 max_stderr_bytes=config.analyzer_max_stderr_bytes,
             )
             info = client.probe()
-            ingestor = NativeClangIngestor(client)
+            ingestor = NativeClangIngestor(client, max_workers=config.analyzer_max_workers)
             analysis_backend = "clang-libtooling"
             advanced_complete = True
             capabilities = tuple(sorted(info.capabilities))

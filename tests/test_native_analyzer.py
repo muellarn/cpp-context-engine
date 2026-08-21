@@ -59,6 +59,72 @@ def _script(tmp_path: Path, body: str) -> Path:
     return path
 
 
+def _fake_hello(*, gzip_transport: bool = False) -> dict[str, object]:
+    capabilities = [
+        "direct_calls",
+        "full_ast",
+        "function_cfg_v1",
+        "includes",
+        "inherits",
+        "lambda_metadata",
+        "macro_provenance",
+        "occurrences",
+        "overrides",
+        "pp_callbacks",
+        "source_manager",
+        "symbols",
+        "template_metadata",
+        "uses_type",
+        "callsites_v1",
+        "dispatch_targets_v1",
+        "macro_expansion_stack",
+        "template_relationships_v1",
+        "intraprocedural_dataflow_v1",
+        "points_to_v1",
+        "function_summaries_v1",
+        "interprocedural_bindings_v1",
+    ]
+    if gzip_transport:
+        capabilities.append("gzip_jsonl_v1")
+    return {
+        "type": "hello",
+        "protocol": "cpp-context-clang-facts",
+        "protocol_version": 5,
+        "analyzer_version": "test",
+        "clang_major": 18,
+        "capabilities": capabilities,
+    }
+
+
+def _gzip_analyzer_script(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    *,
+    fragment_size: int = 1,
+) -> Path:
+    hello = _fake_hello(gzip_transport=True)
+    return _script(
+        tmp_path,
+        f"""import json, os, sys, zlib
+requests = [json.loads(line) for line in sys.stdin]
+hello = {hello!r}
+if len(requests) == 1:
+    print(json.dumps(hello, separators=(",", ":")), flush=True)
+else:
+    request = requests[1]
+    output = [hello, {{"type": "begin", "request_id": request["request_id"]}},
+              *{records!r},
+              {{"type": "complete", "request_id": request["request_id"], "success": True}}]
+    raw = b"".join(json.dumps(record, separators=(",", ":"), sort_keys=True).encode() + b"\\n"
+                   for record in output)
+    compressor = zlib.compressobj(level=1, wbits=31)
+    encoded = compressor.compress(raw) + compressor.flush()
+    for offset in range(0, len(encoded), {fragment_size}):
+        os.write(1, encoded[offset:offset + {fragment_size}])
+""",
+    )
+
+
 def test_fact_builder_caches_validated_project_paths(tmp_path: Path) -> None:
     source = tmp_path / "source.cpp"
     source.write_text("int value = 1;\n", encoding="utf-8")
@@ -114,7 +180,9 @@ def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path
             )
         )
 
-    batch = NativeClangIngestor(ConcurrentClient()).ingest_configurations(  # type: ignore[arg-type]
+    batch = NativeClangIngestor(  # type: ignore[arg-type]
+        ConcurrentClient(), max_workers=3
+    ).ingest_configurations(
         tmp_path, configurations
     )
 
@@ -167,7 +235,9 @@ def test_native_worker_failure_cancels_pending_work_without_partial_batch(tmp_pa
         )
 
     with pytest.raises(RuntimeError, match="injected worker failure"):
-        NativeClangIngestor(FailingClient()).ingest_configurations(  # type: ignore[arg-type]
+        NativeClangIngestor(  # type: ignore[arg-type]
+            FailingClient(), max_workers=7
+        ).ingest_configurations(
             tmp_path, configurations
         )
 
@@ -196,8 +266,27 @@ def test_native_handshake_matches_protocol_golden() -> None:
     assert completed.stderr == ""
 
 
+def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
+    gzip_client = NativeAnalyzerClient(_binary(), timeout_seconds=30)
+    plain_client = NativeAnalyzerClient(
+        _binary(), timeout_seconds=30, prefer_compression=False
+    )
+
+    gzip_batch = NativeClangIngestor(gzip_client).ingest(
+        FIXTURE, FIXTURE / "compile_commands.json"
+    )
+    plain_batch = NativeClangIngestor(plain_client).ingest(
+        FIXTURE, FIXTURE / "compile_commands.json"
+    )
+    repeated = NativeClangIngestor(gzip_client).ingest(
+        FIXTURE, FIXTURE / "compile_commands.json"
+    )
+
+    assert gzip_batch == plain_batch == repeated
+
+
 def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
-    batch = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=15)).ingest(
+    batch = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
         FIXTURE, FIXTURE / "compile_commands.json"
     )
     relations = {edge.relation for edge in batch.edges}
@@ -506,7 +595,7 @@ def test_companion_preserves_baseline_canonical_ids_and_relation_parity() -> Non
         baseline = ClangIngestor().ingest(PARITY_FIXTURE, PARITY_FIXTURE / "compile_commands.json")
     except ClangUnavailableError as error:
         pytest.skip(str(error))
-    native = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=15)).ingest(
+    native = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
         PARITY_FIXTURE, PARITY_FIXTURE / "compile_commands.json"
     )
     names = {"demo::Base", "demo::Derived", "demo::Derived::compute", "demo::helper", "run"}
@@ -536,7 +625,7 @@ def test_switching_from_baseline_to_companion_forces_reindex(tmp_path: Path) -> 
     with SQLiteStore(tmp_path / "index.db", project_root=PARITY_FIXTURE) as store:
         first = ProjectIndexer(baseline, store).index(PARITY_FIXTURE, database)
         upgraded = ProjectIndexer(
-            NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=15)), store
+            NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)), store
         ).index(PARITY_FIXTURE, database)
         states = store.translation_unit_states(PARITY_FIXTURE)
 
@@ -625,6 +714,123 @@ if launch == 2:
         client.analyze(FIXTURE, configuration)
 
 
+def test_fragmented_gzip_transport_preserves_protocol_v5_records(tmp_path: Path) -> None:
+    fact = {"type": "fact", "fact": "test", "payload": "fragmented"}
+    client = NativeAnalyzerClient(_gzip_analyzer_script(tmp_path, [fact]), timeout_seconds=2)
+    configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
+
+    assert client.analyze(FIXTURE, configuration) == (fact,)
+    assert "gzip_jsonl_v1" in client.probe().capabilities
+
+
+def test_new_client_streams_plain_records_from_old_companion(tmp_path: Path) -> None:
+    hello = _fake_hello()
+    fact = {"type": "fact", "fact": "test", "payload": "plain"}
+    script = _script(
+        tmp_path,
+        f"""import json, sys
+requests = [json.loads(line) for line in sys.stdin]
+print(json.dumps({hello!r}), flush=True)
+if len(requests) > 1:
+    request = requests[1]
+    print(json.dumps({{"type": "begin", "request_id": request["request_id"]}}), flush=True)
+    print(json.dumps({fact!r}), flush=True)
+    print(json.dumps({{"type": "complete", "request_id": request["request_id"],
+                      "success": True}}), flush=True)
+""",
+    )
+    configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
+
+    assert NativeAnalyzerClient(script).analyze(FIXTURE, configuration) == (fact,)
+
+
+@pytest.mark.parametrize(
+    ("client_kwargs", "payload", "message"),
+    [
+        (
+            {"max_output_bytes": 1024},
+            "".join(f"{index:08x}" for index in range(2000)),
+            "compressed output limit",
+        ),
+        ({"max_decoded_bytes": 1024}, "x" * 4096, "decoded output limit"),
+        ({"max_record_bytes": 1024}, "x" * 4096, "record limit"),
+    ],
+)
+def test_gzip_transport_enforces_independent_limits(
+    tmp_path: Path,
+    client_kwargs: dict[str, int],
+    payload: str,
+    message: str,
+) -> None:
+    fact = {"type": "fact", "fact": "test", "payload": payload}
+    client = NativeAnalyzerClient(
+        _gzip_analyzer_script(tmp_path, [fact], fragment_size=7),
+        timeout_seconds=2,
+        **client_kwargs,
+    )
+    configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
+
+    with pytest.raises(AnalyzerLimitError, match=message):
+        client.analyze(FIXTURE, configuration)
+
+
+def test_malformed_gzip_and_jsonl_are_protocol_errors(tmp_path: Path) -> None:
+    hello = _fake_hello(gzip_transport=True)
+    malformed_gzip = _script(
+        tmp_path,
+        f"""import json, os, sys
+requests = [json.loads(line) for line in sys.stdin]
+if len(requests) == 1:
+    print(json.dumps({hello!r}), flush=True)
+else:
+    os.write(1, b"not-gzip")
+""",
+    )
+    configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
+    client = NativeAnalyzerClient(malformed_gzip, timeout_seconds=2)
+
+    with pytest.raises(AnalyzerProtocolError, match="malformed gzip"):
+        client.analyze(FIXTURE, configuration)
+
+    malformed_jsonl = _gzip_analyzer_script(
+        tmp_path,
+        [{"type": "fact", "fact": "test"}],
+        fragment_size=3,
+    )
+    malformed_jsonl.write_text(
+        malformed_jsonl.read_text().replace(
+            "compressor.compress(raw)",
+            "compressor.compress(raw.replace(b'\\\"fact\\\"', b'bad', 1))",
+        ),
+        encoding="utf-8",
+    )
+    client = NativeAnalyzerClient(malformed_jsonl, timeout_seconds=2)
+    with pytest.raises(AnalyzerProtocolError, match="malformed JSONL"):
+        client.analyze(FIXTURE, configuration)
+
+
+def test_incomplete_stream_does_not_persist_partial_batch(tmp_path: Path) -> None:
+    hello = _fake_hello()
+    script = _script(
+        tmp_path,
+        f"""import json, sys
+requests = [json.loads(line) for line in sys.stdin]
+print(json.dumps({hello!r}), flush=True)
+if len(requests) > 1:
+    request = requests[1]
+    print(json.dumps({{"type": "begin", "request_id": request["request_id"]}}), flush=True)
+    print(json.dumps({{"type": "fact", "fact": "file", "key": "partial",
+                      "path": str(request["source_path"])}}), flush=True)
+""",
+    )
+    ingestor = NativeClangIngestor(NativeAnalyzerClient(script, timeout_seconds=2))
+
+    with SQLiteStore(tmp_path / "index.db", project_root=FIXTURE) as store:
+        with pytest.raises(AnalyzerProtocolError, match="incomplete"):
+            ProjectIndexer(ingestor, store).index(FIXTURE, FIXTURE / "compile_commands.json")
+        assert store.translation_unit_states(FIXTURE) == {}
+
+
 def test_broken_analyzer_stdin_still_obeys_timeout(tmp_path: Path) -> None:
     script = _script(
         tmp_path,
@@ -649,9 +855,39 @@ def test_timeout_and_output_limits_are_hard(tmp_path: Path) -> None:
     with pytest.raises(AnalyzerLimitError, match="output limit"):
         NativeAnalyzerClient(output, max_output_bytes=64).probe()
 
+    stderr = _script(tmp_path, "import sys\nsys.stderr.write('x' * 10000)\n")
+    with pytest.raises(AnalyzerLimitError, match="stderr output limit"):
+        NativeAnalyzerClient(stderr, max_stderr_bytes=64).probe()
+
+
+def test_timeout_kills_companion_process_group_within_two_seconds(tmp_path: Path) -> None:
+    if not Path("/proc").is_dir():
+        pytest.skip("process-group cleanup assertion requires Linux procfs")
+    child_pid = tmp_path / "child.pid"
+    script = _script(
+        tmp_path,
+        f"""import pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))
+time.sleep(30)
+""",
+    )
+
+    started = time.monotonic()
+    with pytest.raises(AnalyzerLimitError, match="timeout"):
+        NativeAnalyzerClient(script, timeout_seconds=0.2).probe()
+
+    elapsed = time.monotonic() - started
+    pid = int(child_pid.read_text())
+    deadline = time.monotonic() + 1
+    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert elapsed < 2
+    assert not Path(f"/proc/{pid}").exists()
+
 
 def test_sqlite_round_trips_macro_provenance(tmp_path: Path) -> None:
-    batch = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=15)).ingest(
+    batch = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
         FIXTURE, FIXTURE / "compile_commands.json"
     )
     macro = next(symbol for symbol in batch.symbols if symbol.qualified_name == "APPLY_TWICE")

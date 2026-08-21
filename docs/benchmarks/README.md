@@ -5,6 +5,9 @@ normal project checks and does not generate the 100×2 or 1000×3 workloads.
 Generated C++ sources, indexes, and JSON reports are disposable and ignored by
 Git; do not commit them.
 
+The separate [large-TU transport benchmark](large-tu.md) reproduces the KiCad
+Clipper case used to verify bounded streaming, compression, and cancellation.
+
 ## Reproduction
 
 Build the pinned Clang 18 companion in Release mode, activate an installed project

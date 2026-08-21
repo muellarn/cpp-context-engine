@@ -139,7 +139,10 @@ def _add_project_options(
         parser.add_argument("--analyzer-timeout", type=float, help="per-process timeout seconds")
         parser.add_argument("--analyzer-max-input-bytes", type=int)
         parser.add_argument("--analyzer-max-output-bytes", type=int)
+        parser.add_argument("--analyzer-max-decoded-bytes", type=int)
+        parser.add_argument("--analyzer-max-record-bytes", type=int)
         parser.add_argument("--analyzer-max-stderr-bytes", type=int)
+        parser.add_argument("--analyzer-max-workers", type=int)
 
 
 def _add_embedding_options(parser: argparse.ArgumentParser) -> None:
@@ -203,8 +206,14 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         or base.analyzer_max_input_bytes,
         analyzer_max_output_bytes=getattr(args, "analyzer_max_output_bytes", None)
         or base.analyzer_max_output_bytes,
+        analyzer_max_decoded_bytes=getattr(args, "analyzer_max_decoded_bytes", None)
+        or base.analyzer_max_decoded_bytes,
+        analyzer_max_record_bytes=getattr(args, "analyzer_max_record_bytes", None)
+        or base.analyzer_max_record_bytes,
         analyzer_max_stderr_bytes=getattr(args, "analyzer_max_stderr_bytes", None)
         or base.analyzer_max_stderr_bytes,
+        analyzer_max_workers=getattr(args, "analyzer_max_workers", None)
+        or base.analyzer_max_workers,
         embedding_provider=getattr(args, "embedding_provider", None) or base.embedding_provider,
         embedding_base_url=getattr(args, "embedding_base_url", None) or base.embedding_base_url,
         embedding_model=getattr(args, "embedding_model", None) or base.embedding_model,
@@ -262,6 +271,8 @@ def _doctor(config: AppConfig, *, as_json: bool) -> int:
                 timeout_seconds=config.analyzer_timeout_seconds,
                 max_input_bytes=config.analyzer_max_input_bytes,
                 max_output_bytes=config.analyzer_max_output_bytes,
+                max_decoded_bytes=config.analyzer_max_decoded_bytes,
+                max_record_bytes=config.analyzer_max_record_bytes,
                 max_stderr_bytes=config.analyzer_max_stderr_bytes,
             ).probe()
         except (OSError, RuntimeError, ValueError) as error:

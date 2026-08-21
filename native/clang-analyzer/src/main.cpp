@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -10,8 +11,11 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <zlib.h>
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTTypeTraits.h"
@@ -53,11 +57,89 @@ const std::vector<std::string> kCapabilities = {
     "uses_type",          "callsites_v1",     "dispatch_targets_v1",
     "macro_expansion_stack", "template_relationships_v1",
     "intraprocedural_dataflow_v1", "points_to_v1", "function_summaries_v1",
-    "interprocedural_bindings_v1"};
+    "interprocedural_bindings_v1", "gzip_jsonl_v1"};
+
+class OutputWriter {
+public:
+  OutputWriter() = default;
+  OutputWriter(const OutputWriter &) = delete;
+  OutputWriter &operator=(const OutputWriter &) = delete;
+  ~OutputWriter() { finish(); }
+
+  bool enableGzip() {
+    if (gzip_)
+      return true;
+    stream_ = {};
+    if (deflateInit2(&stream_, Z_BEST_SPEED, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+      return false;
+    gzip_ = true;
+    return true;
+  }
+
+  void write(llvm::StringRef bytes) {
+    if (!gzip_) {
+      llvm::outs() << bytes;
+      llvm::outs().flush();
+      return;
+    }
+    stream_.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(bytes.data()));
+    stream_.avail_in = static_cast<uInt>(bytes.size());
+    pump(Z_NO_FLUSH);
+    pendingDecoded_ += bytes.size();
+    if (pendingDecoded_ >= kFlushThreshold) {
+      pump(Z_SYNC_FLUSH);
+      llvm::outs().flush();
+      pendingDecoded_ = 0;
+    }
+  }
+
+  void flush() {
+    if (gzip_ && !finished_) {
+      pump(Z_SYNC_FLUSH);
+      llvm::outs().flush();
+      pendingDecoded_ = 0;
+    }
+  }
+
+  void finish() {
+    if (!gzip_ || finished_)
+      return;
+    pump(Z_FINISH);
+    deflateEnd(&stream_);
+    llvm::outs().flush();
+    finished_ = true;
+  }
+
+private:
+  void pump(int mode) {
+    int result = Z_OK;
+    do {
+      stream_.next_out = buffer_.data();
+      stream_.avail_out = static_cast<uInt>(buffer_.size());
+      result = deflate(&stream_, mode);
+      const auto produced = buffer_.size() - stream_.avail_out;
+      if (produced)
+        llvm::outs().write(reinterpret_cast<const char *>(buffer_.data()), produced);
+    } while (stream_.avail_in || stream_.avail_out == 0 ||
+             (mode == Z_FINISH && result != Z_STREAM_END));
+  }
+
+  static constexpr std::size_t kFlushThreshold = 64 * 1024;
+  bool gzip_ = false;
+  bool finished_ = false;
+  std::size_t pendingDecoded_ = 0;
+  z_stream stream_{};
+  std::array<Bytef, 64 * 1024> buffer_{};
+};
+
+OutputWriter output;
 
 void emit(llvm::json::Object object) {
-  llvm::outs() << llvm::formatv("{0}\n", llvm::json::Value(std::move(object)));
-  llvm::outs().flush();
+  std::string record;
+  llvm::raw_string_ostream stream(record);
+  stream << llvm::formatv("{0}\n", llvm::json::Value(std::move(object)));
+  stream.flush();
+  output.write(record);
 }
 
 void emit(std::initializer_list<llvm::json::Object::KV> properties) {
@@ -78,8 +160,10 @@ std::optional<std::string> requiredString(const llvm::json::Object &object,
 class FactSink {
 public:
   void add(std::string sortKey, llvm::json::Object fact) {
+    if (!sortKeys_.insert(std::move(sortKey)).second)
+      return;
     fact["type"] = "fact";
-    entries_.emplace_back(std::move(sortKey), std::move(fact));
+    emit(std::move(fact));
   }
 
   void add(std::string sortKey,
@@ -88,24 +172,11 @@ public:
   }
 
   void flush() {
-    std::stable_sort(entries_.begin(), entries_.end(),
-                     [](const auto &left, const auto &right) {
-                       return left.first < right.first;
-                     });
-    std::string previous;
-    bool first = true;
-    for (auto &entry : entries_) {
-      if (!first && entry.first == previous)
-        continue;
-      previous = entry.first;
-      first = false;
-      emit(std::move(entry.second));
-    }
-    entries_.clear();
+    output.flush();
   }
 
 private:
-  std::vector<std::pair<std::string, llvm::json::Object>> entries_;
+  std::unordered_set<std::string> sortKeys_;
 };
 
 struct MacroExpansionRecord {
@@ -2707,6 +2778,13 @@ int main() {
     }
     auto type = request->getString("type");
     if (!ready) {
+      auto transport = request->getString("response_transport");
+      if (transport && *transport != "gzip_jsonl_v1") {
+        emitError("unsupported_transport", "unsupported response transport");
+        return 2;
+      }
+      if (transport && !output.enableGzip())
+        return 2;
       if (!type || *type != "hello" || !handleHello(*request))
         return 2;
       ready = true;
@@ -2715,5 +2793,6 @@ int main() {
     if (!type || *type != "analyze" || !handleAnalyze(*request))
       return 2;
   }
+  output.finish();
   return ready ? 0 : 2;
 }

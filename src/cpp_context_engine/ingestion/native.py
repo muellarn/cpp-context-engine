@@ -5,12 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
+import tempfile
 import threading
-from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+import time
+import zlib
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from io import BufferedRandom
 from pathlib import Path
 from typing import Any
 
@@ -88,10 +93,13 @@ REQUIRED_CAPABILITIES = frozenset(
         "interprocedural_bindings_v1",
     }
 )
-DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_TIMEOUT_SECONDS = 75.0
 DEFAULT_MAX_INPUT_BYTES = 1_048_576
 DEFAULT_MAX_OUTPUT_BYTES = 64 * 1_048_576
+DEFAULT_MAX_DECODED_BYTES = 256 * 1_048_576
+DEFAULT_MAX_RECORD_BYTES = 16 * 1_048_576
 DEFAULT_MAX_STDERR_BYTES = 256 * 1024
+GZIP_TRANSPORT = "gzip_jsonl_v1"
 
 
 class AnalyzerUnavailableError(RuntimeError):
@@ -113,6 +121,140 @@ class AnalyzerInfo:
     analyzer_version: str
     clang_major: int
     capabilities: frozenset[str]
+
+
+class _JsonlStreamDecoder:
+    """Incrementally decompress and parse one bounded JSONL response stream."""
+
+    def __init__(
+        self,
+        *,
+        gzip_transport: bool,
+        max_wire_bytes: int,
+        max_decoded_bytes: int,
+        max_record_bytes: int,
+        on_record: Callable[[dict[str, Any]], None],
+    ) -> None:
+        self._decompressor = zlib.decompressobj(wbits=31) if gzip_transport else None
+        self._max_wire_bytes = max_wire_bytes
+        self._max_decoded_bytes = max_decoded_bytes
+        self._max_record_bytes = max_record_bytes
+        self._on_record = on_record
+        self._wire_bytes = 0
+        self._decoded_bytes = 0
+        self._record = bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        self._wire_bytes += len(chunk)
+        if self._wire_bytes > self._max_wire_bytes:
+            raise AnalyzerLimitError("analyzer exceeded the compressed output limit")
+        if self._decompressor is None:
+            self._feed_decoded(chunk)
+            return
+        pending = chunk
+        try:
+            while pending:
+                remaining = self._max_decoded_bytes - self._decoded_bytes
+                decoded = self._decompressor.decompress(pending, remaining + 1)
+                self._feed_decoded(decoded)
+                pending = self._decompressor.unconsumed_tail
+                if pending and self._decoded_bytes >= self._max_decoded_bytes:
+                    raise AnalyzerLimitError("analyzer exceeded the decoded output limit")
+        except zlib.error as error:
+            raise AnalyzerProtocolError("analyzer returned malformed gzip data") from error
+
+    def finish(self) -> None:
+        if self._decompressor is not None:
+            try:
+                remaining = self._max_decoded_bytes - self._decoded_bytes
+                self._feed_decoded(self._decompressor.flush(remaining + 1))
+            except zlib.error as error:
+                raise AnalyzerProtocolError("analyzer returned malformed gzip data") from error
+            if not self._decompressor.eof or self._decompressor.unused_data:
+                raise AnalyzerProtocolError("analyzer returned malformed gzip data")
+        if self._record:
+            raise AnalyzerProtocolError("analyzer returned unterminated JSONL")
+
+    def _feed_decoded(self, chunk: bytes) -> None:
+        self._decoded_bytes += len(chunk)
+        if self._decoded_bytes > self._max_decoded_bytes:
+            raise AnalyzerLimitError("analyzer exceeded the decoded output limit")
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            if index == len(parts) - 1:
+                self._record.extend(part)
+                if len(self._record) > self._max_record_bytes:
+                    raise AnalyzerLimitError("analyzer exceeded the record limit")
+                continue
+            self._record.extend(part)
+            if not self._record:
+                raise AnalyzerProtocolError("analyzer returned malformed JSONL")
+            if len(self._record) > self._max_record_bytes:
+                raise AnalyzerLimitError("analyzer exceeded the record limit")
+            try:
+                record = json.loads(self._record)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise AnalyzerProtocolError("analyzer returned malformed JSONL") from error
+            if not isinstance(record, dict):
+                raise AnalyzerProtocolError("analyzer JSONL records must be objects")
+            self._record.clear()
+            self._on_record(record)
+
+
+class _FactRegistry:
+    """Disk-backed fact-kind registries exposed only after successful completion."""
+
+    def __init__(self) -> None:
+        self._directory = "/tmp" if os.name != "nt" and Path("/tmp").is_dir() else None
+        self._files: dict[str, BufferedRandom] = {}
+
+    def add(self, fact: Mapping[str, Any]) -> None:
+        fact_kind = fact.get("fact")
+        if not isinstance(fact_kind, str) or not fact_kind:
+            raise AnalyzerProtocolError("analyzer fact has no valid kind")
+        destination = self._files.get(fact_kind)
+        if destination is None:
+            destination = tempfile.TemporaryFile(  # noqa: SIM115 - registry owns lifetime
+                mode="w+b", dir=self._directory
+            )
+            self._files[fact_kind] = destination
+        destination.write(
+            json.dumps(fact, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
+        )
+
+    def __iter__(self) -> Iterator[Mapping[str, Any]]:
+        for fact_kind in sorted(self._files):
+            yield from self.records(fact_kind)
+
+    def records(self, fact_kind: str) -> Iterator[Mapping[str, Any]]:
+        source = self._files.get(fact_kind)
+        if source is None:
+            return
+        source.seek(0)
+        while line := source.readline():
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise AnalyzerProtocolError("analyzer JSONL records must be objects")
+            yield record
+
+    def close(self) -> None:
+        for source in self._files.values():
+            source.close()
+        self._files.clear()
+
+    def __enter__(self) -> _FactRegistry:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+def _fact_records(
+    facts: Iterable[Mapping[str, Any]], fact_kind: str
+) -> Iterable[Mapping[str, Any]]:
+    if isinstance(facts, _FactRegistry):
+        return facts.records(fact_kind)
+    return (fact for fact in facts if fact.get("fact") == fact_kind)
 
 
 def _hash_bytes(value: bytes) -> str:
@@ -145,15 +287,27 @@ class NativeAnalyzerClient:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_decoded_bytes: int = DEFAULT_MAX_DECODED_BYTES,
+        max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
         max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
+        prefer_compression: bool = True,
     ) -> None:
         self.binary = binary.expanduser().resolve(strict=False)
-        if timeout_seconds <= 0 or min(max_input_bytes, max_output_bytes, max_stderr_bytes) <= 0:
+        if timeout_seconds <= 0 or min(
+            max_input_bytes,
+            max_output_bytes,
+            max_decoded_bytes,
+            max_record_bytes,
+            max_stderr_bytes,
+        ) <= 0:
             raise ValueError("analyzer timeout and byte limits must be positive")
         self.timeout_seconds = timeout_seconds
         self.max_input_bytes = max_input_bytes
         self.max_output_bytes = max_output_bytes
+        self.max_decoded_bytes = max_decoded_bytes
+        self.max_record_bytes = max_record_bytes
         self.max_stderr_bytes = max_stderr_bytes
+        self.prefer_compression = prefer_compression
         self._info: AnalyzerInfo | None = None
 
     def probe(self, *, refresh: bool = False) -> AnalyzerInfo:
@@ -200,8 +354,27 @@ class NativeAnalyzerClient:
     def analyze(
         self, project_root: Path, configuration: BuildConfiguration
     ) -> tuple[Mapping[str, Any], ...]:
-        self.probe()
+        facts: list[Mapping[str, Any]] = []
+        self.analyze_stream(project_root, configuration, facts.append)
+        return tuple(facts)
+
+    def analyze_stream(
+        self,
+        project_root: Path,
+        configuration: BuildConfiguration,
+        on_fact: Callable[[Mapping[str, Any]], None],
+        *,
+        cancelled: threading.Event | None = None,
+    ) -> None:
+        """Validate one response while forwarding facts without retaining raw output."""
+
+        info = self.probe()
         unit_id = translation_unit_id(configuration)
+        transport = (
+            GZIP_TRANSPORT
+            if self.prefer_compression and GZIP_TRANSPORT in info.capabilities
+            else "plain_jsonl_v1"
+        )
         request = {
             "type": "analyze",
             "request_id": unit_id,
@@ -210,35 +383,67 @@ class NativeAnalyzerClient:
             "directory": str(configuration.directory),
             "arguments": list(libclang_arguments(configuration)),
         }
-        records = self._invoke((self._hello(), request), output_limit=self.max_output_bytes)
-        if not records or records[0].get("type") != "hello":
-            raise AnalyzerProtocolError("analyzer did not repeat its validated handshake")
-        if self._validate_handshake(records[0]) != self._info:
-            raise AnalyzerProtocolError("analyzer handshake changed between invocations")
-        if len(records) < 3 or records[1] != {"request_id": unit_id, "type": "begin"}:
-            raise AnalyzerProtocolError("analyzer response has no matching begin record")
-        complete = records[-1]
-        if complete.get("type") != "complete" or complete.get("request_id") != unit_id:
+        state = "hello"
+
+        def accept(record: dict[str, Any]) -> None:
+            nonlocal state
+            record_type = record.get("type")
+            if state == "hello":
+                if record_type != "hello":
+                    raise AnalyzerProtocolError(
+                        "analyzer did not repeat its validated handshake"
+                    )
+                if self._validate_handshake(record) != info:
+                    raise AnalyzerProtocolError("analyzer handshake changed between invocations")
+                state = "begin"
+                return
+            if state == "begin":
+                if record != {"request_id": unit_id, "type": "begin"}:
+                    raise AnalyzerProtocolError("analyzer response has no matching begin record")
+                state = "facts"
+                return
+            if state != "facts":
+                raise AnalyzerProtocolError("analyzer emitted records after completion")
+            if record_type == "fact":
+                on_fact(record)
+                return
+            if record_type != "complete" or record.get("request_id") != unit_id:
+                raise AnalyzerProtocolError("analyzer emitted a non-fact record during analysis")
+            if record.get("success") is not True:
+                raise AnalyzerProtocolError("analyzer did not complete successfully")
+            state = "complete"
+
+        self._invoke(
+            (self._hello(response_transport=transport), request),
+            output_limit=self.max_output_bytes,
+            transport=transport,
+            on_record=accept,
+            cancelled=cancelled,
+        )
+        if state != "complete":
             raise AnalyzerProtocolError("analyzer response is incomplete")
-        if complete.get("success") is not True:
-            raise AnalyzerProtocolError("analyzer did not complete successfully")
-        facts = records[2:-1]
-        if not all(record.get("type") == "fact" for record in facts):
-            raise AnalyzerProtocolError("analyzer emitted a non-fact record during analysis")
-        return tuple(facts)
 
     @staticmethod
-    def _hello() -> dict[str, Any]:
-        return {
+    def _hello(*, response_transport: str | None = None) -> dict[str, Any]:
+        hello: dict[str, Any] = {
             "type": "hello",
             "protocol": PROTOCOL,
             "protocol_version": PROTOCOL_VERSION,
             "required_clang_major": REQUIRED_CLANG_MAJOR,
             "required_capabilities": sorted(REQUIRED_CAPABILITIES),
         }
+        if response_transport == GZIP_TRANSPORT:
+            hello["response_transport"] = GZIP_TRANSPORT
+        return hello
 
     def _invoke(
-        self, requests: Sequence[Mapping[str, Any]], *, output_limit: int
+        self,
+        requests: Sequence[Mapping[str, Any]],
+        *,
+        output_limit: int,
+        transport: str = "plain_jsonl_v1",
+        on_record: Callable[[dict[str, Any]], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> list[dict[str, Any]]:
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
             raise AnalyzerUnavailableError(
@@ -256,37 +461,74 @@ class NativeAnalyzerClient:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=os.name != "nt",
             )
         except OSError as error:
             raise AnalyzerUnavailableError("configured analyzer could not be started") from error
         assert (
             process.stdin is not None and process.stdout is not None and process.stderr is not None
         )
-        stdout = bytearray()
         stderr = bytearray()
-        exceeded = threading.Event()
+        stopped = threading.Event()
+        failures: list[BaseException] = []
+        records: list[dict[str, Any]] = []
 
-        def read_bounded(stream: Any, destination: bytearray, limit: int) -> None:
-            while chunk := stream.read(64 * 1024):
-                remaining = limit + 1 - len(destination)
-                if remaining > 0:
-                    destination.extend(chunk[:remaining])
-                if len(destination) > limit or len(chunk) > remaining:
-                    exceeded.set()
+        def stop_process() -> None:
+            if process.poll() is not None:
+                return
+            with suppress(ProcessLookupError, PermissionError):
+                if os.name != "nt":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
                     process.kill()
-                    return
+
+        def fail(error: BaseException) -> None:
+            failures.append(error)
+            stopped.set()
+            stop_process()
+
+        def accept(record: dict[str, Any]) -> None:
+            error_record = record if record.get("type") == "error" else None
+            if error_record is not None:
+                code = error_record.get("code", "unknown")
+                if not isinstance(code, str) or not code.replace("_", "").isalnum():
+                    code = "unknown"
+                raise AnalyzerProtocolError(f"analyzer rejected the request ({code})")
+            if on_record is None:
+                records.append(record)
+            else:
+                on_record(record)
+
+        decoder = _JsonlStreamDecoder(
+            gzip_transport=transport == GZIP_TRANSPORT,
+            max_wire_bytes=output_limit,
+            max_decoded_bytes=self.max_decoded_bytes,
+            max_record_bytes=self.max_record_bytes,
+            on_record=accept,
+        )
+
+        def read_stdout() -> None:
+            try:
+                while chunk := process.stdout.read1(64 * 1024):
+                    decoder.feed(chunk)
+                decoder.finish()
+            except BaseException as error:
+                fail(error)
+
+        def read_stderr() -> None:
+            try:
+                while chunk := process.stderr.read1(64 * 1024):
+                    remaining = self.max_stderr_bytes + 1 - len(stderr)
+                    if remaining > 0:
+                        stderr.extend(chunk[:remaining])
+                    if len(stderr) > self.max_stderr_bytes or len(chunk) > remaining:
+                        raise AnalyzerLimitError("analyzer exceeded the stderr output limit")
+            except BaseException as error:
+                fail(error)
 
         readers = (
-            threading.Thread(
-                target=read_bounded,
-                args=(process.stdout, stdout, output_limit),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=read_bounded,
-                args=(process.stderr, stderr, self.max_stderr_bytes),
-                daemon=True,
-            ),
+            threading.Thread(target=read_stdout, daemon=True),
+            threading.Thread(target=read_stderr, daemon=True),
         )
         for reader in readers:
             reader.start()
@@ -304,32 +546,50 @@ class NativeAnalyzerClient:
         writer = threading.Thread(target=write_input, daemon=True)
         writer.start()
         timed_out = False
+        was_cancelled = False
+        deadline = time.monotonic() + self.timeout_seconds
         try:
-            process.wait(timeout=self.timeout_seconds)
+            while process.poll() is None:
+                if cancelled is not None and cancelled.is_set():
+                    was_cancelled = True
+                    stop_process()
+                    break
+                if stopped.is_set():
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    stop_process()
+                    break
+                with suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+            process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            process.wait()
+            stop_process()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=2)
+        except BaseException:
+            stop_process()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=2)
+            raise
         finally:
             writer.join(timeout=2)
             for reader in readers:
                 reader.join(timeout=2)
+        if writer.is_alive() or any(reader.is_alive() for reader in readers):
+            stop_process()
+            raise AnalyzerLimitError("analyzer cleanup exceeded two seconds")
+        if was_cancelled:
+            raise AnalyzerLimitError("analyzer analysis was cancelled")
         if timed_out:
             raise AnalyzerLimitError("analyzer exceeded the configured timeout")
-        if exceeded.is_set():
-            raise AnalyzerLimitError("analyzer exceeded a configured output limit")
-        try:
-            records = [json.loads(line) for line in stdout.decode("utf-8").splitlines()]
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise AnalyzerProtocolError("analyzer returned malformed JSONL") from error
-        if not all(isinstance(record, dict) for record in records):
-            raise AnalyzerProtocolError("analyzer JSONL records must be objects")
-        error_record = next((record for record in records if record.get("type") == "error"), None)
-        if error_record is not None:
-            code = error_record.get("code", "unknown")
-            if not isinstance(code, str) or not code.replace("_", "").isalnum():
-                code = "unknown"
-            raise AnalyzerProtocolError(f"analyzer rejected the request ({code})")
+        if failures:
+            limit_failure = next(
+                (failure for failure in failures if isinstance(failure, AnalyzerLimitError)), None
+            )
+            if limit_failure is not None:
+                raise limit_failure
+            raise failures[0]
         if process.returncode != 0:
             raise AnalyzerProtocolError("analyzer process failed; inspect compiler diagnostics")
         return records
@@ -338,8 +598,11 @@ class NativeAnalyzerClient:
 class NativeClangIngestor:
     """Convert complete companion facts into the existing durable domain model."""
 
-    def __init__(self, client: NativeAnalyzerClient) -> None:
+    def __init__(self, client: NativeAnalyzerClient, *, max_workers: int = 1) -> None:
+        if max_workers <= 0:
+            raise ValueError("native analyzer worker bound must be positive")
         self.client = client
+        self.max_workers = max_workers
 
     analysis_backend = "clang-libtooling"
     advanced_facts_complete = True
@@ -364,33 +627,52 @@ class NativeClangIngestor:
         root = project_root.resolve(strict=False)
         self.client.probe()
         selected = tuple(configurations)
+        cancelled = threading.Event()
 
         def analyze(configuration: BuildConfiguration) -> IngestionBatch:
-            return _FactBatchBuilder(root, configuration).build(
-                self.client.analyze(root, configuration)
-            )
+            builder = _FactBatchBuilder(root, configuration)
+            analyze_stream = getattr(self.client, "analyze_stream", None)
+            if analyze_stream is None:
+                return builder.build(self.client.analyze(root, configuration))
+            with _FactRegistry() as facts:
+                analyze_stream(root, configuration, facts.add, cancelled=cancelled)
+                return builder.build(facts)
 
-        # Each configuration is a separate companion process. Consume futures in
-        # submission order so durable IDs and fact aggregation remain deterministic.
-        # Seven companions keep the measured aggregate process tree below the
-        # 2-GiB benchmark budget while retaining bounded TU parallelism.
-        worker_count = min(7, max(1, len(selected)))
+        # Each configuration is a separate companion process. Aggregate completed
+        # batches in input order so durable IDs and output remain deterministic.
+        # Large C++ TUs can be memory intensive. Default to one companion and let
+        # operators raise this explicit hard bound for their measured workload.
+        worker_count = min(self.max_workers, max(1, len(selected)))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(analyze, configuration) for configuration in selected[:worker_count]
-            ]
-            batches = []
+            futures = {
+                executor.submit(analyze, configuration): index
+                for index, configuration in enumerate(selected[:worker_count])
+            }
+            batches_by_index: dict[int, IngestionBatch] = {}
             next_configuration = worker_count
             try:
-                for future in futures:
-                    batches.append(future.result())
-                    if next_configuration < len(selected):
-                        futures.append(executor.submit(analyze, selected[next_configuration]))
+                while futures:
+                    done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                    failed = next(
+                        (future for future in done if future.exception() is not None), None
+                    )
+                    if failed is not None:
+                        failed.result()
+                    completed = sorted((futures.pop(future), future.result()) for future in done)
+                    for index, batch in completed:
+                        batches_by_index[index] = batch
+                    for _index, _batch in completed:
+                        if next_configuration >= len(selected):
+                            break
+                        future = executor.submit(analyze, selected[next_configuration])
+                        futures[future] = next_configuration
                         next_configuration += 1
             except BaseException:
+                cancelled.set()
                 for future in futures:
                     future.cancel()
                 raise
+        batches = [batches_by_index[index] for index in range(len(selected))]
         callsites = tuple(site for batch in batches for site in batch.callsites)
         call_targets = tuple(target for batch in batches for target in batch.call_targets)
         all_edges = tuple(edge for batch in batches for edge in batch.edges)
@@ -477,22 +759,22 @@ class _FactBatchBuilder:
         self.function_summary_parameter_counts: dict[str, int] = {}
         self.path_cache: dict[str, Path] = {}
 
-    def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
-        for fact in facts:
-            if fact.get("fact") == "file":
-                self._file_fact(fact)
-            elif fact.get("fact") == "symbol":
-                self._symbol_fact(fact)
-            elif fact.get("fact") == "include" and isinstance(fact.get("resolved_path"), str):
+    def build(self, facts: Iterable[Mapping[str, Any]]) -> IngestionBatch:
+        for fact in _fact_records(facts, "file"):
+            self._file_fact(fact)
+        for fact in _fact_records(facts, "symbol"):
+            self._symbol_fact(fact)
+        for fact in _fact_records(facts, "include"):
+            if isinstance(fact.get("resolved_path"), str):
                 path = self._path(fact["resolved_path"])
                 self._file_symbol(path)
         occurrences: dict[str, SymbolOccurrence] = {}
         edges: dict[str, GraphEdge] = {}
-        for fact in facts:
-            if fact.get("fact") == "occurrence":
-                occurrence = self._occurrence_fact(fact)
-                occurrences[occurrence.id] = occurrence
-            elif fact.get("fact") in {"edge", "include"}:
+        for fact in _fact_records(facts, "occurrence"):
+            occurrence = self._occurrence_fact(fact)
+            occurrences[occurrence.id] = occurrence
+        for fact_kind in ("edge", "include"):
+            for fact in _fact_records(facts, fact_kind):
                 edge = self._edge_fact(fact)
                 if edge is not None:
                     edges[edge.id] = edge
@@ -539,16 +821,16 @@ class _FactBatchBuilder:
         )
 
     def _data_flow_facts(
-        self, facts: Sequence[Mapping[str, Any]]
+        self, facts: Iterable[Mapping[str, Any]]
     ) -> tuple[
         tuple[DataFlowAnalysis, ...],
         tuple[MemoryLocation, ...],
         tuple[DataAccess, ...],
         tuple[DataFlowEvidence, ...],
     ]:
-        analysis_facts = [fact for fact in facts if fact.get("fact") == "data_flow_analysis_v1"]
-        location_facts = [fact for fact in facts if fact.get("fact") == "memory_location_v1"]
-        access_facts = [fact for fact in facts if fact.get("fact") == "data_access_v1"]
+        analysis_facts = list(_fact_records(facts, "data_flow_analysis_v1"))
+        location_facts = list(_fact_records(facts, "memory_location_v1"))
+        access_facts = list(_fact_records(facts, "data_access_v1"))
         for fact in analysis_facts:
             key = _string(fact, "key")
             graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
@@ -620,8 +902,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._data_flow_evidence_fact(fact)
-                        for fact in facts
-                        if fact.get("fact") == "data_flow_evidence_v1"
+                        for fact in _fact_records(facts, "data_flow_evidence_v1")
                     ),
                     key=lambda item: (item.analysis_id, item.relation.value, item.id),
                 )
@@ -806,7 +1087,7 @@ class _FactBatchBuilder:
             ) from error
 
     def _interprocedural_facts(
-        self, facts: Sequence[Mapping[str, Any]]
+        self, facts: Iterable[Mapping[str, Any]]
     ) -> tuple[
         tuple[FunctionSummary, ...],
         tuple[SummaryEffect, ...],
@@ -814,7 +1095,7 @@ class _FactBatchBuilder:
         tuple[CallArgumentBinding, ...],
         tuple[CallResultBinding, ...],
     ]:
-        summary_facts = [fact for fact in facts if fact.get("fact") == "function_summary_v1"]
+        summary_facts = list(_fact_records(facts, "function_summary_v1"))
         for fact in summary_facts:
             key = _string(fact, "key")
             analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
@@ -851,8 +1132,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._summary_effect_fact(fact)
-                        for fact in facts
-                        if fact.get("fact") == "summary_effect_v1"
+                        for fact in _fact_records(facts, "summary_effect_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -861,8 +1141,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._summary_return_origin_fact(fact)
-                        for fact in facts
-                        if fact.get("fact") == "summary_return_origin_v1"
+                        for fact in _fact_records(facts, "summary_return_origin_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -871,8 +1150,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._call_argument_binding_fact(fact)
-                        for fact in facts
-                        if fact.get("fact") == "call_argument_binding_v1"
+                        for fact in _fact_records(facts, "call_argument_binding_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -881,8 +1159,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._call_result_binding_fact(fact)
-                        for fact in facts
-                        if fact.get("fact") == "call_result_binding_v1"
+                        for fact in _fact_records(facts, "call_result_binding_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -1066,9 +1343,9 @@ class _FactBatchBuilder:
             ) from error
 
     def _call_facts(
-        self, facts: Sequence[Mapping[str, Any]]
+        self, facts: Iterable[Mapping[str, Any]]
     ) -> tuple[tuple[CallSite, ...], tuple[CallTarget, ...]]:
-        site_facts = [fact for fact in facts if fact.get("fact") == "callsite_v1"]
+        site_facts = list(_fact_records(facts, "callsite_v1"))
         for fact in site_facts:
             key = _string(fact, "key")
             owner_id = self._known_id(_string(fact, "owner_key"))
@@ -1095,9 +1372,7 @@ class _FactBatchBuilder:
                 )[:32]
             )
         sites_by_key = {_string(fact, "key"): self._callsite_fact(fact) for fact in site_facts}
-        for fact in facts:
-            if fact.get("fact") != "callsite_resolution_v1":
-                continue
+        for fact in _fact_records(facts, "callsite_resolution_v1"):
             key = _string(fact, "callsite_key")
             try:
                 site = sites_by_key[key]
@@ -1119,8 +1394,7 @@ class _FactBatchBuilder:
             sorted(
                 (
                     self._call_target_fact(fact)
-                    for fact in facts
-                    if fact.get("fact") == "call_target_v1"
+                    for fact in _fact_records(facts, "call_target_v1")
                 ),
                 key=lambda item: (item.callsite_id, item.target_symbol_id, item.id),
             )
@@ -1200,15 +1474,15 @@ class _FactBatchBuilder:
             raise AnalyzerProtocolError("analyzer target references an unknown callsite") from error
 
     def _cfg_facts(
-        self, facts: Sequence[Mapping[str, Any]]
+        self, facts: Iterable[Mapping[str, Any]]
     ) -> tuple[
         tuple[CfgGraph, ...],
         tuple[CfgBlock, ...],
         tuple[CfgElement, ...],
         tuple[CfgEdge, ...],
     ]:
-        graph_facts = [fact for fact in facts if fact.get("fact") == "cfg_graph_v1"]
-        block_facts = [fact for fact in facts if fact.get("fact") == "cfg_block_v1"]
+        graph_facts = list(_fact_records(facts, "cfg_graph_v1"))
+        block_facts = list(_fact_records(facts, "cfg_block_v1"))
         for fact in graph_facts:
             graph_key = _string(fact, "key")
             function_id = self._known_id(_string(fact, "function_key"))
@@ -1230,9 +1504,7 @@ class _FactBatchBuilder:
             block_graph_ids[block_key] = graph_id
             self.cfg_block_graph_ids[block_key] = graph_id
             self.cfg_block_ids[block_key] = "cfg_block_" + _hash_text(graph_id, str(index))[:32]
-        for fact in facts:
-            if fact.get("fact") != "cfg_element_v1":
-                continue
+        for fact in _fact_records(facts, "cfg_element_v1"):
             graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
             block_id = self._known_cfg_block(_string(fact, "block_key"))
             index = _non_negative_integer(fact, "index")
@@ -1256,15 +1528,15 @@ class _FactBatchBuilder:
                 endpoint_keys.append(exceptional_key)
             if any(block_graph_ids.get(key) != graph_id for key in endpoint_keys):
                 raise AnalyzerProtocolError("analyzer CFG facts have inconsistent graph references")
-        for fact in facts:
-            fact_kind = fact.get("fact")
-            if fact_kind == "cfg_element_v1":
-                graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
-                if block_graph_ids.get(_string(fact, "block_key")) != graph_id:
-                    raise AnalyzerProtocolError(
-                        "analyzer CFG facts have inconsistent graph references"
-                    )
-            elif fact_kind == "cfg_edge_v1":
+        for fact_kind in ("cfg_element_v1", "cfg_edge_v1"):
+            for fact in _fact_records(facts, fact_kind):
+                if fact_kind == "cfg_element_v1":
+                    graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+                    if block_graph_ids.get(_string(fact, "block_key")) != graph_id:
+                        raise AnalyzerProtocolError(
+                            "analyzer CFG facts have inconsistent graph references"
+                        )
+                    continue
                 graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
                 if any(
                     block_graph_ids.get(_string(fact, key)) != graph_id
@@ -1287,15 +1559,17 @@ class _FactBatchBuilder:
             sorted(
                 (
                     self._cfg_element_fact(fact)
-                    for fact in facts
-                    if fact.get("fact") == "cfg_element_v1"
+                    for fact in _fact_records(facts, "cfg_element_v1")
                 ),
                 key=lambda item: (item.graph_id, item.block_id, item.index, item.id),
             )
         )
         edges = tuple(
             sorted(
-                (self._cfg_edge_fact(fact) for fact in facts if fact.get("fact") == "cfg_edge_v1"),
+                (
+                    self._cfg_edge_fact(fact)
+                    for fact in _fact_records(facts, "cfg_edge_v1")
+                ),
                 key=lambda item: (
                     item.graph_id,
                     item.source_block_id,

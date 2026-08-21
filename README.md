@@ -277,10 +277,13 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_BUILD_SCOPE` | comma-separated query/MCP build names | `default` |
 | `LIBCLANG_LIBRARY_FILE` | exact compatible native libclang | auto-discovered |
 | `CPP_CONTEXT_CLANG_ANALYZER` | Clang-18 LibTooling companion executable | unset (baseline mode) |
-| `CPP_CONTEXT_ANALYZER_TIMEOUT` | companion process timeout in seconds | `30` |
+| `CPP_CONTEXT_ANALYZER_TIMEOUT` | per-companion wall timeout in seconds | `75` |
 | `CPP_CONTEXT_ANALYZER_MAX_INPUT_BYTES` | maximum JSONL request bytes | `1048576` |
-| `CPP_CONTEXT_ANALYZER_MAX_OUTPUT_BYTES` | maximum JSONL fact bytes | `67108864` |
+| `CPP_CONTEXT_ANALYZER_MAX_OUTPUT_BYTES` | maximum compressed/plain wire bytes | `67108864` |
+| `CPP_CONTEXT_ANALYZER_MAX_DECODED_BYTES` | maximum decoded protocol bytes | `268435456` |
+| `CPP_CONTEXT_ANALYZER_MAX_RECORD_BYTES` | maximum decoded JSONL record bytes | `16777216` |
 | `CPP_CONTEXT_ANALYZER_MAX_STDERR_BYTES` | maximum diagnostic bytes | `262144` |
+| `CPP_CONTEXT_ANALYZER_MAX_WORKERS` | maximum concurrent companion processes | `1` |
 | `CPP_CONTEXT_MAX_TOKENS` | default packed context budget | `16000` |
 | `CPP_CONTEXT_RETRIEVAL_LIMIT` | candidates per search backend | `20` |
 | `CPP_CONTEXT_EMBEDDING_PROVIDER` | `local` or `openai` | `local` |

@@ -30,12 +30,18 @@ def test_environment_loads_native_analyzer_and_limits(tmp_path, monkeypatch) -> 
     monkeypatch.setenv("CPP_CONTEXT_CLANG_ANALYZER", str(binary))
     monkeypatch.setenv("CPP_CONTEXT_ANALYZER_TIMEOUT", "12.5")
     monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_OUTPUT_BYTES", "4096")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_DECODED_BYTES", "8192")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_RECORD_BYTES", "2048")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_WORKERS", "3")
 
     config = AppConfig.from_environment(cwd=tmp_path)
 
     assert config.clang_analyzer_path == binary
     assert config.analyzer_timeout_seconds == 12.5
     assert config.analyzer_max_output_bytes == 4096
+    assert config.analyzer_max_decoded_bytes == 8192
+    assert config.analyzer_max_record_bytes == 2048
+    assert config.analyzer_max_workers == 3
 
 
 def test_environment_loads_provider_configuration_without_exposing_secrets(
