@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from cpp_context_engine.models import BuildConfiguration
+from cpp_context_engine.models import DEFAULT_BUILD_VARIANT, BuildConfiguration
 
 
 class CompilationDatabaseError(ValueError):
@@ -39,7 +39,7 @@ class CompilationDatabase:
         self.configurations = configurations
 
     @classmethod
-    def load(cls, path: Path) -> CompilationDatabase:
+    def load(cls, path: Path, *, build_variant: str = DEFAULT_BUILD_VARIANT) -> CompilationDatabase:
         path = path.resolve(strict=False)
         try:
             payload: Any = json.loads(path.read_text(encoding="utf-8"))
@@ -60,14 +60,14 @@ class CompilationDatabase:
         configurations: list[BuildConfiguration] = []
         seen: set[str] = set()
         for position, raw in enumerate(payload):
-            configuration = cls._parse_entry(path, position, raw)
+            configuration = cls._parse_entry(path, position, raw, build_variant)
             if configuration.id not in seen:
                 configurations.append(configuration)
                 seen.add(configuration.id)
         return cls(path, tuple(configurations))
 
     @staticmethod
-    def _parse_entry(path: Path, position: int, raw: Any) -> BuildConfiguration:
+    def _parse_entry(path: Path, position: int, raw: Any, build_variant: str) -> BuildConfiguration:
         prefix = f"{path}: entry {position}"
         if not isinstance(raw, dict):
             raise CompilationDatabaseError(f"{prefix} must be an object")
@@ -125,12 +125,13 @@ class CompilationDatabase:
             [str(directory), str(source_path), *arguments, str(output) if output else ""]
         )
         return BuildConfiguration(
-            id=f"build_{command_hash[:32]}",
+            id=f"build_{_digest([build_variant, command_hash])[:32]}",
             source_path=source_path,
             directory=directory,
             arguments=arguments,
             command_hash=command_hash,
             output=output,
+            build_variant=build_variant,
         )
 
 
@@ -198,4 +199,4 @@ def libclang_arguments(configuration: BuildConfiguration) -> tuple[str, ...]:
 def translation_unit_id(configuration: BuildConfiguration) -> str:
     """Return the stable identity of one distinct compiler invocation."""
 
-    return f"tu_{_digest([configuration.id])[:32]}"
+    return f"tu_{_digest([configuration.build_variant, configuration.id])[:32]}"

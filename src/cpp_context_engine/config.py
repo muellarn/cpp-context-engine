@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cpp_context_engine.models import BuildScope, BuildVariant
+
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
@@ -15,6 +17,8 @@ class AppConfig:
     index_directory: Path
     database_path: Path | None = None
     compilation_database: Path | None = None
+    build_variants: tuple[BuildVariant, ...] = ()
+    build_scope: BuildScope = field(default_factory=BuildScope.single)
     libclang_library_file: Path | None = None
     max_context_tokens: int = 16_000
     retrieval_limit: int = 20
@@ -47,6 +51,12 @@ class AppConfig:
             .expanduser()
             .resolve(strict=False),
         )
+        variants = self.build_variants or (
+            BuildVariant("default", self.compilation_database),  # type: ignore[arg-type]
+        )
+        if len({variant.name for variant in variants}) != len(variants):
+            raise ValueError("build variant names must be unique")
+        object.__setattr__(self, "build_variants", tuple(variants))
         if self.libclang_library_file is not None:
             object.__setattr__(
                 self,
@@ -82,6 +92,8 @@ class AppConfig:
             index_directory=index_directory,
             database_path=_optional_path_env("CPP_CONTEXT_DATABASE"),
             compilation_database=_optional_path_env("CPP_CONTEXT_COMPILE_COMMANDS"),
+            build_variants=_build_variants_env(),
+            build_scope=_build_scope_env(),
             libclang_library_file=_optional_path_env("LIBCLANG_LIBRARY_FILE"),
             max_context_tokens=_positive_int("CPP_CONTEXT_MAX_TOKENS", 16_000),
             retrieval_limit=_positive_int("CPP_CONTEXT_RETRIEVAL_LIMIT", 20),
@@ -128,3 +140,21 @@ def _positive_float(name: str, default: float) -> float:
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
     return value
+
+
+def _build_variants_env() -> tuple[BuildVariant, ...]:
+    raw = os.getenv("CPP_CONTEXT_BUILDS", "").strip()
+    if not raw:
+        return ()
+    variants: list[BuildVariant] = []
+    for item in raw.split(","):
+        name, separator, path = item.partition("=")
+        if not separator or not name.strip() or not path.strip():
+            raise ValueError("CPP_CONTEXT_BUILDS must contain comma-separated NAME=PATH entries")
+        variants.append(BuildVariant(name.strip(), Path(path.strip())))
+    return tuple(variants)
+
+
+def _build_scope_env() -> BuildScope:
+    raw = os.getenv("CPP_CONTEXT_BUILD_SCOPE", "").strip()
+    return BuildScope(tuple(raw.split(","))) if raw else BuildScope.single()

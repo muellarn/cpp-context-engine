@@ -8,6 +8,7 @@ from cpp_context_engine.api import ContextRetrievalService, IterativeAnswerServi
 from cpp_context_engine.config import AppConfig
 from cpp_context_engine.ingestion import ClangIngestor, IndexingResult, ProjectIndexer
 from cpp_context_engine.llm import LLMProvider, OpenAICompatibleProvider
+from cpp_context_engine.models import BuildScope
 from cpp_context_engine.retrieval import HybridRetriever, RetrievalConfig
 from cpp_context_engine.search import (
     DeterministicLocalEmbeddingProvider,
@@ -81,17 +82,39 @@ def index_project(config: AppConfig) -> IndexOperationResult:
     """Incrementally index compiler facts, then only missing/current vectors."""
 
     assert config.database_path is not None
-    assert config.compilation_database is not None
     if not config.project_root.is_dir():
         raise ValueError(f"project directory does not exist: {config.project_root}")
     provider = embedding_provider(config)
-    with SQLiteStore(config.database_path, project_root=config.project_root) as store:
+    scope = BuildScope(tuple(variant.name for variant in config.build_variants))
+    with SQLiteStore(
+        config.database_path, project_root=config.project_root, build_scope=scope
+    ) as store:
         ingestor = ClangIngestor(library_file=config.libclang_library_file)
-        indexing = ProjectIndexer(ingestor, store).index(
-            config.project_root, config.compilation_database
+        results = tuple(
+            ProjectIndexer(ingestor, store).index(
+                config.project_root,
+                variant.compilation_database,
+                build_variant=variant,
+            )
+            for variant in config.build_variants
         )
-        vector_search = SQLiteVectorSearch(store, provider, project_root=config.project_root)
-        missing = store.missing_embedding_symbol_ids(provider.model_id, config.project_root)
+        indexing = IndexingResult(
+            indexed_translation_units=sum(item.indexed_translation_units for item in results),
+            skipped_translation_units=sum(item.skipped_translation_units for item in results),
+            removed_translation_units=sum(item.removed_translation_units for item in results),
+            indexed_symbols=sum(item.indexed_symbols for item in results),
+            indexed_occurrences=sum(item.indexed_occurrences for item in results),
+            indexed_edges=sum(item.indexed_edges for item in results),
+        )
+        vector_search = SQLiteVectorSearch(
+            store,
+            provider,
+            project_root=config.project_root,
+            build_scope=scope,
+        )
+        missing = store.missing_embedding_variant_ids(
+            provider.model_id, config.project_root, build_scope=scope
+        )
         vector_search.index(missing)
         return IndexOperationResult(indexing, len(missing), provider.model_id)
 
@@ -105,17 +128,30 @@ def build_runtime(
     """Wire project-scoped adapters to retrieval and optional answer services."""
 
     assert config.database_path is not None
-    store = SQLiteStore(config.database_path, project_root=config.project_root)
+    store = SQLiteStore(
+        config.database_path,
+        project_root=config.project_root,
+        build_scope=config.build_scope,
+    )
     try:
         if not store.has_project(config.project_root):
             raise ValueError(
                 f"project is not indexed in {config.database_path}; run 'cpp-context index' first"
             )
+        available = {variant.name for variant in store.build_variants(config.project_root)}
+        missing_builds = set(config.build_scope.variants) - available
+        if missing_builds:
+            raise ValueError("build scope is not indexed: " + ", ".join(sorted(missing_builds)))
         provider = embedding_provider(config)
-        vector = SQLiteVectorSearch(store, provider, project_root=config.project_root)
+        vector = SQLiteVectorSearch(
+            store,
+            provider,
+            project_root=config.project_root,
+            build_scope=config.build_scope,
+        )
         retriever = HybridRetriever(
-            lexical_search=SQLiteLexicalSearch(store, config.project_root),
-            symbol_search=SQLiteSymbolSearch(store, config.project_root),
+            lexical_search=SQLiteLexicalSearch(store, config.project_root, config.build_scope),
+            symbol_search=SQLiteSymbolSearch(store, config.project_root, config.build_scope),
             vector_search=vector,
             symbol_store=store,
             source_reader=FilesystemSourceReader(config.project_root),

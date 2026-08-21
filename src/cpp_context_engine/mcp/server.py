@@ -390,6 +390,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                     AnswerSource(
                         symbol_id=source.symbol_id,
                         qualified_name=source.qualified_name,
+                        build_variant=source.build_variant,
                         location=_source_location(
                             source.path,
                             source.start_line,
@@ -455,39 +456,49 @@ async def _graph_tool(
     def operation() -> GraphResult:
         runtime = state.require_runtime()
         origin = _get_symbol(runtime, symbol_id)
+        edge_scope = (origin.build_variant,)
         edges = tuple(
             runtime.store.neighbors(
-                symbol_id,
+                origin.id,
                 relations=frozenset(relations) if relations else None,
                 depth=depth,
                 direction=direction,
                 max_edges=max_results + 1,
                 per_node_limit=per_node_fanout,
                 project_root=state.config.project_root,
+                build_scope=edge_scope,
             )
         )
         truncated = len(edges) > max_results
         if not truncated and len(edges) >= per_node_fanout:
             # The primary query cannot reveal when its per-node SQL limit hid one more edge.
             probe = runtime.store.neighbors(
-                symbol_id,
+                origin.id,
                 relations=frozenset(relations) if relations else None,
                 depth=depth,
                 direction=direction,
                 max_edges=max_results + 1,
                 per_node_limit=per_node_fanout + 1,
                 project_root=state.config.project_root,
+                build_scope=edge_scope,
             )
-            known_edges = set(edges)
-            truncated = any(edge not in known_edges for edge in probe)
+            known_edge_ids = {edge.id for edge in edges}
+            truncated = any(edge.id not in known_edge_ids for edge in probe)
         rendered: list[GraphEdgeResult] = []
         for edge in edges[:max_results]:
-            source = runtime.store.get_symbol(edge.source_id, state.config.project_root)
-            target = runtime.store.get_symbol(edge.target_id, state.config.project_root)
+            edge_scope = (edge.build_variant,)
+            source = runtime.store.get_symbol(
+                edge.source_id, state.config.project_root, build_scope=edge_scope
+            )
+            target = runtime.store.get_symbol(
+                edge.target_id, state.config.project_root, build_scope=edge_scope
+            )
             if source is None or target is None:
                 continue
             rendered.append(
                 GraphEdgeResult(
+                    edge_id=edge.id,
+                    build_variant=edge.build_variant,
                     source=_symbol_reference(source, state.config.project_root),
                     target=_symbol_reference(target, state.config.project_root),
                     relation=edge.relation,
@@ -519,6 +530,8 @@ def _get_symbol(runtime: Runtime, symbol_id: str) -> CodeSymbol:
 def _symbol_reference(symbol: CodeSymbol, project_root: Path) -> SymbolReference:
     return SymbolReference(
         symbol_id=symbol.id,
+        variant_id=symbol.variant_id,
+        build_variant=symbol.build_variant,
         qualified_name=symbol.qualified_name,
         kind=symbol.kind,
         signature=symbol.signature,

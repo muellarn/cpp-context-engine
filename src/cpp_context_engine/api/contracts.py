@@ -40,6 +40,7 @@ class SourceCitation:
     path: Path
     start_line: int
     end_line: int
+    build_variant: str = "default"
 
 
 @dataclass(frozen=True, slots=True)

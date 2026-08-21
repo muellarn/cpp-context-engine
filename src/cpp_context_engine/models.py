@@ -9,6 +9,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+DEFAULT_BUILD_VARIANT = "default"
+
 
 class SymbolKind(StrEnum):
     FILE = "file"
@@ -67,6 +69,50 @@ class SourceSpan:
 
 
 @dataclass(frozen=True, slots=True)
+class BuildVariant:
+    """A named, operator-owned compilation-database view of one project."""
+
+    name: str
+    compilation_database: Path
+    target: str = ""
+    platform: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        name = self.name.strip()
+        if not name or any(character.isspace() for character in name):
+            raise ValueError("build variant name must be non-empty and contain no whitespace")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(
+            self,
+            "compilation_database",
+            self.compilation_database.expanduser().resolve(strict=False),
+        )
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+
+
+@dataclass(frozen=True, slots=True)
+class BuildScope:
+    """One or more named variants included in a read operation."""
+
+    variants: tuple[str, ...] = (DEFAULT_BUILD_VARIANT,)
+
+    def __post_init__(self) -> None:
+        normalized = tuple(dict.fromkeys(name.strip() for name in self.variants if name.strip()))
+        if not normalized:
+            raise ValueError("build scope must contain at least one variant")
+        object.__setattr__(self, "variants", normalized)
+
+    @classmethod
+    def single(cls, name: str = DEFAULT_BUILD_VARIANT) -> BuildScope:
+        return cls((name,))
+
+    @property
+    def is_union(self) -> bool:
+        return len(self.variants) > 1
+
+
+@dataclass(frozen=True, slots=True)
 class BuildConfiguration:
     """One normalized entry from a JSON compilation database."""
 
@@ -76,6 +122,7 @@ class BuildConfiguration:
     arguments: tuple[str, ...]
     command_hash: str
     output: Path | None = None
+    build_variant: str = DEFAULT_BUILD_VARIANT
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +135,7 @@ class TranslationUnit:
     content_hash: str
     dependencies: tuple[tuple[Path, str], ...] = ()
     diagnostics: tuple[str, ...] = ()
+    build_variant: str = DEFAULT_BUILD_VARIANT
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +150,8 @@ class CodeSymbol:
     source_text: str = ""
     build_configuration_id: str = ""
     translation_unit_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+    variant_id: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -117,7 +167,10 @@ class GraphEdge:
     source_id: str
     target_id: str
     relation: GraphRelation
-    translation_unit_id: str = ""
+    translation_unit_id: str = field(default="", compare=False)
+    id: str = field(default="", compare=False)
+    build_configuration_id: str = field(default="", compare=False)
+    build_variant: str = field(default=DEFAULT_BUILD_VARIANT, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +181,8 @@ class SymbolOccurrence:
     kind: OccurrenceKind
     enclosing_symbol_id: str | None = None
     translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
 
     def __post_init__(self) -> None:
         if not self.id.strip():

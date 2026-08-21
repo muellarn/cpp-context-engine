@@ -64,6 +64,34 @@ are skipped. `search --json` returns stable symbol IDs, source files and line
 ranges, fused scores, selection reasons, and every code-graph hop used to connect
 context. It is fully local by default.
 
+### Multiple build variants
+
+Index each relevant compilation database under a stable operator-owned name:
+
+```bash
+cpp-context index /path/to/project \
+  --build debug=/path/to/project/build-debug/compile_commands.json \
+  --build release=/path/to/project/build-release/compile_commands.json
+
+cpp-context search "feature handler" --project /path/to/project --build debug
+cpp-context search "feature handler" --project /path/to/project \
+  --build debug --build release --json
+```
+
+A single-build query is strictly filtered. A union query returns separate evidence
+for each build and labels every result with `build_variant` (and a stable
+`variant_id`). Reindexing one name removes stale translation units only from that
+variant. Remove a variant explicitly with `cpp-context remove-build NAME`.
+
+For a long-running MCP operator, configure paths with repeated `--build NAME=PATH`
+or `CPP_CONTEXT_BUILDS=debug=/path/debug/compile_commands.json,release=/path/release/compile_commands.json`.
+`CPP_CONTEXT_BUILD_SCOPE=debug,release` selects the server-visible union. MCP callers
+can select neither filesystem paths nor unconfigured builds.
+
+Databases created before schema v3 are migrated as the `default` build. Baseline
+search remains available, but advanced build/TU provenance is marked as requiring
+one reindex; run the normal `index` command before relying on build-filtered facts.
+
 ### Offline and hosted embeddings
 
 The default `local` embedding provider is deterministic, network-free feature
@@ -194,6 +222,8 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_INDEX_DIRECTORY` | local index directory | `<project>/.cpp-context` |
 | `CPP_CONTEXT_DATABASE` | SQLite file | `<index-directory>/index.db` |
 | `CPP_CONTEXT_COMPILE_COMMANDS` | compilation database | `<project>/build/compile_commands.json` |
+| `CPP_CONTEXT_BUILDS` | comma-separated named databases (`NAME=PATH`) | unset |
+| `CPP_CONTEXT_BUILD_SCOPE` | comma-separated query/MCP build names | `default` |
 | `LIBCLANG_LIBRARY_FILE` | exact compatible native libclang | auto-discovered |
 | `CPP_CONTEXT_MAX_TOKENS` | default packed context budget | `16000` |
 | `CPP_CONTEXT_RETRIEVAL_LIMIT` | candidates per search backend | `20` |

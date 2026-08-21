@@ -64,6 +64,7 @@ def create_app(
                     "path": str(source.path),
                     "start_line": source.start_line,
                     "end_line": source.end_line,
+                    "build_variant": source.build_variant,
                 }
                 for source in response.sources
             ],
@@ -81,6 +82,8 @@ def _serialize_context(bundle: ContextBundle) -> dict[str, Any]:
         "items": [
             {
                 "symbol_id": item.hit.symbol.id,
+                "variant_id": item.hit.symbol.variant_id,
+                "build_variant": item.hit.symbol.build_variant,
                 "qualified_name": item.hit.symbol.qualified_name,
                 "kind": item.hit.symbol.kind.value,
                 "path": str(item.hit.symbol.span.path),
