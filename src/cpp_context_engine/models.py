@@ -136,6 +136,8 @@ class TranslationUnit:
     dependencies: tuple[tuple[Path, str], ...] = ()
     diagnostics: tuple[str, ...] = ()
     build_variant: str = DEFAULT_BUILD_VARIANT
+    analysis_backend: str = "unknown"
+    advanced_facts_complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,12 +185,14 @@ class SymbolOccurrence:
     translation_unit_id: str = ""
     build_configuration_id: str = ""
     build_variant: str = DEFAULT_BUILD_VARIANT
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.id.strip():
             raise ValueError("occurrence id must not be empty")
         if not self.symbol_id.strip():
             raise ValueError("occurrence symbol id must not be empty")
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 @dataclass(frozen=True, slots=True)

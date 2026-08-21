@@ -14,6 +14,42 @@ export LIBCLANG_LIBRARY_FILE=/usr/lib/llvm-18/lib/libclang.so
 The library also searches common LLVM installation directories. The Python
 binding and native library must have compatible major versions.
 
+## Full Clang-18 analyzer companion
+
+The optional `native/clang-analyzer` executable uses Clang LibTooling's full AST,
+`SourceManager`, and `PPCallbacks`. Configure it with CMake's installed LLVM and
+Clang package files, then select it explicitly:
+
+```bash
+cmake -S native/clang-analyzer -B build/clang-analyzer \
+  -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+  -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang
+cmake --build build/clang-analyzer
+cpp-context doctor --clang-analyzer build/clang-analyzer/cpp-context-clang-analyzer
+cpp-context index /workspace/project \
+  --clang-analyzer build/clang-analyzer/cpp-context-clang-analyzer
+```
+
+Protocol 1 is newline-delimited JSON. A process must receive `hello` first and
+returns `hello` with analyzer version, Clang major, and capabilities. An analysis
+then returns `begin`, zero or more `fact` records, and `complete`. Fact records
+are `file`, `symbol`, `occurrence`, `edge`, and `include`; references use stable
+USR or location-derived keys that the Python adapter converts to canonical IDs.
+Macro expansions carry independent `spelling_span` and `expansion_span` objects.
+Symbols can carry `template_kind`, `template_arguments`,
+`is_lambda_call_operator`, and `stable_lambda_key` metadata.
+
+Only stdout is protocol data. Native diagnostics use stderr. The adapter accepts
+no command string, invokes no shell, confines fact paths to the project, validates
+the handshake before analysis, and enforces operator-owned timeout and byte
+limits. This companion currently supports Linux and exactly Clang major 18.
+
+The libclang path remains a baseline fallback. Baseline symbols and occurrences
+are explicitly marked `analysis_backend=libclang-baseline` and
+`advanced_facts_complete=false`; selecting a validated companion invalidates and
+reindexes such translation units. CFG, indirect calls, and dataflow remain out of
+scope until their dedicated analysis stages are implemented.
+
 ## Indexing from Python
 
 ```python

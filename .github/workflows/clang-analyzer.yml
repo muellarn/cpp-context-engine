@@ -1,0 +1,42 @@
+name: Clang analyzer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-and-clang-18:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Clang 18 development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends clang-18 libclang-18-dev llvm-18-dev
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install Python package
+        run: python -m pip install -e '.[dev,clang,api,mcp]'
+      - name: Configure companion
+        run: >-
+          cmake -S native/clang-analyzer -B build/clang-analyzer
+          -DCMAKE_BUILD_TYPE=Release
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang
+      - run: cmake --build build/clang-analyzer --parallel 2
+      - name: Verify Python and native integration
+        env:
+          CPP_CONTEXT_TEST_ANALYZER: ${{ github.workspace }}/build/clang-analyzer/cpp-context-clang-analyzer
+          LIBCLANG_LIBRARY_FILE: /usr/lib/llvm-18/lib/libclang.so
+        run: |
+          ruff format --check .
+          ruff check .
+          pytest -s
+          python -m compileall -q src tests

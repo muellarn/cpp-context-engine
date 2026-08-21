@@ -1,0 +1,15 @@
+[
+  {
+    "directory": ".",
+    "file": "src/analysis.cpp",
+    "arguments": [
+      "clang++",
+      "-std=c++20",
+      "-Iinclude",
+      "-c",
+      "src/analysis.cpp",
+      "-o",
+      "analysis.o"
+    ]
+  }
+]

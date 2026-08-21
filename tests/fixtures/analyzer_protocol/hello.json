@@ -1,0 +1,22 @@
+{
+  "analyzer_version": "0.1.0",
+  "capabilities": [
+    "direct_calls",
+    "full_ast",
+    "includes",
+    "inherits",
+    "lambda_metadata",
+    "macro_provenance",
+    "occurrences",
+    "overrides",
+    "pp_callbacks",
+    "source_manager",
+    "symbols",
+    "template_metadata",
+    "uses_type"
+  ],
+  "clang_major": 18,
+  "protocol": "cpp-context-clang-facts",
+  "protocol_version": 1,
+  "type": "hello"
+}

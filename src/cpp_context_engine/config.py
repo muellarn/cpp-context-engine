@@ -20,6 +20,11 @@ class AppConfig:
     build_variants: tuple[BuildVariant, ...] = ()
     build_scope: BuildScope = field(default_factory=BuildScope.single)
     libclang_library_file: Path | None = None
+    clang_analyzer_path: Path | None = None
+    analyzer_timeout_seconds: float = 30.0
+    analyzer_max_input_bytes: int = 1_048_576
+    analyzer_max_output_bytes: int = 67_108_864
+    analyzer_max_stderr_bytes: int = 262_144
     max_context_tokens: int = 16_000
     retrieval_limit: int = 20
     embedding_provider: str = "local"
@@ -63,6 +68,12 @@ class AppConfig:
                 "libclang_library_file",
                 self.libclang_library_file.expanduser().resolve(strict=False),
             )
+        if self.clang_analyzer_path is not None:
+            object.__setattr__(
+                self,
+                "clang_analyzer_path",
+                self.clang_analyzer_path.expanduser().resolve(strict=False),
+            )
         if self.embedding_provider not in {"local", "openai"}:
             raise ValueError("embedding provider must be 'local' or 'openai'")
         if (
@@ -79,6 +90,16 @@ class AppConfig:
             raise ValueError("serve port must not exceed 65535")
         if self.provider_timeout_seconds <= 0:
             raise ValueError("provider timeout must be positive")
+        if (
+            self.analyzer_timeout_seconds <= 0
+            or min(
+                self.analyzer_max_input_bytes,
+                self.analyzer_max_output_bytes,
+                self.analyzer_max_stderr_bytes,
+            )
+            <= 0
+        ):
+            raise ValueError("analyzer timeout and byte limits must be positive")
 
     @classmethod
     def from_environment(cls, *, cwd: Path | None = None) -> AppConfig:
@@ -95,6 +116,17 @@ class AppConfig:
             build_variants=_build_variants_env(),
             build_scope=_build_scope_env(),
             libclang_library_file=_optional_path_env("LIBCLANG_LIBRARY_FILE"),
+            clang_analyzer_path=_optional_path_env("CPP_CONTEXT_CLANG_ANALYZER"),
+            analyzer_timeout_seconds=_positive_float("CPP_CONTEXT_ANALYZER_TIMEOUT", 30.0),
+            analyzer_max_input_bytes=_positive_int(
+                "CPP_CONTEXT_ANALYZER_MAX_INPUT_BYTES", 1_048_576
+            ),
+            analyzer_max_output_bytes=_positive_int(
+                "CPP_CONTEXT_ANALYZER_MAX_OUTPUT_BYTES", 67_108_864
+            ),
+            analyzer_max_stderr_bytes=_positive_int(
+                "CPP_CONTEXT_ANALYZER_MAX_STDERR_BYTES", 262_144
+            ),
             max_context_tokens=_positive_int("CPP_CONTEXT_MAX_TOKENS", 16_000),
             retrieval_limit=_positive_int("CPP_CONTEXT_RETRIEVAL_LIMIT", 20),
             embedding_provider=os.getenv("CPP_CONTEXT_EMBEDDING_PROVIDER", "local").casefold(),

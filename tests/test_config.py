@@ -25,6 +25,19 @@ def test_environment_configuration_rejects_non_positive_limit(tmp_path, monkeypa
         AppConfig.from_environment(cwd=tmp_path)
 
 
+def test_environment_loads_native_analyzer_and_limits(tmp_path, monkeypatch) -> None:
+    binary = tmp_path / "analyzer"
+    monkeypatch.setenv("CPP_CONTEXT_CLANG_ANALYZER", str(binary))
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_TIMEOUT", "12.5")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_OUTPUT_BYTES", "4096")
+
+    config = AppConfig.from_environment(cwd=tmp_path)
+
+    assert config.clang_analyzer_path == binary
+    assert config.analyzer_timeout_seconds == 12.5
+    assert config.analyzer_max_output_bytes == 4096
+
+
 def test_environment_loads_provider_configuration_without_exposing_secrets(
     tmp_path, monkeypatch
 ) -> None:

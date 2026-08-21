@@ -6,7 +6,13 @@ from dataclasses import dataclass
 
 from cpp_context_engine.api import ContextRetrievalService, IterativeAnswerService
 from cpp_context_engine.config import AppConfig
-from cpp_context_engine.ingestion import ClangIngestor, IndexingResult, ProjectIndexer
+from cpp_context_engine.ingestion import (
+    ClangIngestor,
+    IndexingResult,
+    NativeAnalyzerClient,
+    NativeClangIngestor,
+    ProjectIndexer,
+)
 from cpp_context_engine.llm import LLMProvider, OpenAICompatibleProvider
 from cpp_context_engine.models import BuildScope
 from cpp_context_engine.retrieval import HybridRetriever, RetrievalConfig
@@ -26,6 +32,9 @@ class IndexOperationResult:
     indexing: IndexingResult
     embedded_symbols: int
     embedding_model: str
+    analysis_backend: str = "libclang-baseline"
+    advanced_facts_complete: bool = False
+    analyzer_capabilities: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -89,7 +98,24 @@ def index_project(config: AppConfig) -> IndexOperationResult:
     with SQLiteStore(
         config.database_path, project_root=config.project_root, build_scope=scope
     ) as store:
-        ingestor = ClangIngestor(library_file=config.libclang_library_file)
+        if config.clang_analyzer_path is not None:
+            client = NativeAnalyzerClient(
+                config.clang_analyzer_path,
+                timeout_seconds=config.analyzer_timeout_seconds,
+                max_input_bytes=config.analyzer_max_input_bytes,
+                max_output_bytes=config.analyzer_max_output_bytes,
+                max_stderr_bytes=config.analyzer_max_stderr_bytes,
+            )
+            info = client.probe()
+            ingestor = NativeClangIngestor(client)
+            analysis_backend = "clang-libtooling"
+            advanced_complete = True
+            capabilities = tuple(sorted(info.capabilities))
+        else:
+            ingestor = ClangIngestor(library_file=config.libclang_library_file)
+            analysis_backend = "libclang-baseline"
+            advanced_complete = False
+            capabilities = ()
         results = tuple(
             ProjectIndexer(ingestor, store).index(
                 config.project_root,
@@ -116,7 +142,14 @@ def index_project(config: AppConfig) -> IndexOperationResult:
             provider.model_id, config.project_root, build_scope=scope
         )
         vector_search.index(missing)
-        return IndexOperationResult(indexing, len(missing), provider.model_id)
+        return IndexOperationResult(
+            indexing,
+            len(missing),
+            provider.model_id,
+            analysis_backend,
+            advanced_complete,
+            capabilities,
+        )
 
 
 def build_runtime(
