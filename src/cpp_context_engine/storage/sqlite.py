@@ -761,7 +761,8 @@ class SQLiteStore:
                 "UPDATE translation_units SET advanced_facts_complete = 0 "
                 "WHERE analysis_backend = 'clang-libtooling'"
             )
-            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            # Pin this migration's boundary: a later migration may still roll back.
+            self._connection.execute("PRAGMA user_version = 6")
         except BaseException:
             self._connection.rollback()
             raise

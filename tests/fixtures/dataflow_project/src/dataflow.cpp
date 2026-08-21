@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 namespace dataflow_fixture {
 
 int target_a(int value) { return value + 1; }
@@ -62,12 +64,34 @@ int conditional_pointer(int value, bool choose) {
   return selected(value);
 }
 
+int nullable_pointer(int value, bool choose) {
+  Function selected = choose ? &target_a : nullptr;
+  return selected(value);
+}
+
+int external_pointer(int value) {
+  Function selected = &std::abs;
+  return selected(value);
+}
+
 int null_pointer(int value) {
   Function selected = nullptr;
   return selected(value);
 }
 
 int unknown_pointer(Function selected, int value) { return selected(value); }
+
+int partial_definition(bool choose) {
+  int value;
+  if (choose)
+    value = 1;
+  return value;
+}
+
+int const_pointer_alias(const int &value) {
+  const int *pointer = &value;
+  return *pointer;
+}
 
 using MemberFunction = int (Handler::*)(int);
 

@@ -320,19 +320,22 @@ struct PointsToValue {
   std::set<const clang::FunctionDecl *> functions;
   std::set<std::string> locations;
   bool complete = true;
+  bool includesNull = false;
 
   bool operator==(const PointsToValue &other) const {
     return functions == other.functions && locations == other.locations &&
-           complete == other.complete;
+           complete == other.complete && includesNull == other.includesNull;
   }
 };
 
 struct DataFlowState {
   std::map<std::string, std::set<std::string>> definitions;
+  std::map<std::string, bool> definitionsComplete;
   std::map<std::string, PointsToValue> pointsTo;
 
   bool operator==(const DataFlowState &other) const {
-    return definitions == other.definitions && pointsTo == other.pointsTo;
+    return definitions == other.definitions &&
+           definitionsComplete == other.definitionsComplete && pointsTo == other.pointsTo;
   }
 };
 
@@ -1091,9 +1094,8 @@ private:
         return false;
       if (type->isReferenceType() || type->isMemberFunctionPointerType())
         return true;
-      if (const auto *pointer = type->getAs<clang::PointerType>())
-        return pointer->getPointeeType()->isFunctionType() ||
-               !pointer->getPointeeType().isConstQualified();
+      if (type->getAs<clang::PointerType>())
+        return true;
       return false;
     };
     const auto qualifyLocation = [&](MemoryLocationRecord &record, clang::QualType type) {
@@ -1373,9 +1375,7 @@ private:
               addAccess(currentBlockKey, elementKey, location, "initialization", statement,
                         initializer);
             } else {
-              auto &access = addAccess(currentBlockKey, elementKey, location, "initialization",
-                                       statement, nullptr);
-              access.pointsToComplete = !locations.at(location).tracksPointsTo;
+              // A declaration without an initializer is not a reaching definition.
               if (locations.at(location).tracksPointsTo)
                 incompleteReasons.insert("uninitialized_pointer_or_reference");
             }
@@ -1533,21 +1533,27 @@ private:
                                                      std::min(remaining, functions.size()));
     };
 
+    const auto functionTarget = [&](const clang::FunctionDecl *target) {
+      const bool indexed = source_.relative(target->getLocation()).has_value();
+      if (!indexed)
+        incompleteReasons.insert("external_indirect_target");
+      return PointsToValue{{target}, {}, indexed, false};
+    };
     std::function<PointsToValue(const clang::Expr *, const DataFlowState &)> evaluatePointsTo;
     evaluatePointsTo = [&](const clang::Expr *raw, const DataFlowState &state) -> PointsToValue {
       if (!raw)
-        return PointsToValue{{}, {}, false};
+        return PointsToValue{{}, {}, false, false};
       const auto *expression = raw->IgnoreParenImpCasts();
       if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(expression)) {
         if (const auto *target = llvm::dyn_cast<clang::FunctionDecl>(reference->getDecl()))
-          return PointsToValue{{target}, {}, true};
+          return functionTarget(target);
         if (const auto *value = llvm::dyn_cast<clang::ValueDecl>(reference->getDecl())) {
           const auto location = locationForDecl(value);
           if (const auto found = state.pointsTo.find(location); found != state.pointsTo.end())
             return found->second;
           if (!tracksPointsTo(value->getType()))
-            return PointsToValue{{}, {location}, true};
-          return PointsToValue{{}, {}, false};
+            return PointsToValue{{}, {location}, true, false};
+          return PointsToValue{{}, {}, false, false};
         }
       }
       if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(expression);
@@ -1555,13 +1561,13 @@ private:
         const auto *operand = unary->getSubExpr()->IgnoreParenImpCasts();
         if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(operand)) {
           if (const auto *target = llvm::dyn_cast<clang::FunctionDecl>(reference->getDecl()))
-            return PointsToValue{{target}, {}, true};
+            return functionTarget(target);
         }
         if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(operand)) {
           if (const auto *target = llvm::dyn_cast<clang::FunctionDecl>(member->getMemberDecl()))
-            return PointsToValue{{target}, {}, true};
+            return functionTarget(target);
         }
-        return PointsToValue{{}, {locationForLValue(operand)}, true};
+        return PointsToValue{{}, {locationForLValue(operand)}, true, false};
       }
       if (const auto *conditional = llvm::dyn_cast<clang::ConditionalOperator>(expression)) {
         auto left = evaluatePointsTo(conditional->getTrueExpr(), state);
@@ -1569,6 +1575,7 @@ private:
         left.functions.insert(right.functions.begin(), right.functions.end());
         left.locations.insert(right.locations.begin(), right.locations.end());
         left.complete = left.complete && right.complete;
+        left.includesNull = left.includesNull || right.includesNull;
         capPointsTo(left);
         return left;
       }
@@ -1579,16 +1586,16 @@ private:
       if (llvm::isa<clang::CXXNullPtrLiteralExpr, clang::GNUNullExpr>(expression) ||
           (llvm::isa<clang::IntegerLiteral>(expression) &&
            llvm::cast<clang::IntegerLiteral>(expression)->getValue() == 0))
-        return PointsToValue{{}, {}, true};
+        return PointsToValue{{}, {}, true, true};
       if (const auto *lambda = llvm::dyn_cast<clang::LambdaExpr>(expression))
-        return PointsToValue{{lambda->getCallOperator()}, {}, true};
+        return functionTarget(lambda->getCallOperator());
       if (llvm::isa<clang::CXXReinterpretCastExpr>(expression))
         incompleteReasons.insert("reinterpret_cast");
       if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(expression);
           binary && (binary->getOpcode() == clang::BO_Add ||
                      binary->getOpcode() == clang::BO_Sub))
         incompleteReasons.insert("pointer_arithmetic");
-      return PointsToValue{{}, {}, false};
+      return PointsToValue{{}, {}, false, false};
     };
 
     const auto isDefinition = [](llvm::StringRef kind) {
@@ -1603,6 +1610,7 @@ private:
         if (!isDefinition(access.kind))
           continue;
         state.definitions[access.locationKey] = {access.key};
+        state.definitionsComplete[access.locationKey] = true;
         const auto location = locations.find(access.locationKey);
         if (location != locations.end() && location->second.tracksPointsTo) {
           const bool referenceHandle =
@@ -1613,7 +1621,7 @@ private:
             continue;
           auto value = access.assignedExpression
                            ? evaluatePointsTo(access.assignedExpression, state)
-                           : PointsToValue{{}, {}, access.pointsToComplete};
+                           : PointsToValue{{}, {}, access.pointsToComplete, false};
           state.pointsTo[access.locationKey] = std::move(value);
         }
       }
@@ -1629,11 +1637,24 @@ private:
           states.push_back(&found->second);
       }
       std::set<std::string> pointLocations;
+      std::set<std::string> definitionLocations;
       for (const auto *state : states) {
-        for (const auto &[location, definitions] : state->definitions)
+        for (const auto &[location, definitions] : state->definitions) {
           joined.definitions[location].insert(definitions.begin(), definitions.end());
+          definitionLocations.insert(location);
+        }
+        for (const auto &[location, _] : state->definitionsComplete)
+          definitionLocations.insert(location);
         for (const auto &[location, _] : state->pointsTo)
           pointLocations.insert(location);
+      }
+      for (const auto &location : definitionLocations) {
+        bool complete = states.size() == incoming.size();
+        for (const auto *state : states) {
+          const auto found = state->definitionsComplete.find(location);
+          complete = complete && found != state->definitionsComplete.end() && found->second;
+        }
+        joined.definitionsComplete[location] = complete;
       }
       for (const auto &location : pointLocations) {
         PointsToValue destination;
@@ -1648,6 +1669,7 @@ private:
           destination.locations.insert(found->second.locations.begin(),
                                        found->second.locations.end());
           destination.complete = destination.complete && found->second.complete;
+          destination.includesNull = destination.includesNull || found->second.includesNull;
         }
         capPointsTo(destination);
         joined.pointsTo.emplace(location, std::move(destination));
@@ -1747,18 +1769,22 @@ private:
         }
         auto definitions = state.definitions[access.locationKey];
         if (!isDefinition(access.kind)) {
-          const auto certainty = definitions.size() == 1 ? "certain" : "possible";
+          const bool complete = state.definitionsComplete[access.locationKey];
+          if (!complete)
+            incompleteReasons.insert("reaching_definition_incomplete");
+          const auto certainty = complete && definitions.size() == 1 ? "certain" : "possible";
           for (const auto &definition : definitions)
             emitAccessEvidence("reaching_definition", certainty,
-                               definitions.size() == 1
+                               complete && definitions.size() == 1
                                    ? "one definition reaches this use on every modeled path"
                                    : "this definition reaches the use on at least one CFG path",
                                definition, access.key, access.statement);
         } else {
-          const auto certainty = definitions.size() == 1 ? "certain" : "possible";
+          const bool complete = state.definitionsComplete[access.locationKey];
+          const auto certainty = complete && definitions.size() == 1 ? "certain" : "possible";
           for (const auto &definition : definitions)
             emitAccessEvidence("overwrites", certainty,
-                               definitions.size() == 1
+                               complete && definitions.size() == 1
                                    ? "this definition is the unique reaching prior value"
                                    : "this definition is one of multiple reaching prior values",
                                definition, access.key, access.statement);
@@ -1769,7 +1795,9 @@ private:
             location->second.kind == "dereference") {
           const auto aliases = state.pointsTo.find(location->second.baseKey);
           if (aliases != state.pointsTo.end()) {
-            const bool must = aliases->second.complete && aliases->second.locations.size() == 1;
+            const bool must = aliases->second.complete && !aliases->second.includesNull &&
+                              aliases->second.functions.empty() &&
+                              aliases->second.locations.size() == 1;
             for (const auto &target : aliases->second.locations)
               emitAliasEvidence(must ? "must_alias" : "may_alias",
                                 must ? "certain" : "possible",
@@ -1781,6 +1809,7 @@ private:
 
         if (isDefinition(access.kind)) {
           state.definitions[access.locationKey] = {access.key};
+          state.definitionsComplete[access.locationKey] = true;
           if (location != locations.end() && location->second.tracksPointsTo) {
             const bool referenceHandle =
                 (location->second.kind == "local" || location->second.kind == "parameter") &&
@@ -1790,10 +1819,11 @@ private:
               continue;
             auto value = access.assignedExpression
                              ? evaluatePointsTo(access.assignedExpression, state)
-                             : PointsToValue{{}, {}, access.pointsToComplete};
+                             : PointsToValue{{}, {}, access.pointsToComplete, false};
             access.pointees.assign(value.functions.begin(), value.functions.end());
             access.pointsToComplete = value.complete;
-            const bool must = value.complete && value.locations.size() == 1;
+            const bool must = value.complete && !value.includesNull &&
+                              value.functions.empty() && value.locations.size() == 1;
             for (const auto &target : value.locations)
               emitAliasEvidence(must ? "must_alias" : "may_alias",
                                 must ? "certain" : "possible",
@@ -1827,7 +1857,8 @@ private:
                  {"callsite_key", callsiteKey},
                  {"target_set_complete", complete},
                  {"unresolved_reason", complete ? "" : "points_to_set_incomplete"}});
-      const bool certain = complete && value.functions.size() == 1;
+      // A nullable singleton is still only a possible runtime target.
+      const bool certain = complete && !value.includesNull && value.functions.size() == 1;
       for (const auto *target : value.functions) {
         if (!source_.relative(target->getLocation())) {
           incompleteReasons.insert("external_indirect_target");

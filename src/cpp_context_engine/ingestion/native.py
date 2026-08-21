@@ -404,7 +404,9 @@ class _FactBatchBuilder:
         self.data_flow_analysis_ids: dict[str, str] = {}
         self.data_flow_analysis_graph_ids: dict[str, str] = {}
         self.memory_location_ids: dict[str, str] = {}
+        self.memory_location_analysis_ids: dict[str, str] = {}
         self.data_access_ids: dict[str, str] = {}
+        self.data_access_analysis_ids: dict[str, str] = {}
 
     def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
         for fact in facts:
@@ -479,10 +481,12 @@ class _FactBatchBuilder:
             key = _string(fact, "key")
             analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
             self.memory_location_ids[key] = "memory_" + _hash_text(analysis_id, key)[:32]
+            self.memory_location_analysis_ids[key] = analysis_id
         for fact in access_facts:
             key = _string(fact, "key")
             analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
             self.data_access_ids[key] = "access_" + _hash_text(analysis_id, key)[:32]
+            self.data_access_analysis_ids[key] = analysis_id
 
         for fact in (*location_facts, *access_facts):
             analysis_key = _string(fact, "analysis_key")
@@ -491,7 +495,20 @@ class _FactBatchBuilder:
                 raise AnalyzerProtocolError(
                     "analyzer data-flow facts have inconsistent graph references"
                 )
+        # Individual SQLite FKs cannot prove that referenced rows belong to this analysis.
+        for fact in location_facts:
+            analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+            base_key = fact.get("base_key")
+            if base_key and self.memory_location_analysis_ids.get(str(base_key)) != analysis_id:
+                raise AnalyzerProtocolError(
+                    "analyzer data-flow facts have inconsistent analysis references"
+                )
         for fact in access_facts:
+            analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+            if self.memory_location_analysis_ids.get(_string(fact, "location_key")) != analysis_id:
+                raise AnalyzerProtocolError(
+                    "analyzer data-flow facts have inconsistent analysis references"
+                )
             graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
             if self.cfg_block_graph_ids.get(_string(fact, "block_key")) != graph_id:
                 raise AnalyzerProtocolError(
@@ -503,34 +520,38 @@ class _FactBatchBuilder:
                     "analyzer data-flow facts have inconsistent graph references"
                 )
 
-        analyses = tuple(
-            sorted(
-                (self._data_flow_analysis_fact(fact) for fact in analysis_facts),
-                key=lambda item: item.id,
+        try:
+            analyses = tuple(
+                sorted(
+                    (self._data_flow_analysis_fact(fact) for fact in analysis_facts),
+                    key=lambda item: item.id,
+                )
             )
-        )
-        locations = tuple(
-            sorted(
-                (self._memory_location_fact(fact) for fact in location_facts),
-                key=lambda item: (item.analysis_id, item.kind.value, item.name, item.id),
+            locations = tuple(
+                sorted(
+                    (self._memory_location_fact(fact) for fact in location_facts),
+                    key=lambda item: (item.analysis_id, item.kind.value, item.name, item.id),
+                )
             )
-        )
-        accesses = tuple(
-            sorted(
-                (self._data_access_fact(fact) for fact in access_facts),
-                key=lambda item: (item.analysis_id, item.block_id, item.sequence, item.id),
+            accesses = tuple(
+                sorted(
+                    (self._data_access_fact(fact) for fact in access_facts),
+                    key=lambda item: (item.analysis_id, item.block_id, item.sequence, item.id),
+                )
             )
-        )
-        evidence = tuple(
-            sorted(
-                (
-                    self._data_flow_evidence_fact(fact)
-                    for fact in facts
-                    if fact.get("fact") == "data_flow_evidence_v1"
-                ),
-                key=lambda item: (item.analysis_id, item.relation.value, item.id),
+            evidence = tuple(
+                sorted(
+                    (
+                        self._data_flow_evidence_fact(fact)
+                        for fact in facts
+                        if fact.get("fact") == "data_flow_evidence_v1"
+                    ),
+                    key=lambda item: (item.analysis_id, item.relation.value, item.id),
+                )
             )
-        )
+        except ValueError as error:
+            # Invalid enums and model invariants are malformed protocol-v4 facts.
+            raise AnalyzerProtocolError("analyzer returned an invalid data-flow fact") from error
         return analyses, locations, accesses, evidence
 
     def _data_flow_analysis_fact(self, fact: Mapping[str, Any]) -> DataFlowAnalysis:
@@ -634,11 +655,35 @@ class _FactBatchBuilder:
             raise AnalyzerProtocolError(
                 "analyzer data-flow facts have inconsistent graph references"
             )
+        relation = DataFlowRelation(_string(fact, "relation"))
+        access_keys = (source_access_key, target_access_key)
+        location_keys = (source_location_key, target_location_key)
+        if relation in {
+            DataFlowRelation.REACHING_DEFINITION,
+            DataFlowRelation.OVERWRITES,
+        }:
+            valid_pair = all(access_keys) and not any(location_keys)
+        else:
+            valid_pair = all(location_keys) and not any(access_keys)
+        if not valid_pair:
+            raise AnalyzerProtocolError("analyzer data-flow evidence relation is invalid")
+        if any(
+            self.data_access_analysis_ids.get(str(value)) != analysis_id
+            for value in access_keys
+            if value
+        ) or any(
+            self.memory_location_analysis_ids.get(str(value)) != analysis_id
+            for value in location_keys
+            if value
+        ):
+            raise AnalyzerProtocolError(
+                "analyzer data-flow facts have inconsistent analysis references"
+            )
         return DataFlowEvidence(
             id="evidence_" + _hash_text(analysis_id, key)[:32],
             analysis_id=analysis_id,
             graph_id=graph_id,
-            relation=DataFlowRelation(_string(fact, "relation")),
+            relation=relation,
             certainty=DataFlowCertainty(_string(fact, "certainty")),
             reason=_string(fact, "reason"),
             source_access_id=(
