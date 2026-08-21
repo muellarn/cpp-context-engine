@@ -16,8 +16,15 @@ from typing import TYPE_CHECKING
 
 from cpp_context_engine.models import (
     DEFAULT_BUILD_VARIANT,
+    BoundedCfgResult,
     BuildScope,
     BuildVariant,
+    CfgBlock,
+    CfgBlockRole,
+    CfgEdge,
+    CfgEdgeKind,
+    CfgElement,
+    CfgGraph,
     CodeSymbol,
     GraphDirection,
     GraphEdge,
@@ -33,7 +40,8 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+MAX_CFG_PAGE_SIZE = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +298,8 @@ class SQLiteStore:
             self._migrate_v3()
         if current <= 3:
             self._migrate_v4()
+        if current <= 4:
+            self._migrate_v5()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -526,6 +536,138 @@ class SQLiteStore:
                 "ALTER TABLE translation_units "
                 "ADD COLUMN advanced_facts_complete INTEGER NOT NULL DEFAULT 0"
             )
+            self._connection.execute("PRAGMA user_version = 4")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _migrate_v5(self) -> None:
+        """Add versioned, build-scoped CFG facts without overloading symbol tables."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            _execute_script(
+                self._connection,
+                """
+                CREATE TABLE cfg_graphs (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    function_symbol_id TEXT NOT NULL,
+                    entry_block_id TEXT NOT NULL,
+                    normal_exit_block_id TEXT NOT NULL,
+                    exceptional_exit_block_id TEXT,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    clang_major INTEGER NOT NULL,
+                    fact_schema_version INTEGER NOT NULL,
+                    build_options_json TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (
+                        project_id, build_variant, build_configuration_id,
+                        translation_unit_id, function_symbol_id
+                    ),
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, function_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE cfg_blocks (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    block_index INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    reachable INTEGER NOT NULL,
+                    terminator_kind TEXT NOT NULL,
+                    terminator_text TEXT NOT NULL,
+                    terminator_spelling_span_json TEXT,
+                    terminator_expansion_span_json TEXT,
+                    label_kind TEXT NOT NULL,
+                    label_text TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, graph_id, block_index),
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE cfg_elements (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    block_id TEXT NOT NULL,
+                    element_index INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    statement_class TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    spelling_span_json TEXT,
+                    expansion_span_json TEXT,
+                    metadata_json TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    UNIQUE (project_id, block_id, element_index),
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, block_id)
+                        REFERENCES cfg_blocks(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE cfg_edges (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    source_block_id TEXT NOT NULL,
+                    target_block_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    successor_index INTEGER NOT NULL,
+                    feasible INTEGER NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, graph_id)
+                        REFERENCES cfg_graphs(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, source_block_id)
+                        REFERENCES cfg_blocks(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, target_block_id)
+                        REFERENCES cfg_blocks(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX cfg_graphs_function_scope
+                    ON cfg_graphs(project_id, function_symbol_id, build_variant, id);
+                CREATE INDEX cfg_graphs_tu
+                    ON cfg_graphs(project_id, translation_unit_id);
+                CREATE INDEX cfg_blocks_graph_order
+                    ON cfg_blocks(project_id, graph_id, block_index, id);
+                CREATE INDEX cfg_elements_graph_order
+                    ON cfg_elements(project_id, graph_id, block_id, element_index, id);
+                CREATE INDEX cfg_edges_graph_order
+                    ON cfg_edges(
+                        project_id, graph_id, source_block_id, successor_index,
+                        target_block_id, kind, id
+                    );
+                """,
+            )
+            # Native v4 rows predate CFG facts but otherwise looked "advanced complete".
+            # Downgrading only those rows forces one normal companion reindex.
+            self._connection.execute(
+                "UPDATE translation_units SET advanced_facts_complete = 0 "
+                "WHERE analysis_backend = 'clang-libtooling'"
+            )
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except BaseException:
             self._connection.rollback()
@@ -681,6 +823,13 @@ class SQLiteStore:
                 self._put_symbol_variant(project_id, symbol)
             self._put_occurrences(project_id, batch.occurrences)
             self._put_edges(project_id, batch.edges)
+            self._put_cfg_facts(
+                project_id,
+                batch.cfg_graphs,
+                batch.cfg_blocks,
+                batch.cfg_elements,
+                batch.cfg_edges,
+            )
             self._refresh_symbols(
                 project_id, affected_symbols | {symbol.id for symbol in batch.symbols}
             )
@@ -1141,6 +1290,126 @@ class SQLiteStore:
             ),
         )
 
+    def _put_cfg_facts(
+        self,
+        project_id: int,
+        graphs: Iterable[CfgGraph],
+        blocks: Iterable[CfgBlock],
+        elements: Iterable[CfgElement],
+        edges: Iterable[CfgEdge],
+    ) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO cfg_graphs(
+                project_id, id, function_symbol_id, entry_block_id,
+                normal_exit_block_id, exceptional_exit_block_id,
+                translation_unit_id, build_configuration_id, build_variant,
+                clang_major, fact_schema_version, build_options_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    graph.id,
+                    graph.function_symbol_id,
+                    graph.entry_block_id,
+                    graph.normal_exit_block_id,
+                    graph.exceptional_exit_block_id,
+                    graph.translation_unit_id,
+                    graph.build_configuration_id,
+                    graph.build_variant,
+                    graph.clang_major,
+                    graph.fact_schema_version,
+                    json.dumps(dict(graph.build_options), sort_keys=True),
+                )
+                for graph in graphs
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO cfg_blocks(
+                project_id, id, graph_id, block_index, role, reachable,
+                terminator_kind, terminator_text,
+                terminator_spelling_span_json, terminator_expansion_span_json,
+                label_kind, label_text, translation_unit_id,
+                build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    block.id,
+                    block.graph_id,
+                    block.index,
+                    block.role.value,
+                    int(block.reachable),
+                    block.terminator_kind,
+                    block.terminator_text,
+                    _span_json(block.terminator_spelling_span),
+                    _span_json(block.terminator_expansion_span),
+                    block.label_kind,
+                    block.label_text,
+                    block.translation_unit_id,
+                    block.build_configuration_id,
+                    block.build_variant,
+                )
+                for block in blocks
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO cfg_elements(
+                project_id, id, graph_id, block_id, element_index, kind,
+                statement_class, text, spelling_span_json, expansion_span_json,
+                metadata_json, translation_unit_id, build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    element.id,
+                    element.graph_id,
+                    element.block_id,
+                    element.index,
+                    element.kind,
+                    element.statement_class,
+                    element.text,
+                    _span_json(element.spelling_span),
+                    _span_json(element.expansion_span),
+                    json.dumps(dict(element.metadata), sort_keys=True),
+                    element.translation_unit_id,
+                    element.build_configuration_id,
+                    element.build_variant,
+                )
+                for element in elements
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO cfg_edges(
+                project_id, id, graph_id, source_block_id, target_block_id,
+                kind, successor_index, feasible, translation_unit_id,
+                build_configuration_id, build_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    edge.id,
+                    edge.graph_id,
+                    edge.source_block_id,
+                    edge.target_block_id,
+                    edge.kind.value,
+                    edge.successor_index,
+                    int(edge.feasible),
+                    edge.translation_unit_id,
+                    edge.build_configuration_id,
+                    edge.build_variant,
+                )
+                for edge in edges
+            ),
+        )
+
     def translation_unit_states(
         self,
         project_root: Path | None = None,
@@ -1310,6 +1579,216 @@ class SQLiteStore:
             build_variant=row["build_variant"],
             variant_id=row["id"],
             metadata=symbol.metadata,
+        )
+
+    def cfg_graphs(
+        self,
+        function_symbol_id: str | None = None,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> BoundedCfgResult[CfgGraph]:
+        """Return build-specific function CFGs in stable order with explicit truncation."""
+
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        function_sql = ""
+        parameters: list[object] = [project_id, *names]
+        if function_symbol_id is not None:
+            function_sql = " AND function_symbol_id = ?"
+            parameters.append(function_symbol_id)
+        parameters.append(limit + 1)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM cfg_graphs
+            WHERE project_id = ? AND build_variant IN ({placeholders}){function_sql}
+            ORDER BY build_variant, build_configuration_id, translation_unit_id,
+                     function_symbol_id, id
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_cfg_graph(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def get_cfg_graph(
+        self,
+        graph_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> CfgGraph | None:
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        row = self._connection.execute(
+            f"""
+            SELECT * FROM cfg_graphs
+            WHERE project_id = ? AND id = ? AND build_variant IN ({placeholders})
+            """,
+            (project_id, graph_id, *names),
+        ).fetchone()
+        return self._row_to_cfg_graph(row) if row else None
+
+    def cfg_blocks(
+        self,
+        graph_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 1_000,
+    ) -> BoundedCfgResult[CfgBlock]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM cfg_blocks
+            WHERE project_id = ? AND graph_id = ? AND build_variant IN ({placeholders})
+            ORDER BY block_index, id LIMIT ?
+            """,
+            (project_id, graph_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_cfg_block(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def cfg_elements(
+        self,
+        graph_id: str,
+        project_root: Path | None = None,
+        *,
+        block_id: str | None = None,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 2_000,
+    ) -> BoundedCfgResult[CfgElement]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        block_sql = ""
+        parameters: list[object] = [project_id, graph_id, *names]
+        if block_id is not None:
+            block_sql = " AND elements.block_id = ?"
+            parameters.append(block_id)
+        parameters.append(limit + 1)
+        rows = self._connection.execute(
+            f"""
+            SELECT elements.* FROM cfg_elements elements
+            JOIN cfg_blocks blocks
+              ON blocks.project_id = elements.project_id AND blocks.id = elements.block_id
+            WHERE elements.project_id = ? AND elements.graph_id = ?
+              AND elements.build_variant IN ({placeholders}){block_sql}
+            ORDER BY blocks.block_index, elements.element_index, elements.id LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_cfg_element(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    def cfg_edges(
+        self,
+        graph_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        limit: int = 2_000,
+    ) -> BoundedCfgResult[CfgEdge]:
+        limit = _cfg_limit(limit)
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT edges.* FROM cfg_edges edges
+            JOIN cfg_blocks source
+              ON source.project_id = edges.project_id AND source.id = edges.source_block_id
+            JOIN cfg_blocks target
+              ON target.project_id = edges.project_id AND target.id = edges.target_block_id
+            WHERE edges.project_id = ? AND edges.graph_id = ?
+              AND edges.build_variant IN ({placeholders})
+            ORDER BY source.block_index, edges.successor_index, target.block_index,
+                     edges.kind, edges.feasible DESC, edges.id
+            LIMIT ?
+            """,
+            (project_id, graph_id, *names, limit + 1),
+        ).fetchall()
+        return BoundedCfgResult(
+            tuple(self._row_to_cfg_edge(row) for row in rows[:limit]), len(rows) > limit
+        )
+
+    @staticmethod
+    def _row_to_cfg_graph(row: sqlite3.Row) -> CfgGraph:
+        return CfgGraph(
+            id=row["id"],
+            function_symbol_id=row["function_symbol_id"],
+            entry_block_id=row["entry_block_id"],
+            normal_exit_block_id=row["normal_exit_block_id"],
+            exceptional_exit_block_id=row["exceptional_exit_block_id"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+            clang_major=row["clang_major"],
+            fact_schema_version=row["fact_schema_version"],
+            build_options=json.loads(row["build_options_json"]),
+        )
+
+    @staticmethod
+    def _row_to_cfg_block(row: sqlite3.Row) -> CfgBlock:
+        return CfgBlock(
+            id=row["id"],
+            graph_id=row["graph_id"],
+            index=row["block_index"],
+            role=CfgBlockRole(row["role"]),
+            reachable=bool(row["reachable"]),
+            terminator_kind=row["terminator_kind"],
+            terminator_text=row["terminator_text"],
+            terminator_spelling_span=_span_from_json(row["terminator_spelling_span_json"]),
+            terminator_expansion_span=_span_from_json(row["terminator_expansion_span_json"]),
+            label_kind=row["label_kind"],
+            label_text=row["label_text"],
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+        )
+
+    @staticmethod
+    def _row_to_cfg_element(row: sqlite3.Row) -> CfgElement:
+        return CfgElement(
+            id=row["id"],
+            graph_id=row["graph_id"],
+            block_id=row["block_id"],
+            index=row["element_index"],
+            kind=row["kind"],
+            statement_class=row["statement_class"],
+            text=row["text"],
+            spelling_span=_span_from_json(row["spelling_span_json"]),
+            expansion_span=_span_from_json(row["expansion_span_json"]),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    @staticmethod
+    def _row_to_cfg_edge(row: sqlite3.Row) -> CfgEdge:
+        return CfgEdge(
+            id=row["id"],
+            graph_id=row["graph_id"],
+            source_block_id=row["source_block_id"],
+            target_block_id=row["target_block_id"],
+            kind=CfgEdgeKind(row["kind"]),
+            successor_index=row["successor_index"],
+            feasible=bool(row["feasible"]),
+            translation_unit_id=row["translation_unit_id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
         )
 
     def occurrences(
@@ -1764,6 +2243,40 @@ def _validate_vector(vector: Sequence[float]) -> tuple[float, ...]:
     if not any(value != 0.0 for value in values):
         raise ValueError("embedding vector magnitude must be greater than zero")
     return values
+
+
+def _cfg_limit(limit: int) -> int:
+    if not 1 <= limit <= MAX_CFG_PAGE_SIZE:
+        raise ValueError(f"CFG page limit must be between 1 and {MAX_CFG_PAGE_SIZE}")
+    return limit
+
+
+def _span_json(span: SourceSpan | None) -> str | None:
+    if span is None:
+        return None
+    return json.dumps(
+        {
+            "path": str(span.path),
+            "start_line": span.start_line,
+            "end_line": span.end_line,
+            "start_column": span.start_column,
+            "end_column": span.end_column,
+        },
+        sort_keys=True,
+    )
+
+
+def _span_from_json(payload: str | None) -> SourceSpan | None:
+    if payload is None:
+        return None
+    value = json.loads(payload)
+    return SourceSpan(
+        Path(value["path"]),
+        value["start_line"],
+        value["end_line"],
+        value["start_column"],
+        value["end_column"],
+    )
 
 
 def _stable_id(prefix: str, *parts: str) -> str:

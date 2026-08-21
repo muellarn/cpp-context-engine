@@ -30,7 +30,12 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
           -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang
-      - run: cmake --build build/clang-analyzer --parallel 2
+      - run: cmake --build build/clang-analyzer --config Release --parallel 2
+      - name: Verify native protocol and CFG fixtures
+        env:
+          CPP_CONTEXT_TEST_ANALYZER: ${{ github.workspace }}/build/clang-analyzer/cpp-context-clang-analyzer
+          LIBCLANG_LIBRARY_FILE: /usr/lib/llvm-18/lib/libclang.so
+        run: pytest -s tests/test_native_analyzer.py
       - name: Verify Python and native integration
         env:
           CPP_CONTEXT_TEST_ANALYZER: ${{ github.workspace }}/build/clang-analyzer/cpp-context-clang-analyzer

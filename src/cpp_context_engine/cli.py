@@ -219,6 +219,7 @@ def _doctor(config: AppConfig, *, as_json: bool) -> int:
         "clang_analyzer_clang_major": None,
         "clang_analyzer_capabilities": [],
         "advanced_facts_complete": False,
+        "cfg_facts_available": False,
         "analysis_backend": "libclang-baseline",
     }
     analyzer_ok = True
@@ -245,6 +246,7 @@ def _doctor(config: AppConfig, *, as_json: bool) -> int:
                     "clang_analyzer_clang_major": info.clang_major,
                     "clang_analyzer_capabilities": sorted(info.capabilities),
                     "advanced_facts_complete": True,
+                    "cfg_facts_available": "function_cfg_v1" in info.capabilities,
                     "analysis_backend": "clang-libtooling",
                 }
             )

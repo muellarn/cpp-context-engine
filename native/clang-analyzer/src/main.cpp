@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -12,6 +13,7 @@
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/ParentMapContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/Analysis/CFG.h"
 #include "clang/Basic/Version.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
@@ -22,6 +24,7 @@
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -31,11 +34,12 @@ namespace {
 static_assert(CLANG_VERSION_MAJOR == 18, "cpp-context-clang-analyzer requires Clang 18");
 
 constexpr llvm::StringLiteral kProtocol = "cpp-context-clang-facts";
-constexpr std::int64_t kProtocolVersion = 1;
+constexpr std::int64_t kProtocolVersion = 2;
 constexpr std::int64_t kClangMajor = 18;
 
 const std::vector<std::string> kCapabilities = {
-    "direct_calls",       "full_ast",          "includes",
+    "direct_calls",       "full_ast",          "function_cfg_v1",
+    "includes",
     "inherits",           "lambda_metadata",   "macro_provenance",
     "occurrences",        "overrides",         "pp_callbacks",
     "source_manager",     "symbols",           "template_metadata",
@@ -360,6 +364,15 @@ public:
     return true;
   }
 
+  bool VisitFunctionDecl(clang::FunctionDecl *function) {
+    if (!function->isThisDeclarationADefinition() || !function->hasBody() ||
+        !source_.relative(function->getLocation()) ||
+        (function->isImplicit() && !isRequiredImplicit(function)))
+      return true;
+    emitCFG(function);
+    return true;
+  }
+
   bool VisitCallExpr(clang::CallExpr *expression) {
     auto *callee = expression->getDirectCallee();
     auto *owner = enclosingCallable(expression);
@@ -434,6 +447,318 @@ public:
   }
 
 private:
+  static clang::CFG::BuildOptions cfgBuildOptions(const clang::LangOptions &language) {
+    clang::CFG::BuildOptions options;
+    options.PruneTriviallyFalseEdges = false;
+    options.AddEHEdges = language.CXXExceptions;
+    options.AddInitializers = true;
+    options.AddImplicitDtors = true;
+    options.AddLifetime = true;
+    options.AddLoopExit = true;
+    options.AddTemporaryDtors = true;
+    options.AddScopes = true;
+    options.AddStaticInitBranches = true;
+    options.AddCXXNewAllocator = true;
+    options.AddCXXDefaultInitExprInCtors = true;
+    options.AddCXXDefaultInitExprInAggregates = true;
+    options.AddRichCXXConstructors = true;
+    options.MarkElidedCXXConstructors = true;
+    options.AddVirtualBaseBranches = true;
+    options.OmitImplicitValueInitializers = false;
+    options.setAllAlwaysAdd();
+    return options;
+  }
+
+  static llvm::StringRef cfgElementKind(clang::CFGElement::Kind kind) {
+    switch (kind) {
+    case clang::CFGElement::Initializer:
+      return "initializer";
+    case clang::CFGElement::ScopeBegin:
+      return "scope_begin";
+    case clang::CFGElement::ScopeEnd:
+      return "scope_end";
+    case clang::CFGElement::NewAllocator:
+      return "new_allocator";
+    case clang::CFGElement::LifetimeEnds:
+      return "lifetime_end";
+    case clang::CFGElement::LoopExit:
+      return "loop_exit";
+    case clang::CFGElement::Statement:
+      return "statement";
+    case clang::CFGElement::Constructor:
+      return "constructor";
+    case clang::CFGElement::CXXRecordTypedCall:
+      return "record_typed_call";
+    case clang::CFGElement::AutomaticObjectDtor:
+      return "automatic_object_destructor";
+    case clang::CFGElement::DeleteDtor:
+      return "delete_destructor";
+    case clang::CFGElement::BaseDtor:
+      return "base_destructor";
+    case clang::CFGElement::MemberDtor:
+      return "member_destructor";
+    case clang::CFGElement::TemporaryDtor:
+      return "temporary_destructor";
+    case clang::CFGElement::CleanupFunction:
+      return "cleanup_function";
+    }
+    return "unknown";
+  }
+
+  const clang::Stmt *elementStatement(const clang::CFGElement &element) const {
+    if (auto statement = element.getAs<clang::CFGStmt>())
+      return statement->getStmt();
+    if (auto allocator = element.getAs<clang::CFGNewAllocator>())
+      return allocator->getAllocatorExpr();
+    if (auto lifetime = element.getAs<clang::CFGLifetimeEnds>())
+      return lifetime->getTriggerStmt();
+    if (auto loop = element.getAs<clang::CFGLoopExit>())
+      return loop->getLoopStmt();
+    if (auto scope = element.getAs<clang::CFGScopeBegin>())
+      return scope->getTriggerStmt();
+    if (auto scope = element.getAs<clang::CFGScopeEnd>())
+      return scope->getTriggerStmt();
+    if (auto destructor = element.getAs<clang::CFGAutomaticObjDtor>())
+      return destructor->getTriggerStmt();
+    if (auto destructor = element.getAs<clang::CFGDeleteDtor>())
+      return destructor->getDeleteExpr();
+    if (auto destructor = element.getAs<clang::CFGTemporaryDtor>())
+      return destructor->getBindTemporaryExpr();
+    return nullptr;
+  }
+
+  std::optional<clang::SourceRange> elementRange(const clang::CFGElement &element) const {
+    if (const auto *statement = elementStatement(element))
+      return statement->getSourceRange();
+    if (auto initializer = element.getAs<clang::CFGInitializer>())
+      return initializer->getInitializer()->getSourceRange();
+    if (auto destructor = element.getAs<clang::CFGBaseDtor>())
+      return destructor->getBaseSpecifier()->getSourceRange();
+    if (auto destructor = element.getAs<clang::CFGMemberDtor>())
+      return destructor->getFieldDecl()->getSourceRange();
+    if (auto cleanup = element.getAs<clang::CFGCleanupFunction>())
+      return cleanup->getVarDecl()->getSourceRange();
+    return std::nullopt;
+  }
+
+  llvm::json::Object cfgElementMetadata(const clang::CFGElement &element) const {
+    llvm::json::Object metadata{{"implicit", element.getKind() < clang::CFGElement::STMT_BEGIN ||
+                                                element.getKind() > clang::CFGElement::STMT_END}};
+    if (auto initializer = element.getAs<clang::CFGInitializer>()) {
+      const auto *value = initializer->getInitializer();
+      metadata["initializer_kind"] = value->isBaseInitializer()      ? "base"
+                                     : value->isMemberInitializer() ? "member"
+                                     : value->isDelegatingInitializer() ? "delegating"
+                                                                        : "other";
+      if (value->isMemberInitializer())
+        metadata["declaration"] = value->getMember()->getQualifiedNameAsString();
+    } else if (auto lifetime = element.getAs<clang::CFGLifetimeEnds>()) {
+      metadata["declaration"] = lifetime->getVarDecl()->getQualifiedNameAsString();
+    } else if (auto destructor = element.getAs<clang::CFGAutomaticObjDtor>()) {
+      metadata["declaration"] = destructor->getVarDecl()->getQualifiedNameAsString();
+    } else if (auto destructor = element.getAs<clang::CFGMemberDtor>()) {
+      metadata["declaration"] = destructor->getFieldDecl()->getQualifiedNameAsString();
+    } else if (auto cleanup = element.getAs<clang::CFGCleanupFunction>()) {
+      metadata["declaration"] = cleanup->getVarDecl()->getQualifiedNameAsString();
+      metadata["cleanup_function"] =
+          cleanup->getFunctionDecl()->getQualifiedNameAsString();
+    }
+    return metadata;
+  }
+
+  void addRange(llvm::json::Object &fact, clang::SourceRange range,
+                llvm::StringRef spellingName, llvm::StringRef expansionName) const {
+    if (auto spelling = source_.span(range, true))
+      fact[spellingName] = std::move(*spelling);
+    if (auto expansion = source_.span(range, false))
+      fact[expansionName] = std::move(*expansion);
+  }
+
+  static bool blockContains(const clang::CFGBlock &block, clang::Stmt::StmtClass kind) {
+    for (const auto &element : block) {
+      if (auto statement = element.getAs<clang::CFGStmt>();
+          statement && statement->getStmt()->getStmtClass() == kind)
+        return true;
+    }
+    return false;
+  }
+
+  static llvm::StringRef edgeKind(const clang::CFGBlock &source,
+                                  const clang::CFGBlock &target,
+                                  unsigned successorIndex,
+                                  const llvm::SmallPtrSetImpl<const clang::CFGBlock *> &tryBlocks) {
+    const auto *terminator = source.getTerminatorStmt();
+    const auto *label = target.getLabel();
+    if (llvm::isa_and_nonnull<clang::CXXCatchStmt>(label) || tryBlocks.contains(&source) ||
+        tryBlocks.contains(&target) ||
+        blockContains(source, clang::Stmt::CXXThrowExprClass))
+      return "exception";
+    if (llvm::isa_and_nonnull<clang::DefaultStmt>(label))
+      return "default";
+    if (llvm::isa_and_nonnull<clang::CaseStmt>(label))
+      return "case";
+    if (llvm::isa_and_nonnull<clang::BreakStmt>(terminator))
+      return "break";
+    if (llvm::isa_and_nonnull<clang::ContinueStmt>(terminator))
+      return "continue";
+    if (llvm::isa_and_nonnull<clang::GotoStmt, clang::IndirectGotoStmt>(terminator))
+      return "goto";
+    if (blockContains(source, clang::Stmt::ReturnStmtClass))
+      return "return";
+    if (source.getLoopTarget())
+      return "loop_back";
+    if (llvm::isa_and_nonnull<clang::IfStmt, clang::WhileStmt, clang::ForStmt,
+                             clang::DoStmt, clang::ConditionalOperator>(terminator))
+      return successorIndex == 0 ? "true" : "false";
+    if (const auto *binary = llvm::dyn_cast_or_null<clang::BinaryOperator>(terminator);
+        binary && binary->isLogicalOp())
+      return successorIndex == 0 ? "true" : "false";
+    return "fallthrough";
+  }
+
+  void emitCFG(const clang::FunctionDecl *function) {
+    auto body = function->getBody();
+    auto functionKind = llvm::isa<clang::CXXMethodDecl>(function) ? "method" : "function";
+    auto functionKey = source_.declKey(function, functionKind);
+    auto options = cfgBuildOptions(context_.getLangOpts());
+    auto cfg = clang::CFG::buildCFG(function, body, &context_, options);
+    if (!cfg)
+      return;
+
+    emitSymbol(function, functionKind);
+    auto graphKey = "cfg:" + functionKey;
+    auto blockKey = [&](const clang::CFGBlock &block) {
+      return graphKey + ":block:" + std::to_string(block.getBlockID());
+    };
+
+    llvm::SmallPtrSet<const clang::CFGBlock *, 16> tryBlocks;
+    for (const auto *block : cfg->try_blocks())
+      tryBlocks.insert(block);
+
+    llvm::SmallPtrSet<const clang::CFGBlock *, 32> reachable;
+    std::deque<const clang::CFGBlock *> pending{&cfg->getEntry()};
+    reachable.insert(&cfg->getEntry());
+    while (!pending.empty()) {
+      const auto *block = pending.front();
+      pending.pop_front();
+      for (const auto &successor : block->succs()) {
+        const auto *target = successor.getReachableBlock();
+        if (target && reachable.insert(target).second)
+          pending.push_back(target);
+      }
+    }
+
+    llvm::json::Object buildOptions{
+        {"prune_trivially_false_edges", false},
+        {"add_eh_edges", options.AddEHEdges},
+        {"add_initializers", true},
+        {"add_implicit_dtors", true},
+        {"add_lifetime", true},
+        {"add_loop_exit", true},
+        {"add_temporary_dtors", true},
+        {"add_scopes", true},
+        {"add_static_init_branches", true},
+        {"add_cxx_new_allocator", true},
+        {"add_cxx_default_init_expr_in_ctors", true},
+        {"add_cxx_default_init_expr_in_aggregates", true},
+        {"add_rich_cxx_constructors", true},
+        {"mark_elided_cxx_constructors", true},
+        {"add_virtual_base_branches", true},
+        {"omit_implicit_value_initializers", false},
+        {"always_add_all_statements", true}};
+    sink_.add("cfg-graph:" + functionKey,
+              {{"fact", "cfg_graph_v1"},
+               {"key", graphKey},
+               {"function_key", functionKey},
+               {"entry_block_key", blockKey(cfg->getEntry())},
+               {"normal_exit_block_key", blockKey(cfg->getExit())},
+               {"exceptional_exit_block_key", nullptr},
+               {"clang_major", kClangMajor},
+               {"fact_schema_version", 1},
+               {"build_options", std::move(buildOptions)}});
+
+    std::vector<const clang::CFGBlock *> blocks(cfg->begin(), cfg->end());
+    std::sort(blocks.begin(), blocks.end(), [](const auto *left, const auto *right) {
+      return left->getBlockID() < right->getBlockID();
+    });
+    for (const auto *block : blocks) {
+      std::string role = "normal";
+      if (block == &cfg->getEntry())
+        role = "entry";
+      else if (block == &cfg->getExit())
+        role = "normal_exit";
+      llvm::json::Object blockFact{{"fact", "cfg_block_v1"},
+                                   {"key", blockKey(*block)},
+                                   {"graph_key", graphKey},
+                                   {"index", static_cast<std::int64_t>(block->getBlockID())},
+                                   {"role", role},
+                                   {"reachable", reachable.contains(block)}};
+      if (const auto *terminator = block->getTerminatorStmt()) {
+        blockFact["terminator_kind"] = terminator->getStmtClassName();
+        blockFact["terminator_text"] = source_.source(terminator->getSourceRange());
+        addRange(blockFact, terminator->getSourceRange(), "terminator_spelling_span",
+                 "terminator_expansion_span");
+      }
+      if (const auto *label = block->getLabel()) {
+        blockFact["label_kind"] = label->getStmtClassName();
+        blockFact["label_text"] = source_.source(label->getSourceRange());
+      }
+      sink_.add("cfg-block:" + functionKey + ":" +
+                    std::to_string(block->getBlockID()),
+                std::move(blockFact));
+
+      unsigned elementIndex = 0;
+      for (const auto &element : *block) {
+        llvm::json::Object elementFact{
+            {"fact", "cfg_element_v1"},
+            {"key", blockKey(*block) + ":element:" + std::to_string(elementIndex)},
+            {"graph_key", graphKey},
+            {"block_key", blockKey(*block)},
+            {"index", static_cast<std::int64_t>(elementIndex)},
+            {"kind", cfgElementKind(element.getKind())},
+            {"metadata", cfgElementMetadata(element)}};
+        if (const auto *statement = elementStatement(element)) {
+          elementFact["statement_class"] = statement->getStmtClassName();
+          elementFact["text"] = source_.source(statement->getSourceRange());
+        }
+        if (auto range = elementRange(element))
+          addRange(elementFact, *range, "spelling_span", "expansion_span");
+        sink_.add("cfg-element:" + functionKey + ":" +
+                      std::to_string(block->getBlockID()) + ":" +
+                      std::to_string(elementIndex),
+                  std::move(elementFact));
+        ++elementIndex;
+      }
+
+      unsigned successorIndex = 0;
+      for (const auto &successor : block->succs()) {
+        const auto emitEdge = [&](const clang::CFGBlock *target, bool feasible,
+                                  llvm::StringRef suffix) {
+          if (!target)
+            return;
+          const auto kind = edgeKind(*block, *target, successorIndex, tryBlocks);
+          sink_.add("cfg-edge:" + functionKey + ":" +
+                        std::to_string(block->getBlockID()) + ":" +
+                        std::to_string(successorIndex) + ":" + suffix.str() + ":" +
+                        std::to_string(target->getBlockID()),
+                    {{"fact", "cfg_edge_v1"},
+                     {"graph_key", graphKey},
+                     {"source_block_key", blockKey(*block)},
+                     {"target_block_key", blockKey(*target)},
+                     {"kind", kind},
+                     {"successor_index", static_cast<std::int64_t>(successorIndex)},
+                     {"feasible", feasible}});
+        };
+        const auto *reachableTarget = successor.getReachableBlock();
+        emitEdge(reachableTarget, true, "reachable");
+        const auto *alternateTarget = successor.getPossiblyUnreachableBlock();
+        if (alternateTarget != reachableTarget)
+          emitEdge(alternateTarget, false, "unreachable");
+        ++successorIndex;
+      }
+    }
+  }
+
   static bool isRequiredImplicit(const clang::NamedDecl *decl) {
     const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
     return method && method->getParent() && method->getParent()->isLambda() &&

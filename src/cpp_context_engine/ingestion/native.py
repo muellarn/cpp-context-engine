@@ -21,6 +21,12 @@ from cpp_context_engine.ingestion.compilation_database import (
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
+    CfgBlock,
+    CfgBlockRole,
+    CfgEdge,
+    CfgEdgeKind,
+    CfgElement,
+    CfgGraph,
     CodeSymbol,
     GraphEdge,
     GraphRelation,
@@ -32,7 +38,7 @@ from cpp_context_engine.models import (
 )
 
 PROTOCOL = "cpp-context-clang-facts"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 REQUIRED_CLANG_MAJOR = 18
 REQUIRED_CAPABILITIES = frozenset(
     {
@@ -49,6 +55,7 @@ REQUIRED_CAPABILITIES = frozenset(
         "symbols",
         "template_metadata",
         "uses_type",
+        "function_cfg_v1",
     }
 )
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -338,6 +345,10 @@ class NativeClangIngestor:
             symbols=tuple(symbol for batch in batches for symbol in batch.symbols),
             occurrences=tuple(occurrence for batch in batches for occurrence in batch.occurrences),
             edges=tuple(edge for batch in batches for edge in batch.edges),
+            cfg_graphs=tuple(graph for batch in batches for graph in batch.cfg_graphs),
+            cfg_blocks=tuple(block for batch in batches for block in batch.cfg_blocks),
+            cfg_elements=tuple(element for batch in batches for element in batch.cfg_elements),
+            cfg_edges=tuple(edge for batch in batches for edge in batch.cfg_edges),
         )
 
 
@@ -349,6 +360,8 @@ class _FactBatchBuilder:
         self.symbols: dict[str, CodeSymbol] = {}
         self.keys: dict[str, str] = {}
         self.files: dict[str, Path] = {}
+        self.cfg_graph_ids: dict[str, str] = {}
+        self.cfg_block_ids: dict[str, str] = {}
 
     def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
         for fact in facts:
@@ -369,6 +382,7 @@ class _FactBatchBuilder:
                 edge = self._edge_fact(fact)
                 if edge is not None:
                     edges[edge.id] = edge
+        cfg_graphs, cfg_blocks, cfg_elements, cfg_edges = self._cfg_facts(facts)
         dependencies = tuple(
             (path, _hash_bytes(path.read_bytes())) for path in sorted(set(self.files.values()))
         )
@@ -385,10 +399,225 @@ class _FactBatchBuilder:
         return IngestionBatch(
             (self.configuration,),
             (unit,),
-            tuple(self.symbols.values()),
-            tuple(occurrences.values()),
-            tuple(edges.values()),
+            tuple(sorted(self.symbols.values(), key=lambda item: item.id)),
+            tuple(sorted(occurrences.values(), key=lambda item: item.id)),
+            tuple(sorted(edges.values(), key=lambda item: item.id)),
+            (),
+            cfg_graphs,
+            cfg_blocks,
+            cfg_elements,
+            cfg_edges,
         )
+
+    def _cfg_facts(
+        self, facts: Sequence[Mapping[str, Any]]
+    ) -> tuple[
+        tuple[CfgGraph, ...],
+        tuple[CfgBlock, ...],
+        tuple[CfgElement, ...],
+        tuple[CfgEdge, ...],
+    ]:
+        graph_facts = [fact for fact in facts if fact.get("fact") == "cfg_graph_v1"]
+        block_facts = [fact for fact in facts if fact.get("fact") == "cfg_block_v1"]
+        for fact in graph_facts:
+            graph_key = _string(fact, "key")
+            function_id = self._known_id(_string(fact, "function_key"))
+            self.cfg_graph_ids[graph_key] = (
+                "cfg_"
+                + _hash_text(
+                    self.configuration.build_variant,
+                    self.configuration.id,
+                    self.unit_id,
+                    function_id,
+                )[:32]
+            )
+        block_graph_ids: dict[str, str] = {}
+        for fact in block_facts:
+            graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+            index = _non_negative_integer(fact, "index")
+            block_key = _string(fact, "key")
+            block_graph_ids[block_key] = graph_id
+            self.cfg_block_ids[block_key] = "cfg_block_" + _hash_text(graph_id, str(index))[:32]
+
+        # A compromised or mismatched companion must not be able to persist a CFG
+        # relation that crosses graph boundaries while still satisfying SQLite FKs.
+        for fact in graph_facts:
+            graph_id = self._known_cfg_graph(_string(fact, "key"))
+            endpoint_keys = [
+                _string(fact, "entry_block_key"),
+                _string(fact, "normal_exit_block_key"),
+            ]
+            exceptional_key = fact.get("exceptional_exit_block_key")
+            if exceptional_key is not None:
+                if not isinstance(exceptional_key, str) or not exceptional_key:
+                    raise AnalyzerProtocolError("analyzer CFG exceptional exit key is invalid")
+                endpoint_keys.append(exceptional_key)
+            if any(block_graph_ids.get(key) != graph_id for key in endpoint_keys):
+                raise AnalyzerProtocolError("analyzer CFG facts have inconsistent graph references")
+        for fact in facts:
+            fact_kind = fact.get("fact")
+            if fact_kind == "cfg_element_v1":
+                graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+                if block_graph_ids.get(_string(fact, "block_key")) != graph_id:
+                    raise AnalyzerProtocolError(
+                        "analyzer CFG facts have inconsistent graph references"
+                    )
+            elif fact_kind == "cfg_edge_v1":
+                graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+                if any(
+                    block_graph_ids.get(_string(fact, key)) != graph_id
+                    for key in ("source_block_key", "target_block_key")
+                ):
+                    raise AnalyzerProtocolError(
+                        "analyzer CFG facts have inconsistent graph references"
+                    )
+
+        graphs = tuple(
+            sorted((self._cfg_graph_fact(fact) for fact in graph_facts), key=lambda item: item.id)
+        )
+        blocks = tuple(
+            sorted(
+                (self._cfg_block_fact(fact) for fact in block_facts),
+                key=lambda item: (item.graph_id, item.index, item.id),
+            )
+        )
+        elements = tuple(
+            sorted(
+                (
+                    self._cfg_element_fact(fact)
+                    for fact in facts
+                    if fact.get("fact") == "cfg_element_v1"
+                ),
+                key=lambda item: (item.graph_id, item.block_id, item.index, item.id),
+            )
+        )
+        edges = tuple(
+            sorted(
+                (self._cfg_edge_fact(fact) for fact in facts if fact.get("fact") == "cfg_edge_v1"),
+                key=lambda item: (
+                    item.graph_id,
+                    item.source_block_id,
+                    item.successor_index,
+                    item.target_block_id,
+                    item.kind.value,
+                    item.id,
+                ),
+            )
+        )
+        return graphs, blocks, elements, edges
+
+    def _cfg_graph_fact(self, fact: Mapping[str, Any]) -> CfgGraph:
+        graph_id = self._known_cfg_graph(_string(fact, "key"))
+        schema_version = _integer(fact, "fact_schema_version")
+        clang_major = _integer(fact, "clang_major")
+        if schema_version != 1 or clang_major != REQUIRED_CLANG_MAJOR:
+            raise AnalyzerProtocolError("analyzer returned an unsupported CFG fact schema")
+        options = _mapping(fact, "build_options")
+        exceptional_key = fact.get("exceptional_exit_block_key")
+        if exceptional_key is not None and not isinstance(exceptional_key, str):
+            raise AnalyzerProtocolError("analyzer CFG exceptional exit key is invalid")
+        return CfgGraph(
+            id=graph_id,
+            function_symbol_id=self._known_id(_string(fact, "function_key")),
+            entry_block_id=self._known_cfg_block(_string(fact, "entry_block_key")),
+            normal_exit_block_id=self._known_cfg_block(_string(fact, "normal_exit_block_key")),
+            exceptional_exit_block_id=(
+                self._known_cfg_block(exceptional_key) if exceptional_key else None
+            ),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+            clang_major=clang_major,
+            fact_schema_version=schema_version,
+            build_options=dict(options),
+        )
+
+    def _cfg_block_fact(self, fact: Mapping[str, Any]) -> CfgBlock:
+        return CfgBlock(
+            id=self._known_cfg_block(_string(fact, "key")),
+            graph_id=self._known_cfg_graph(_string(fact, "graph_key")),
+            index=_non_negative_integer(fact, "index"),
+            role=CfgBlockRole(_string(fact, "role")),
+            reachable=_boolean(fact, "reachable"),
+            terminator_kind=_optional_string(fact, "terminator_kind"),
+            terminator_text=_optional_string(fact, "terminator_text"),
+            terminator_spelling_span=self._optional_span(fact, "terminator_spelling_span"),
+            terminator_expansion_span=self._optional_span(fact, "terminator_expansion_span"),
+            label_kind=_optional_string(fact, "label_kind"),
+            label_text=_optional_string(fact, "label_text"),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _cfg_element_fact(self, fact: Mapping[str, Any]) -> CfgElement:
+        graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+        block_id = self._known_cfg_block(_string(fact, "block_key"))
+        index = _non_negative_integer(fact, "index")
+        metadata = _mapping(fact, "metadata")
+        return CfgElement(
+            id="cfg_element_" + _hash_text(graph_id, block_id, str(index))[:32],
+            graph_id=graph_id,
+            block_id=block_id,
+            index=index,
+            kind=_string(fact, "kind"),
+            statement_class=_optional_string(fact, "statement_class"),
+            text=_optional_string(fact, "text"),
+            spelling_span=self._optional_span(fact, "spelling_span"),
+            expansion_span=self._optional_span(fact, "expansion_span"),
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+            metadata=dict(metadata),
+        )
+
+    def _cfg_edge_fact(self, fact: Mapping[str, Any]) -> CfgEdge:
+        graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+        source_id = self._known_cfg_block(_string(fact, "source_block_key"))
+        target_id = self._known_cfg_block(_string(fact, "target_block_key"))
+        successor_index = _non_negative_integer(fact, "successor_index")
+        kind = CfgEdgeKind(_string(fact, "kind"))
+        feasible = _boolean(fact, "feasible")
+        return CfgEdge(
+            id="cfg_edge_"
+            + _hash_text(
+                graph_id,
+                source_id,
+                target_id,
+                str(successor_index),
+                kind.value,
+                str(feasible),
+            )[:32],
+            graph_id=graph_id,
+            source_block_id=source_id,
+            target_block_id=target_id,
+            kind=kind,
+            successor_index=successor_index,
+            feasible=feasible,
+            translation_unit_id=self.unit_id,
+            build_configuration_id=self.configuration.id,
+            build_variant=self.configuration.build_variant,
+        )
+
+    def _optional_span(self, fact: Mapping[str, Any], name: str) -> SourceSpan | None:
+        value = fact.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+        return self._span(value)
+
+    def _known_cfg_graph(self, key: str) -> str:
+        try:
+            return self.cfg_graph_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError("analyzer CFG fact references an unknown graph") from error
+
+    def _known_cfg_block(self, key: str) -> str:
+        try:
+            return self.cfg_block_ids[key]
+        except KeyError as error:
+            raise AnalyzerProtocolError("analyzer CFG fact references an unknown block") from error
 
     def _file_fact(self, fact: Mapping[str, Any]) -> None:
         key = _string(fact, "key")
@@ -604,6 +833,20 @@ def _optional_string(record: Mapping[str, Any], name: str) -> str:
 def _integer(record: Mapping[str, Any], name: str) -> int:
     value = record.get(name)
     if not isinstance(value, int) or isinstance(value, bool):
+        raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+    return value
+
+
+def _non_negative_integer(record: Mapping[str, Any], name: str) -> int:
+    value = _integer(record, name)
+    if value < 0:
+        raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
+    return value
+
+
+def _boolean(record: Mapping[str, Any], name: str) -> bool:
+    value = record.get(name)
+    if not isinstance(value, bool):
         raise AnalyzerProtocolError(f"analyzer record has invalid {name}")
     return value
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 DEFAULT_BUILD_VARIANT = "default"
 
@@ -51,6 +51,27 @@ class OccurrenceKind(StrEnum):
     CALL = "call"
     TYPE = "type"
     MACRO_EXPANSION = "macro_expansion"
+
+
+class CfgBlockRole(StrEnum):
+    NORMAL = "normal"
+    ENTRY = "entry"
+    NORMAL_EXIT = "normal_exit"
+    EXCEPTIONAL_EXIT = "exceptional_exit"
+
+
+class CfgEdgeKind(StrEnum):
+    FALLTHROUGH = "fallthrough"
+    TRUE = "true"
+    FALSE = "false"
+    CASE = "case"
+    DEFAULT = "default"
+    LOOP_BACK = "loop_back"
+    BREAK = "break"
+    CONTINUE = "continue"
+    RETURN = "return"
+    GOTO = "goto"
+    EXCEPTION = "exception"
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +214,114 @@ class SymbolOccurrence:
         if not self.symbol_id.strip():
             raise ValueError("occurrence symbol id must not be empty")
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+
+
+@dataclass(frozen=True, slots=True)
+class CfgGraph:
+    """One Clang CFG for one function definition in one concrete build/TU."""
+
+    id: str
+    function_symbol_id: str
+    entry_block_id: str
+    normal_exit_block_id: str
+    exceptional_exit_block_id: str | None = None
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+    clang_major: int = 18
+    fact_schema_version: int = 1
+    build_options: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        required = (
+            self.id,
+            self.function_symbol_id,
+            self.entry_block_id,
+            self.normal_exit_block_id,
+        )
+        if not all(value.strip() for value in required):
+            raise ValueError("CFG graph identifiers must not be empty")
+        object.__setattr__(self, "build_options", MappingProxyType(dict(self.build_options)))
+
+
+@dataclass(frozen=True, slots=True)
+class CfgBlock:
+    id: str
+    graph_id: str
+    index: int
+    role: CfgBlockRole
+    reachable: bool
+    terminator_kind: str = ""
+    terminator_text: str = ""
+    terminator_spelling_span: SourceSpan | None = None
+    terminator_expansion_span: SourceSpan | None = None
+    label_kind: str = ""
+    label_text: str = ""
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.graph_id.strip():
+            raise ValueError("CFG block identifiers must not be empty")
+        if self.index < 0:
+            raise ValueError("CFG block index must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class CfgElement:
+    id: str
+    graph_id: str
+    block_id: str
+    index: int
+    kind: str
+    statement_class: str = ""
+    text: str = ""
+    spelling_span: SourceSpan | None = None
+    expansion_span: SourceSpan | None = None
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.graph_id.strip() or not self.block_id.strip():
+            raise ValueError("CFG element identifiers must not be empty")
+        if self.index < 0 or not self.kind.strip():
+            raise ValueError("CFG elements require a non-negative index and kind")
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+
+
+@dataclass(frozen=True, slots=True)
+class CfgEdge:
+    id: str
+    graph_id: str
+    source_block_id: str
+    target_block_id: str
+    kind: CfgEdgeKind
+    successor_index: int
+    feasible: bool = True
+    translation_unit_id: str = ""
+    build_configuration_id: str = ""
+    build_variant: str = DEFAULT_BUILD_VARIANT
+
+    def __post_init__(self) -> None:
+        required = (self.id, self.graph_id, self.source_block_id, self.target_block_id)
+        if not all(value.strip() for value in required):
+            raise ValueError("CFG edge identifiers must not be empty")
+        if self.successor_index < 0:
+            raise ValueError("CFG successor index must be non-negative")
+
+
+CfgFact = TypeVar("CfgFact")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedCfgResult(Generic[CfgFact]):
+    """A deterministic page whose truncation is explicit to callers."""
+
+    items: tuple[CfgFact, ...]
+    truncated: bool
 
 
 @dataclass(frozen=True, slots=True)

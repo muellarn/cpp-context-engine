@@ -9,6 +9,10 @@ from typing import Protocol
 from cpp_context_engine.models import (
     BuildConfiguration,
     BuildVariant,
+    CfgBlock,
+    CfgEdge,
+    CfgElement,
+    CfgGraph,
     CodeSymbol,
     GraphEdge,
     SymbolOccurrence,
@@ -24,6 +28,10 @@ class IngestionBatch:
     occurrences: tuple[SymbolOccurrence, ...]
     edges: tuple[GraphEdge, ...]
     build_variants: tuple[BuildVariant, ...] = ()
+    cfg_graphs: tuple[CfgGraph, ...] = ()
+    cfg_blocks: tuple[CfgBlock, ...] = ()
+    cfg_elements: tuple[CfgElement, ...] = ()
+    cfg_edges: tuple[CfgEdge, ...] = ()
 
 
 class Ingestor(Protocol):
