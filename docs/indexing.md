@@ -53,6 +53,25 @@ handshake must include `function_cfg_v1`; `cpp-context doctor` exposes that as
 The `intraprocedural_dataflow_v1` and `points_to_v1` capabilities similarly
 produce `data_flow_facts_available=true`.
 
+The handshake advertises optional `gzip_jsonl_v1` transport support without
+changing protocol version 5, fact schemas, or stable IDs. Probes and old clients
+remain plain JSONL. A new client requests gzip only after a plain probe advertised
+it; a new client talking to an old companion therefore remains plain. The native
+sink suppresses duplicate sort keys before serialization and emits first-seen
+facts incrementally through a bounded gzip level-1 writer. The Python adapter
+decompresses and parses fragmented records incrementally into disk-backed
+fact-kind registries. Cross-reference validation and domain construction happen
+only after a matching successful `complete`, so malformed, cancelled, timed-out,
+or limit-exhausted responses cannot produce a durable partial batch.
+
+Compressed wire bytes, decoded bytes, one decoded record, stderr, and wall time
+have independent hard limits. Exhaustion is an indexing error; relational facts
+are never truncated. Companion processes run in a killable process group and are
+joined on cancellation or failure. `CPP_CONTEXT_ANALYZER_MAX_WORKERS` is a hard
+concurrency bound and defaults conservatively to one because per-TU memory varies
+widely. The [large-TU benchmark](benchmarks/large-tu.md) documents the local KiCad
+Clipper reproduction; it is deliberately not a CI workload.
+
 ### Callsites and C++ dispatch
 
 The companion stores every syntactic call separately, including consecutive

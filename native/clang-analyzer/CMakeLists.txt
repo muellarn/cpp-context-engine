@@ -4,6 +4,7 @@ project(cpp_context_clang_analyzer VERSION 0.1.0 LANGUAGES CXX)
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
+find_package(ZLIB REQUIRED)
 
 if(NOT LLVM_VERSION_MAJOR EQUAL 18)
   message(FATAL_ERROR "cpp-context-clang-analyzer requires LLVM and Clang 18")
@@ -20,7 +21,7 @@ target_compile_definitions(cpp-context-clang-analyzer PRIVATE
   ${LLVM_DEFINITIONS_LIST}
   CPP_CONTEXT_ANALYZER_VERSION="${PROJECT_VERSION}"
 )
-target_link_libraries(cpp-context-clang-analyzer PRIVATE clang-cpp LLVM)
+target_link_libraries(cpp-context-clang-analyzer PRIVATE clang-cpp LLVM ZLIB::ZLIB)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(cpp-context-clang-analyzer PRIVATE -Wall -Wextra -Wpedantic)
