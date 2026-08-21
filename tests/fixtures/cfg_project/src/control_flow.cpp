@@ -82,4 +82,13 @@ int lifetime(int value) {
   return 0;
 }
 
+int local_object_macro_ranges(int value) {
+#define LOCAL_CHUNK_SIZE 8
+  int remaining = value;
+  remaining = value - LOCAL_CHUNK_SIZE;
+  value += LOCAL_CHUNK_SIZE;
+#undef LOCAL_CHUNK_SIZE
+  return remaining + value;
+}
+
 } // namespace cfg_fixture

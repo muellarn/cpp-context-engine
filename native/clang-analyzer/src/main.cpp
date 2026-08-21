@@ -235,7 +235,7 @@ public:
       return std::nullopt;
     bool endIsExclusive = false;
     if (!sourceManager_.isWrittenInSameFile(begin, end)) {
-      // A declaration ending in a macro can otherwise combine source and definition files.
+      // Cross-file endpoints use Clang's deterministic use-site range when available.
       auto fileRange = clang::Lexer::makeFileCharRange(
           clang::CharSourceRange::getTokenRange(range), sourceManager_, langOptions_);
       fileRange = clang::Lexer::getAsCharRange(fileRange, sourceManager_, langOptions_);
@@ -245,6 +245,12 @@ public:
       end = fileRange.getEnd();
       endIsExclusive = true;
     }
+    // Independently resolved macro spelling endpoints can share a file while
+    // mixing the use-site begin with a definition-site end. Omitting that
+    // spelling span preserves its separate valid expansion span without
+    // silently reordering or inventing source evidence.
+    if (!isOrderedFileRange(begin, end))
+      return std::nullopt;
     auto candidate = path(begin, spelling);
     if (!candidate || !isProjectPath(*candidate))
       return std::nullopt;
@@ -253,6 +259,8 @@ public:
       if (endToken.isValid())
         end = endToken;
     }
+    if (!isOrderedFileRange(begin, end))
+      return std::nullopt;
     return llvm::json::Object{
         {"path", canonical(*candidate).string()},
         {"start_line", static_cast<std::int64_t>(sourceManager_.getSpellingLineNumber(begin))},
@@ -377,6 +385,14 @@ public:
   }
 
 private:
+  bool isOrderedFileRange(clang::SourceLocation begin, clang::SourceLocation end) const {
+    if (begin.isInvalid() || end.isInvalid())
+      return false;
+    const auto [beginFile, beginOffset] = sourceManager_.getDecomposedLoc(begin);
+    const auto [endFile, endOffset] = sourceManager_.getDecomposedLoc(end);
+    return beginFile.isValid() && beginFile == endFile && beginOffset <= endOffset;
+  }
+
   clang::SourceManager &sourceManager_;
   const clang::LangOptions &langOptions_;
   std::filesystem::path projectRoot_;

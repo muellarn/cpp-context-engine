@@ -473,6 +473,34 @@ def test_real_cfg_snapshot_covers_control_flow_macro_and_lifetime_facts() -> Non
     )
 
 
+def test_cfg_macro_expression_ranges_are_ordered_and_keep_expansion_evidence() -> None:
+    first = _cfg_batch()
+    second = _cfg_batch()
+    graph = _cfg_for(first, "cfg_fixture::local_object_macro_ranges")
+    elements = [element for element in first.cfg_elements if element.graph_id == graph.id]
+    target_text = {
+        "value - LOCAL_CHUNK_SIZE",
+        "value += LOCAL_CHUNK_SIZE",
+    }
+    macro_expressions = [
+        element
+        for element in elements
+        if element.statement_class in {"BinaryOperator", "CompoundAssignOperator"}
+        and element.text in target_text
+    ]
+
+    assert len(macro_expressions) == 2
+    assert all(element.spelling_span is None for element in macro_expressions)
+    assert all(element.expansion_span is not None for element in macro_expressions)
+    assert all(
+        (span.end_line, span.end_column) >= (span.start_line, span.start_column)
+        for element in first.cfg_elements
+        for span in (element.spelling_span, element.expansion_span)
+        if span is not None
+    )
+    assert first == second
+
+
 def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(tmp_path: Path) -> None:
     first = _cfg_batch()
     second = _cfg_batch()
