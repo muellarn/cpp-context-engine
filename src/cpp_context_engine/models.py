@@ -428,7 +428,7 @@ class CallSite:
     id: str
     owner_symbol_id: str
     dispatch_kind: CallDispatchKind
-    spelling_span: SourceSpan
+    spelling_span: SourceSpan | None
     expansion_span: SourceSpan
     target_set_complete: bool
     static_target_symbol_id: str | None = None

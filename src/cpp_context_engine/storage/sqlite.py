@@ -2265,7 +2265,9 @@ class SQLiteStore:
                     site.id,
                     site.owner_symbol_id,
                     site.dispatch_kind.value,
-                    _span_json(site.spelling_span),
+                    # Schema v6 requires a JSON payload; JSON null preserves a
+                    # truthful missing spelling span without rebuilding the table.
+                    _span_json(site.spelling_span) or "null",
                     _span_json(site.expansion_span),
                     json.dumps(
                         [
@@ -3490,7 +3492,7 @@ class SQLiteStore:
             id=row["id"],
             owner_symbol_id=row["owner_symbol_id"],
             dispatch_kind=CallDispatchKind(row["dispatch_kind"]),
-            spelling_span=_required_span_from_json(row["spelling_span_json"]),
+            spelling_span=_span_from_json(row["spelling_span_json"]),
             expansion_span=_required_span_from_json(row["expansion_span_json"]),
             target_set_complete=bool(row["target_set_complete"]),
             static_target_symbol_id=row["static_target_symbol_id"],
@@ -4610,6 +4612,8 @@ def _span_from_json(payload: str | None) -> SourceSpan | None:
     if payload is None:
         return None
     value = json.loads(payload)
+    if value is None:
+        return None
     return _span_from_payload(value)
 
 

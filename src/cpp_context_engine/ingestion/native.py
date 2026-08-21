@@ -1359,8 +1359,9 @@ class _FactBatchBuilder:
         for fact in site_facts:
             key = _string(fact, "key")
             owner_id = self._known_id(_string(fact, "owner_key"))
-            spelling = self._span(_mapping(fact, "spelling_span"))
+            spelling = self._optional_span(fact, "spelling_span")
             expansion = self._span(_mapping(fact, "expansion_span"))
+            spelling_identity = spelling or expansion
             self.callsite_ids[key] = (
                 "callsite_"
                 + _hash_text(
@@ -1368,11 +1369,11 @@ class _FactBatchBuilder:
                     self.configuration.id,
                     self.unit_id,
                     owner_id,
-                    str(spelling.path),
-                    str(spelling.start_line),
-                    str(spelling.start_column),
-                    str(spelling.end_line),
-                    str(spelling.end_column),
+                    str(spelling_identity.path),
+                    str(spelling_identity.start_line),
+                    str(spelling_identity.start_column),
+                    str(spelling_identity.end_line),
+                    str(spelling_identity.end_column),
                     str(expansion.path),
                     str(expansion.start_line),
                     str(expansion.start_column),
@@ -1432,7 +1433,7 @@ class _FactBatchBuilder:
             id=self._known_callsite(key),
             owner_symbol_id=self._known_id(_string(fact, "owner_key")),
             dispatch_kind=CallDispatchKind(_string(fact, "dispatch_kind")),
-            spelling_span=self._span(_mapping(fact, "spelling_span")),
+            spelling_span=self._optional_span(fact, "spelling_span"),
             expansion_span=self._span(_mapping(fact, "expansion_span")),
             target_set_complete=_boolean(fact, "target_set_complete"),
             static_target_symbol_id=(self._known_id(static_key) if static_key else None),
