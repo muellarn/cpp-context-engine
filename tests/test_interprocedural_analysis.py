@@ -21,10 +21,18 @@ from cpp_context_engine.ingestion.native import _FactBatchBuilder
 from cpp_context_engine.models import (
     BuildScope,
     BuildVariant,
+    CallArgumentBinding,
+    CallDispatchKind,
+    CallSite,
+    CallTarget,
     CallTargetCertainty,
+    DataFlowCertainty,
+    FunctionSummary,
     InterproceduralFlowKind,
     MemoryLocationKind,
     SearchQuery,
+    SourceSpan,
+    SummaryEffect,
     SummaryEffectKind,
 )
 from cpp_context_engine.storage import SQLiteStore
@@ -61,6 +69,325 @@ def _summary(batch, name: str):
 
 def _effects(batch, summary):
     return [effect for effect in batch.summary_effects if effect.summary_id == summary.id]
+
+
+def test_body_variants_consume_only_their_own_callsites() -> None:
+    span = SourceSpan(Path("synthetic.cpp"), 1, 1)
+
+    def summary(identity: str, function: str, unit: str, configuration: str) -> FunctionSummary:
+        return FunctionSummary(
+            id=identity,
+            function_symbol_id=function,
+            graph_id=f"graph-{identity}",
+            analysis_id=f"analysis-{identity}",
+            parameter_modes=(),
+            parameter_location_ids=(),
+            local_complete=True,
+            local_incomplete_reasons=(),
+            complete=True,
+            incomplete_reasons=(),
+            recursive=False,
+            iteration_count=0,
+            max_scc_iterations=32,
+            max_scc_size=128,
+            max_summary_effects=1024,
+            translation_unit_id=unit,
+            build_configuration_id=configuration,
+        )
+
+    caller_a = summary("caller-a", "shared-caller", "tu-a", "config-a")
+    caller_b = summary("caller-b", "shared-caller", "tu-b", "config-b")
+    callee_a = summary("callee-a", "target-a", "tu-target-a", "config-target-a")
+    callee_b = summary("callee-b", "target-b", "tu-target-b", "config-target-b")
+    site_a = CallSite(
+        "site-a",
+        "shared-caller",
+        CallDispatchKind.DIRECT,
+        span,
+        span,
+        True,
+        translation_unit_id="tu-a",
+        build_configuration_id="config-a",
+    )
+    site_b = CallSite(
+        "site-b",
+        "shared-caller",
+        CallDispatchKind.DIRECT,
+        span,
+        span,
+        True,
+        translation_unit_id="tu-b",
+        build_configuration_id="config-b",
+    )
+    target_a = CallTarget(
+        "target-edge-a",
+        site_a.id,
+        callee_a.function_symbol_id,
+        CallTargetCertainty.CERTAIN,
+        1.0,
+        "direct target",
+        "direct",
+        span,
+        translation_unit_id="tu-a",
+        build_configuration_id="config-a",
+    )
+    target_b = CallTarget(
+        "target-edge-b",
+        site_b.id,
+        callee_b.function_symbol_id,
+        CallTargetCertainty.CERTAIN,
+        1.0,
+        "direct target",
+        "direct",
+        span,
+        translation_unit_id="tu-b",
+        build_configuration_id="config-b",
+    )
+    effect_a = SummaryEffect(
+        "effect-a",
+        callee_a.id,
+        SummaryEffectKind.WRITE,
+        MemoryLocationKind.GLOBAL,
+        DataFlowCertainty.CERTAIN,
+        "writes global a",
+    )
+    effect_b = SummaryEffect(
+        "effect-b",
+        callee_b.id,
+        SummaryEffectKind.WRITE,
+        MemoryLocationKind.GLOBAL,
+        DataFlowCertainty.CERTAIN,
+        "writes global b",
+    )
+
+    solution = solve_interprocedural(
+        (caller_a, caller_b, callee_a, callee_b),
+        (effect_a, effect_b),
+        (),
+        (),
+        (),
+        (site_a, site_b),
+        (target_a, target_b),
+    )
+    propagated = {
+        summary_id: {
+            effect.target_symbol_id
+            for effect in solution.effects
+            if effect.summary_id == summary_id and not effect.is_local
+        }
+        for summary_id in (caller_a.id, caller_b.id)
+    }
+
+    assert propagated == {caller_a.id: {"target-a"}, caller_b.id: {"target-b"}}
+
+
+def test_callee_body_resolution_prefers_same_tu_and_downgrades_odr_ambiguity() -> None:
+    span = SourceSpan(Path("synthetic.cpp"), 1, 1)
+
+    def summary(identity: str, function: str, unit: str, configuration: str) -> FunctionSummary:
+        return FunctionSummary(
+            id=identity,
+            function_symbol_id=function,
+            graph_id=f"graph-{identity}",
+            analysis_id=f"analysis-{identity}",
+            parameter_modes=(),
+            parameter_location_ids=(),
+            local_complete=True,
+            local_incomplete_reasons=(),
+            complete=True,
+            incomplete_reasons=(),
+            recursive=False,
+            iteration_count=0,
+            max_scc_iterations=32,
+            max_scc_size=128,
+            max_summary_effects=1024,
+            translation_unit_id=unit,
+            build_configuration_id=configuration,
+        )
+
+    same_tu_caller = summary("same-tu-caller", "same-tu-caller", "tu-a", "config-a")
+    ambiguous_caller = summary("ambiguous-caller", "ambiguous-caller", "tu-c", "config-c")
+    body_a = summary("body-a", "shared-target", "tu-a", "config-a")
+    body_b = summary("body-b", "shared-target", "tu-b", "config-b")
+    same_tu_site = CallSite(
+        "same-tu-site",
+        same_tu_caller.function_symbol_id,
+        CallDispatchKind.DIRECT,
+        span,
+        span,
+        True,
+        translation_unit_id="tu-a",
+        build_configuration_id="config-a",
+    )
+    ambiguous_site = CallSite(
+        "ambiguous-site",
+        ambiguous_caller.function_symbol_id,
+        CallDispatchKind.DIRECT,
+        span,
+        span,
+        True,
+        translation_unit_id="tu-c",
+        build_configuration_id="config-c",
+    )
+    targets = tuple(
+        CallTarget(
+            f"target-{site.id}",
+            site.id,
+            "shared-target",
+            CallTargetCertainty.CERTAIN,
+            1.0,
+            "direct target",
+            "direct",
+            span,
+            translation_unit_id=site.translation_unit_id,
+            build_configuration_id=site.build_configuration_id,
+        )
+        for site in (same_tu_site, ambiguous_site)
+    )
+    effects = (
+        SummaryEffect(
+            "effect-a",
+            body_a.id,
+            SummaryEffectKind.WRITE,
+            MemoryLocationKind.GLOBAL,
+            DataFlowCertainty.CERTAIN,
+            "body a",
+            source_access_id="source-a",
+        ),
+        SummaryEffect(
+            "effect-b",
+            body_b.id,
+            SummaryEffectKind.WRITE,
+            MemoryLocationKind.GLOBAL,
+            DataFlowCertainty.CERTAIN,
+            "body b",
+            source_access_id="source-b",
+        ),
+    )
+
+    solution = solve_interprocedural(
+        (same_tu_caller, ambiguous_caller, body_a, body_b),
+        effects,
+        (),
+        (),
+        (),
+        (same_tu_site, ambiguous_site),
+        targets,
+    )
+    summaries = {item.id: item for item in solution.summaries}
+    same_tu_effects = [item for item in solution.effects if item.summary_id == same_tu_caller.id]
+    ambiguous_effects = [
+        item for item in solution.effects if item.summary_id == ambiguous_caller.id
+    ]
+
+    assert {item.source_access_id for item in same_tu_effects} == {"source-a"}
+    assert summaries[same_tu_caller.id].complete
+    assert {item.source_access_id for item in ambiguous_effects} == {"source-a", "source-b"}
+    assert all(item.certainty == DataFlowCertainty.POSSIBLE for item in ambiguous_effects)
+    assert "multiple_callee_body_variants" in summaries[ambiguous_caller.id].incomplete_reasons
+
+
+def test_incomplete_argument_binding_makes_the_caller_summary_incomplete() -> None:
+    span = SourceSpan(Path("synthetic.cpp"), 1, 1)
+    caller = FunctionSummary(
+        "caller",
+        "caller-function",
+        "caller-graph",
+        "caller-analysis",
+        (),
+        (),
+        True,
+        (),
+        True,
+        (),
+        False,
+        0,
+        32,
+        128,
+        1024,
+        translation_unit_id="caller-tu",
+        build_configuration_id="caller-config",
+    )
+    callee = FunctionSummary(
+        "callee",
+        "callee-function",
+        "callee-graph",
+        "callee-analysis",
+        ("reference",),
+        ("callee-parameter",),
+        True,
+        (),
+        True,
+        (),
+        False,
+        0,
+        32,
+        128,
+        1024,
+        translation_unit_id="callee-tu",
+        build_configuration_id="callee-config",
+    )
+    site = CallSite(
+        "site",
+        caller.function_symbol_id,
+        CallDispatchKind.DIRECT,
+        span,
+        span,
+        True,
+        translation_unit_id=caller.translation_unit_id,
+        build_configuration_id=caller.build_configuration_id,
+    )
+    target = CallTarget(
+        "target",
+        site.id,
+        callee.function_symbol_id,
+        CallTargetCertainty.CERTAIN,
+        1.0,
+        "direct target",
+        "direct",
+        span,
+        translation_unit_id=site.translation_unit_id,
+        build_configuration_id=site.build_configuration_id,
+    )
+    binding = CallArgumentBinding(
+        "binding",
+        caller.id,
+        site.id,
+        0,
+        None,
+        MemoryLocationKind.UNKNOWN,
+        None,
+        (),
+        True,
+        False,
+        "unknown_argument_storage",
+        translation_unit_id=site.translation_unit_id,
+        build_configuration_id=site.build_configuration_id,
+    )
+    effect = SummaryEffect(
+        "callee-write",
+        callee.id,
+        SummaryEffectKind.WRITE,
+        MemoryLocationKind.PARAMETER,
+        DataFlowCertainty.CERTAIN,
+        "writes parameter",
+        parameter_index=0,
+        location_id="callee-parameter",
+    )
+
+    solution = solve_interprocedural(
+        (caller, callee),
+        (effect,),
+        (),
+        (binding,),
+        (),
+        (site,),
+        (target,),
+    )
+    solved_caller = next(item for item in solution.summaries if item.id == caller.id)
+
+    assert not solved_caller.complete
+    assert "incomplete_call_argument_binding" in solved_caller.incomplete_reasons
 
 
 def test_real_two_hop_summaries_propagate_arguments_returns_and_side_effects() -> None:
@@ -247,6 +574,42 @@ def test_v5_adapter_rejects_cross_analysis_summary_references() -> None:
     facts[facts.index(effect)] = malformed
 
     with pytest.raises(AnalyzerProtocolError, match="inconsistent analysis references"):
+        _FactBatchBuilder(FIXTURE.resolve(), configuration).build(facts)
+
+
+def test_v5_adapter_rejects_malformed_summary_body_and_parameter_references() -> None:
+    configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
+    original = list(_client().analyze(FIXTURE, configuration))
+    summaries = [fact for fact in original if fact.get("fact") == "function_summary_v1"]
+    assert len(summaries) >= 2
+
+    foreign_parameter = dict(summaries[0])
+    foreign_parameter["parameter_location_keys"] = [
+        summaries[1]["parameter_location_keys"][0],
+        *foreign_parameter["parameter_location_keys"][1:],
+    ]
+    facts = list(original)
+    facts[facts.index(summaries[0])] = foreign_parameter
+    with pytest.raises(AnalyzerProtocolError, match="inconsistent analysis references"):
+        _FactBatchBuilder(FIXTURE.resolve(), configuration).build(facts)
+
+    foreign_body = dict(summaries[0])
+    foreign_body["function_key"] = summaries[1]["function_key"]
+    facts = list(original)
+    facts[facts.index(summaries[0])] = foreign_body
+    with pytest.raises(AnalyzerProtocolError, match="inconsistent graph references"):
+        _FactBatchBuilder(FIXTURE.resolve(), configuration).build(facts)
+
+    effect = next(
+        fact
+        for fact in original
+        if fact.get("fact") == "summary_effect_v1" and "parameter_index" in fact
+    )
+    invalid_index = dict(effect)
+    invalid_index["parameter_index"] = 10_000
+    facts = list(original)
+    facts[facts.index(effect)] = invalid_index
+    with pytest.raises(AnalyzerProtocolError, match="parameter index"):
         _FactBatchBuilder(FIXTURE.resolve(), configuration).build(facts)
 
 

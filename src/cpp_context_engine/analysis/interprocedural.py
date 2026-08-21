@@ -151,9 +151,11 @@ def _solve_variant(
     summaries_by_function: dict[str, list[FunctionSummary]] = defaultdict(list)
     for summary in summaries:
         summaries_by_function[summary.function_symbol_id].append(summary)
-    sites_by_owner: dict[str, list[CallSite]] = defaultdict(list)
+    sites_by_owner: dict[tuple[str, str, str], list[CallSite]] = defaultdict(list)
     for site in callsites:
-        sites_by_owner[site.owner_symbol_id].append(site)
+        sites_by_owner[
+            (site.owner_symbol_id, site.translation_unit_id, site.build_configuration_id)
+        ].append(site)
     targets_by_site: dict[str, list[CallTarget]] = defaultdict(list)
     for target in targets:
         targets_by_site[target.callsite_id].append(target)
@@ -162,14 +164,46 @@ def _solve_variant(
     }
     result_by_pair = {(item.caller_summary_id, item.callsite_id): item for item in result_bindings}
 
+    def owner_sites(caller: FunctionSummary) -> tuple[CallSite, ...]:
+        # One canonical symbol can have different inline/ODR bodies in several TUs.
+        # Mixing their callsites would invent effects that do not occur in this body.
+        return tuple(
+            sites_by_owner.get(
+                (
+                    caller.function_symbol_id,
+                    caller.translation_unit_id,
+                    caller.build_configuration_id,
+                ),
+                (),
+            )
+        )
+
+    def callee_bodies(
+        caller: FunctionSummary, target: CallTarget
+    ) -> tuple[tuple[FunctionSummary, ...], bool]:
+        candidates = tuple(
+            sorted(summaries_by_function.get(target.target_symbol_id, ()), key=lambda item: item.id)
+        )
+        same_tu = tuple(
+            item
+            for item in candidates
+            if item.translation_unit_id == caller.translation_unit_id
+            and item.build_configuration_id == caller.build_configuration_id
+        )
+        selected = same_tu or candidates
+        return selected, len(selected) > 1
+
     adjacency: dict[str, set[str]] = defaultdict(set)
-    call_edges: dict[str, list[tuple[CallSite, CallTarget, FunctionSummary]]] = defaultdict(list)
+    call_edges: dict[str, list[tuple[CallSite, CallTarget, FunctionSummary, bool]]] = defaultdict(
+        list
+    )
     for caller in summaries:
-        for site in sites_by_owner.get(caller.function_symbol_id, ()):
+        for site in owner_sites(caller):
             for target in targets_by_site.get(site.id, ()):
-                for callee in summaries_by_function.get(target.target_symbol_id, ()):
+                callees, body_ambiguous = callee_bodies(caller, target)
+                for callee in callees:
                     adjacency[caller.id].add(callee.id)
-                    call_edges[caller.id].append((site, target, callee))
+                    call_edges[caller.id].append((site, target, callee, body_ambiguous))
     components = _tarjan(tuple(summary_by_id), adjacency)
     recursive_ids = {
         member for component in components if len(component) > 1 for member in component
@@ -210,24 +244,37 @@ def _solve_variant(
             reasons.add("scc_size_cap_exceeded")
         effects = {item.id: item for item in local_effect_map[caller.id]}
         origins = {item.id: item for item in local_origin_map[caller.id]}
-        owner_sites = sites_by_owner.get(caller.function_symbol_id, ())
-        for site in owner_sites:
+        for site in owner_sites(caller):
             site_targets = targets_by_site.get(site.id, ())
             if not site.target_set_complete or not site_targets:
                 reasons.add("unknown_or_external_call_target")
             for target in site_targets:
-                callees = summaries_by_function.get(target.target_symbol_id, ())
+                callees, body_ambiguous = callee_bodies(caller, target)
                 if not callees:
                     reasons.add("external_or_unindexed_callee_body")
                     reasons.add("unknown_or_external_call_target")
-                if len(callees) > 1:
+                if body_ambiguous:
                     reasons.add("multiple_callee_body_variants")
                 for callee in callees:
+                    for parameter_index in range(len(callee.parameter_location_ids)):
+                        binding = bindings_by_pair.get((caller.id, site.id, parameter_index))
+                        # Dropping an unbound parameter would hide downstream effects while
+                        # incorrectly leaving the caller summary complete.
+                        if binding is None:
+                            reasons.add("missing_call_argument_binding")
+                        elif not binding.complete:
+                            reasons.add("incomplete_call_argument_binding")
                     if current_reasons.get(callee.id):
                         reasons.add("callee_summary_incomplete")
                     for effect in current_effects.get(callee.id, ()):
                         propagated = _propagate_effect(
-                            caller, site, target, callee, effect, bindings_by_pair
+                            caller,
+                            site,
+                            target,
+                            callee,
+                            effect,
+                            bindings_by_pair,
+                            body_ambiguous=body_ambiguous,
                         )
                         if propagated is not None:
                             effects[propagated.id] = propagated
@@ -245,6 +292,7 @@ def _solve_variant(
                                 callee,
                                 callee_origin,
                                 bindings_by_pair,
+                                body_ambiguous=body_ambiguous,
                             )
                             origins[propagated_origin.id] = propagated_origin
         ordered_effects = tuple(sorted(effects.values(), key=lambda item: item.id))
@@ -308,7 +356,7 @@ def _solve_variant(
 
     flows: dict[str, InterproceduralFlow] = {}
     for caller in summaries:
-        for site, target, callee in call_edges.get(caller.id, ()):
+        for site, target, callee, body_ambiguous in call_edges.get(caller.id, ()):
             for index, callee_location in enumerate(callee.parameter_location_ids):
                 binding = bindings_by_pair.get((caller.id, site.id, index))
                 if binding is None:
@@ -319,7 +367,9 @@ def _solve_variant(
                     callee,
                     site,
                     target,
-                    DataFlowCertainty.CERTAIN if binding.complete else DataFlowCertainty.POSSIBLE,
+                    DataFlowCertainty.CERTAIN
+                    if binding.complete and not body_ambiguous
+                    else DataFlowCertainty.POSSIBLE,
                     "caller argument is bound to this concrete callee parameter",
                     argument_index=index,
                     caller_location_id=binding.location_id,
@@ -341,7 +391,9 @@ def _solve_variant(
                     callee,
                     site,
                     target,
-                    effect.certainty if binding.complete else DataFlowCertainty.POSSIBLE,
+                    effect.certainty
+                    if binding.complete and not body_ambiguous
+                    else DataFlowCertainty.POSSIBLE,
                     "callee parameter side effect may write caller storage",
                     argument_index=effect.parameter_index,
                     caller_location_id=binding.location_id,
@@ -357,7 +409,7 @@ def _solve_variant(
                         callee,
                         site,
                         target,
-                        origin.certainty,
+                        origin.certainty if not body_ambiguous else DataFlowCertainty.POSSIBLE,
                         "callee return origin reaches the caller's call-result definition",
                         caller_location_id=result.location_id,
                         callee_location_id=origin.location_id,
@@ -379,6 +431,8 @@ def _propagate_effect(
     callee: FunctionSummary,
     effect: SummaryEffect,
     bindings: dict[tuple[str, str, int], CallArgumentBinding],
+    *,
+    body_ambiguous: bool,
 ) -> SummaryEffect | None:
     location_kind = effect.location_kind
     parameter_index = effect.parameter_index
@@ -394,7 +448,10 @@ def _propagate_effect(
         location_id = binding.location_id
     elif location_kind not in {MemoryLocationKind.GLOBAL, MemoryLocationKind.FIELD}:
         return None
-    certainty = _certainty(target.certainty, effect.certainty)
+    certainty = _certainty(
+        target.certainty,
+        effect.certainty if not body_ambiguous else DataFlowCertainty.POSSIBLE,
+    )
     # Key by the originating local access, not the previous propagated row ID: recursive
     # SCCs otherwise mint a fresh semantic duplicate on every fixed-point iteration.
     return SummaryEffect(
@@ -434,6 +491,8 @@ def _propagate_origin(
     callee: FunctionSummary,
     origin: SummaryReturnOrigin,
     bindings: dict[tuple[str, str, int], CallArgumentBinding],
+    *,
+    body_ambiguous: bool,
 ) -> SummaryReturnOrigin:
     del callee
     location_kind = origin.location_kind
@@ -452,7 +511,10 @@ def _propagate_origin(
             parameter_index = binding.parameter_index
             access_path = (binding.access_path + origin.access_path)[:8]
             location_id = binding.location_id
-    certainty = _certainty(target.certainty, origin.certainty)
+    certainty = _certainty(
+        target.certainty,
+        origin.certainty if not body_ambiguous else DataFlowCertainty.POSSIBLE,
+    )
     return SummaryReturnOrigin(
         id=_id(
             "summary_return",

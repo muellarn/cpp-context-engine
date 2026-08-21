@@ -435,6 +435,7 @@ class _FactBatchBuilder:
         self.keys: dict[str, str] = {}
         self.files: dict[str, Path] = {}
         self.cfg_graph_ids: dict[str, str] = {}
+        self.cfg_graph_function_ids: dict[str, str] = {}
         self.cfg_block_ids: dict[str, str] = {}
         self.cfg_element_ids: dict[str, str] = {}
         self.cfg_block_graph_ids: dict[str, str] = {}
@@ -448,6 +449,7 @@ class _FactBatchBuilder:
         self.data_access_analysis_ids: dict[str, str] = {}
         self.function_summary_ids: dict[str, str] = {}
         self.function_summary_analysis_ids: dict[str, str] = {}
+        self.function_summary_parameter_counts: dict[str, int] = {}
 
     def build(self, facts: Sequence[Mapping[str, Any]]) -> IngestionBatch:
         for fact in facts:
@@ -790,8 +792,14 @@ class _FactBatchBuilder:
         for fact in summary_facts:
             key = _string(fact, "key")
             analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
-            graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+            graph_key = _string(fact, "graph_key")
+            graph_id = self._known_cfg_graph(graph_key)
             if self.data_flow_analysis_graph_ids.get(_string(fact, "analysis_key")) != graph_id:
+                raise AnalyzerProtocolError(
+                    "analyzer summary facts have inconsistent graph references"
+                )
+            function_id = self._known_id(_string(fact, "function_key"))
+            if self.cfg_graph_function_ids.get(graph_key) != function_id:
                 raise AnalyzerProtocolError(
                     "analyzer summary facts have inconsistent graph references"
                 )
@@ -805,6 +813,7 @@ class _FactBatchBuilder:
                 )[:32]
             )
             self.function_summary_analysis_ids[key] = analysis_id
+            self.function_summary_parameter_counts[key] = len(_string_list(fact, "parameter_modes"))
         try:
             summaries = tuple(
                 sorted(
@@ -864,12 +873,20 @@ class _FactBatchBuilder:
         complete = _boolean(fact, "local_complete")
         if len(modes) != len(location_keys) or complete == bool(reasons):
             raise AnalyzerProtocolError("analyzer function summary shape is invalid")
+        analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
+        if any(
+            self.memory_location_analysis_ids.get(location_key) != analysis_id
+            for location_key in location_keys
+        ):
+            raise AnalyzerProtocolError(
+                "analyzer summary facts have inconsistent analysis references"
+            )
         limits = InterproceduralLimits()
         return FunctionSummary(
             id=self._known_function_summary(key),
             function_symbol_id=self._known_id(_string(fact, "function_key")),
             graph_id=self._known_cfg_graph(_string(fact, "graph_key")),
-            analysis_id=self._known_data_flow_analysis(_string(fact, "analysis_key")),
+            analysis_id=analysis_id,
             parameter_modes=modes,
             parameter_location_ids=tuple(
                 self._known_memory_location(location_key) for location_key in location_keys
@@ -895,6 +912,12 @@ class _FactBatchBuilder:
         access_key = _optional_key(fact, "source_access_key")
         self._validate_summary_analysis(summary_key, location_key, access_key)
         key = _string(fact, "key")
+        parameter_index = _optional_non_negative_integer(fact, "parameter_index")
+        if (
+            parameter_index is not None
+            and parameter_index >= self.function_summary_parameter_counts[summary_key]
+        ):
+            raise AnalyzerProtocolError("analyzer summary effect has an invalid parameter index")
         return SummaryEffect(
             id="summary_effect_" + _hash_text(summary_id, key)[:32],
             summary_id=summary_id,
@@ -902,7 +925,7 @@ class _FactBatchBuilder:
             location_kind=MemoryLocationKind(_string(fact, "location_kind")),
             certainty=DataFlowCertainty(_string(fact, "certainty")),
             reason=_string(fact, "reason"),
-            parameter_index=_optional_non_negative_integer(fact, "parameter_index"),
+            parameter_index=parameter_index,
             access_path=_string_list(fact, "access_path"),
             location_id=self._known_memory_location(location_key) if location_key else None,
             source_access_id=self._known_data_access(access_key) if access_key else None,
@@ -919,6 +942,12 @@ class _FactBatchBuilder:
         callsite_key = _optional_key(fact, "callsite_key")
         location_kind = _optional_string(fact, "location_kind")
         key = _string(fact, "key")
+        parameter_index = _optional_non_negative_integer(fact, "parameter_index")
+        if (
+            parameter_index is not None
+            and parameter_index >= self.function_summary_parameter_counts[summary_key]
+        ):
+            raise AnalyzerProtocolError("analyzer summary origin has an invalid parameter index")
         return SummaryReturnOrigin(
             id="summary_return_" + _hash_text(summary_id, key)[:32],
             summary_id=summary_id,
@@ -926,7 +955,7 @@ class _FactBatchBuilder:
             certainty=DataFlowCertainty(_string(fact, "certainty")),
             reason=_string(fact, "reason"),
             location_kind=MemoryLocationKind(location_kind) if location_kind else None,
-            parameter_index=_optional_non_negative_integer(fact, "parameter_index"),
+            parameter_index=parameter_index,
             access_path=_string_list(fact, "access_path"),
             location_id=self._known_memory_location(location_key) if location_key else None,
             callsite_id=self._known_callsite(callsite_key) if callsite_key else None,
@@ -946,6 +975,12 @@ class _FactBatchBuilder:
             raise AnalyzerProtocolError("analyzer call argument completeness is invalid")
         callsite_id = self._known_callsite(_string(fact, "callsite_key"))
         index = _non_negative_integer(fact, "argument_index")
+        parameter_index = _optional_non_negative_integer(fact, "parameter_index")
+        if (
+            parameter_index is not None
+            and parameter_index >= self.function_summary_parameter_counts[summary_key]
+        ):
+            raise AnalyzerProtocolError("analyzer call binding has an invalid parameter index")
         return CallArgumentBinding(
             id="call_argument_" + _hash_text(summary_id, callsite_id, str(index))[:32],
             caller_summary_id=summary_id,
@@ -953,7 +988,7 @@ class _FactBatchBuilder:
             argument_index=index,
             location_id=self._known_memory_location(location_key) if location_key else None,
             location_kind=MemoryLocationKind(_string(fact, "location_kind")),
-            parameter_index=_optional_non_negative_integer(fact, "parameter_index"),
+            parameter_index=parameter_index,
             access_path=_string_list(fact, "access_path"),
             writeback_candidate=_boolean(fact, "writeback_candidate"),
             complete=complete,
@@ -1151,6 +1186,7 @@ class _FactBatchBuilder:
         for fact in graph_facts:
             graph_key = _string(fact, "key")
             function_id = self._known_id(_string(fact, "function_key"))
+            self.cfg_graph_function_ids[graph_key] = function_id
             self.cfg_graph_ids[graph_key] = (
                 "cfg_"
                 + _hash_text(
