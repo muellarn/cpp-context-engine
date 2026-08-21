@@ -810,17 +810,18 @@ private:
     auto ownerKind = symbolKind(owner);
     if (!expansion || !ownerKind)
       return;
-    emitSymbol(owner, *ownerKind);
-    const bool staticTargetIndexed =
-        staticTarget && source_.relative(staticTarget->getLocation()).has_value();
-    const bool resolvedTargetIndexed =
-        resolvedTarget && source_.relative(resolvedTarget->getLocation()).has_value();
-    if (staticTargetIndexed)
-      emitSymbol(staticTarget, llvm::isa<clang::CXXMethodDecl>(staticTarget) ? "method"
-                                                                           : "function");
-    if (resolvedTargetIndexed)
-      emitSymbol(resolvedTarget, llvm::isa<clang::CXXMethodDecl>(resolvedTarget) ? "method"
-                                                                                : "function");
+    auto ownerKey = emitSymbol(owner, *ownerKind);
+    if (!ownerKey)
+      return;
+    auto emitTarget = [&](const clang::FunctionDecl *target) -> std::optional<std::string> {
+      if (!target || !source_.relative(target->getLocation()))
+        return std::nullopt;
+      return emitSymbol(target, llvm::isa<clang::CXXMethodDecl>(target) ? "method" : "function");
+    };
+    auto staticTargetKey = emitTarget(staticTarget);
+    auto resolvedTargetKey = emitTarget(resolvedTarget);
+    const bool staticTargetIndexed = staticTargetKey.has_value();
+    const bool resolvedTargetIndexed = resolvedTargetKey.has_value();
     if ((staticTarget && !staticTargetIndexed) || (resolvedTarget && !resolvedTargetIndexed)) {
       complete = false;
       unresolvedReason = "resolved_target_external_or_unindexed";
@@ -828,15 +829,14 @@ private:
       derivation = "";
       confidenceReason = "";
     }
-    auto ownerKey = source_.declKey(owner, *ownerKind);
     auto range = expression->getSourceRange();
-    auto callsiteKey = "callsite:" + ownerKey + ":" + expression->getStmtClassName() + ":" +
+    auto callsiteKey = "callsite:" + *ownerKey + ":" + expression->getStmtClassName() + ":" +
                        std::to_string(source_.offset(range.getBegin(), true)) + ":" +
                        std::to_string(source_.offset(range.getBegin(), false)) + ":" +
                        std::to_string(source_.offset(range.getEnd(), false));
     llvm::json::Object site{{"fact", "callsite_v1"},
                             {"key", callsiteKey},
-                            {"owner_key", ownerKey},
+                            {"owner_key", *ownerKey},
                             {"dispatch_kind", dispatchKind.str()},
                             {"expansion_span", std::move(*expansion)},
                             {"expansion_stack",
@@ -847,17 +847,14 @@ private:
     if (spelling)
       site["spelling_span"] = std::move(*spelling);
     if (staticTargetIndexed)
-      site["static_target_key"] = source_.declKey(
-          staticTarget, llvm::isa<clang::CXXMethodDecl>(staticTarget) ? "method" : "function");
+      site["static_target_key"] = *staticTargetKey;
     sink_.add("callsite:" + callsiteKey, std::move(site));
 
     if (resolvedTargetIndexed && !certainty.empty()) {
-      auto targetKey = source_.declKey(
-          resolvedTarget, llvm::isa<clang::CXXMethodDecl>(resolvedTarget) ? "method" : "function");
-      sink_.add("call-target:" + callsiteKey + ":" + targetKey,
+      sink_.add("call-target:" + callsiteKey + ":" + *resolvedTargetKey,
                 {{"fact", "call_target_v1"},
                  {"callsite_key", callsiteKey},
-                 {"target_key", targetKey},
+                 {"target_key", *resolvedTargetKey},
                  {"certainty", certainty.str()},
                  {"confidence", confidence},
                  {"confidence_reason", confidenceReason.str()},
@@ -871,10 +868,10 @@ private:
         auto macroKey = object ? object->getString("macro_key") : std::nullopt;
         if (!macroKey || *macroKey != frame.key)
           continue;
-        sink_.add("edge:generated_by_macro:" + ownerKey + ":" + frame.key + ":" +
+        sink_.add("edge:generated_by_macro:" + *ownerKey + ":" + frame.key + ":" +
                       std::to_string(source_.offset(range.getBegin(), false)),
                   {{"fact", "edge"},
-                   {"source_key", ownerKey},
+                   {"source_key", *ownerKey},
                    {"target_key", frame.key},
                    {"relation", "generated_by_macro"},
                    {"span", std::move(*source_.span(range, false))}});
@@ -1055,13 +1052,15 @@ private:
   void emitCFG(const clang::FunctionDecl *function) {
     auto body = function->getBody();
     auto functionKind = llvm::isa<clang::CXXMethodDecl>(function) ? "method" : "function";
-    auto functionKey = source_.declKey(function, functionKind);
     auto options = cfgBuildOptions(context_.getLangOpts());
     auto cfg = clang::CFG::buildCFG(function, body, &context_, options);
     if (!cfg)
       return;
 
-    emitSymbol(function, functionKind);
+    auto functionEndpoint = emitSymbol(function, functionKind);
+    if (!functionEndpoint)
+      return;
+    const auto &functionKey = *functionEndpoint;
     auto graphKey = "cfg:" + functionKey;
     auto blockKey = [&](const clang::CFGBlock &block) {
       return graphKey + ":block:" + std::to_string(block.getBlockID());
@@ -2066,12 +2065,15 @@ private:
           continue;
         }
         const auto targetKind = llvm::isa<clang::CXXMethodDecl>(target) ? "method" : "function";
-        emitSymbol(target, targetKind);
-        const auto targetKey = source_.declKey(target, targetKind);
-        sink_.add("call-target:data-flow:" + callsiteKey + ":" + targetKey,
+        auto targetKey = emitSymbol(target, targetKind);
+        if (!targetKey) {
+          incompleteReasons.insert("unrepresentable_indirect_target_source");
+          continue;
+        }
+        sink_.add("call-target:data-flow:" + callsiteKey + ":" + *targetKey,
                   {{"fact", "call_target_v1"},
                    {"callsite_key", callsiteKey},
-                   {"target_key", targetKey},
+                   {"target_key", *targetKey},
                    {"certainty", certain ? "certain" : "possible"},
                    {"confidence", certain ? 1.0 : 0.5},
                    {"confidence_reason",
@@ -2552,15 +2554,18 @@ private:
               {{"fact", "file"}, {"key", key}, {"path", path.string()}});
   }
 
-  void emitSymbol(const clang::NamedDecl *decl, llvm::StringRef kind) {
+  std::optional<std::string> emitSymbol(const clang::NamedDecl *decl, llvm::StringRef kind) {
     auto span = source_.span(decl->getSourceRange());
     if (!span)
       span = source_.span(decl->getSourceRange(), false);
     auto path = source_.path(decl->getLocation());
     if (!span || !path || !source_.isProjectPath(*path))
-      return;
+      return std::nullopt;
     emitFile(*path);
     auto key = source_.declKey(decl, kind);
+    auto symbolFactKey = "symbol:" + key + (isDefinition(decl) ? ":0" : ":1");
+    if (!emittedSymbolFacts_.insert(symbolFactKey).second)
+      return key;
     const auto [startOffset, endOffset] = source_.offsets(decl->getSourceRange());
     llvm::json::Object metadata{{"is_definition", isDefinition(decl)},
                                 {"analysis_backend", "clang-libtooling"},
@@ -2593,31 +2598,38 @@ private:
                             {"documentation", documentation},
                             {"source_text", source_.source(decl->getSourceRange())},
                             {"metadata", std::move(metadata)}};
-    sink_.add("symbol:" + key + (isDefinition(decl) ? ":0" : ":1"), std::move(fact));
+    sink_.add(std::move(symbolFactKey), std::move(fact));
     llvm::StringRef occurrenceKind = isDefinition(decl) ? "definition" : "declaration";
     auto occurrencePath = source_.path(decl->getLocation(), false).value_or(*path);
     auto occurrenceSpan = source_.span(decl->getSourceRange());
     if (!occurrenceSpan)
       occurrenceSpan = source_.span(decl->getSourceRange(), false);
     if (!occurrenceSpan)
-      return;
+      return key;
+    llvm::json::Object occurrence{{"fact", "occurrence"},
+                                  {"symbol_key", key},
+                                  {"kind", occurrenceKind.str()},
+                                  {"span", std::move(*occurrenceSpan)}};
+    auto owner = enclosingDecl(decl);
+    std::optional<std::string> ownerKey;
+    if (owner) {
+      if (auto ownerKind = symbolKind(owner))
+        ownerKey = emitSymbol(owner, *ownerKind);
+    }
+    if (ownerKey)
+      occurrence["enclosing_key"] = *ownerKey;
     sink_.add("occurrence:" + key + ":" + occurrenceKind.str() + ":" +
                   occurrencePath.string() + ":" +
                   std::to_string(source_.offset(decl->getLocation(), false)),
-              {{"fact", "occurrence"},
-               {"symbol_key", key},
-               {"kind", occurrenceKind.str()},
-               {"span", std::move(*occurrenceSpan)},
-               {"enclosing_key", enclosingDeclKey(decl)}});
-    auto owner = enclosingDecl(decl);
-    auto sourceKey = owner ? source_.declKey(owner, symbolKind(owner).value_or("unknown"))
-                           : source_.fileKey(*path);
-    if (sourceKey != key)
-      sink_.add("edge:contains:" + sourceKey + ":" + key,
+              std::move(occurrence));
+    auto containerKey = owner ? ownerKey : std::optional<std::string>(source_.fileKey(*path));
+    if (containerKey && *containerKey != key)
+      sink_.add("edge:contains:" + *containerKey + ":" + key,
                 {{"fact", "edge"},
-                 {"source_key", sourceKey},
+                 {"source_key", *containerKey},
                  {"target_key", key},
                  {"relation", "contains"}});
+    return key;
   }
 
   const clang::NamedDecl *enclosingDecl(const clang::Decl *decl) const {
@@ -2630,11 +2642,6 @@ private:
       context = context->getParent();
     }
     return nullptr;
-  }
-
-  std::string enclosingDeclKey(const clang::Decl *decl) const {
-    auto *owner = enclosingDecl(decl);
-    return owner ? source_.declKey(owner, symbolKind(owner).value_or("unknown")) : "";
   }
 
   template <typename Node> const clang::FunctionDecl *enclosingCallable(const Node *node) const {
@@ -2673,28 +2680,30 @@ private:
     auto span = source_.span(range, false);
     if (!sourceKind || !targetKind || !span)
       return;
-    emitSymbol(source, *sourceKind);
-    emitSymbol(target, *targetKind);
-    auto sourceKey = source_.declKey(source, *sourceKind);
-    auto targetKey = source_.declKey(target, *targetKind);
+    auto sourceKey = emitSymbol(source, *sourceKind);
+    auto targetKey = emitSymbol(target, *targetKind);
+    // Clang can expose implicit declarations whose source range cannot be represented.
+    // Suppress dependent facts instead of emitting references to a symbol we skipped.
+    if (!sourceKey || !targetKey)
+      return;
     std::string evidence = std::to_string(source_.offset(range.getBegin(), false));
-    sink_.add("edge:" + relation.str() + ":" + sourceKey + ":" + targetKey + ":" + evidence,
+    sink_.add("edge:" + relation.str() + ":" + *sourceKey + ":" + *targetKey + ":" + evidence,
               {{"fact", "edge"},
-               {"source_key", sourceKey},
-               {"target_key", targetKey},
+               {"source_key", *sourceKey},
+               {"target_key", *targetKey},
                {"relation", relation.str()},
                {"span", std::move(*span)}});
     if (addReference && relation != "references")
-      sink_.add("edge:references:" + sourceKey + ":" + targetKey + ":" + evidence,
+      sink_.add("edge:references:" + *sourceKey + ":" + *targetKey + ":" + evidence,
                 {{"fact", "edge"},
-                 {"source_key", sourceKey},
-                 {"target_key", targetKey},
+                 {"source_key", *sourceKey},
+                 {"target_key", *targetKey},
                  {"relation", "references"},
                  {"span", std::move(*source_.span(range, false))}});
-    sink_.add("occurrence:" + occurrenceKind.str() + ":" + targetKey + ":" + evidence,
+    sink_.add("occurrence:" + occurrenceKind.str() + ":" + *targetKey + ":" + evidence,
               {{"fact", "occurrence"},
-               {"symbol_key", targetKey},
-               {"enclosing_key", sourceKey},
+               {"symbol_key", *targetKey},
+               {"enclosing_key", *sourceKey},
                {"kind", occurrenceKind.str()},
                {"span", std::move(*source_.span(range, false))}});
   }
@@ -2703,6 +2712,7 @@ private:
   FactSink &sink_;
   SourceFacts source_;
   const std::vector<MacroExpansionRecord> &macroExpansions_;
+  std::unordered_set<std::string> emittedSymbolFacts_;
 };
 
 class Consumer final : public clang::ASTConsumer {

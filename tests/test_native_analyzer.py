@@ -39,6 +39,7 @@ from cpp_context_engine.storage import SQLiteStore
 FIXTURE = Path(__file__).parent / "fixtures" / "analyzer_project"
 PARITY_FIXTURE = Path(__file__).parent / "fixtures" / "cpp_project"
 CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
+IMPLICIT_FIXTURE = Path(__file__).parent / "fixtures" / "implicit_project"
 
 
 def _binary() -> Path:
@@ -306,6 +307,35 @@ def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
     repeated = NativeClangIngestor(gzip_client).ingest(FIXTURE, FIXTURE / "compile_commands.json")
 
     assert gzip_batch == plain_batch == repeated
+
+
+def test_implicit_lambda_copy_has_no_orphan_symbol_references() -> None:
+    configuration = CompilationDatabase.load(
+        IMPLICIT_FIXTURE / "compile_commands.json"
+    ).configurations[0]
+    facts = NativeAnalyzerClient(_binary(), timeout_seconds=30).analyze(
+        IMPLICIT_FIXTURE, configuration
+    )
+    repeated = NativeAnalyzerClient(_binary(), timeout_seconds=30).analyze(
+        IMPLICIT_FIXTURE, configuration
+    )
+    endpoint_keys = {
+        fact["key"]
+        for fact in facts
+        if fact.get("fact") in {"file", "symbol"}
+    }
+    unknown_references = {
+        key
+        for fact in facts
+        for field in ("symbol_key", "enclosing_key", "source_key", "target_key")
+        if isinstance((key := fact.get(field)), str) and key and key not in endpoint_keys
+    }
+    skipped_implicit_parameter = "fallback:variable:src/implicit.cpp::11:14"
+
+    assert facts == repeated
+    assert skipped_implicit_parameter not in endpoint_keys
+    assert unknown_references == set()
+    _FactBatchBuilder(IMPLICIT_FIXTURE.resolve(), configuration).build(facts)
 
 
 def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
