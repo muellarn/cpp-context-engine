@@ -23,6 +23,7 @@ class _BinaryIdentity:
     inode: int
     size: int
     modified_ns: int
+    changed_ns: int
 
 
 _validated: set[_BinaryIdentity] = set()
@@ -54,6 +55,7 @@ def _identity(candidate: Path, source: str) -> _BinaryIdentity:
         inode=metadata.st_ino,
         size=metadata.st_size,
         modified_ns=metadata.st_mtime_ns,
+        changed_ns=metadata.st_ctime_ns,
     )
 
 
@@ -75,6 +77,10 @@ def analyzer_binary(
             NativeAnalyzerClient(identity.path, timeout_seconds=10).probe()
         except RuntimeError as error:
             raise pytest.UsageError(f"{source} is incompatible: {error}") from error
+        # A concurrently rebuilt binary must not inherit validation performed on
+        # different bytes observed immediately before the handshake.
+        if _identity(identity.path, source) != identity:
+            raise pytest.UsageError(f"{source} changed while being validated: {identity.path}")
         _validated.add(identity)
     return identity.path
 
