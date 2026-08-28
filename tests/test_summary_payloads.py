@@ -486,6 +486,46 @@ def test_v10_migration_compacts_existing_rows_without_changing_results(
         } == expected
 
 
+def test_v10_direct_upgrade_preserves_summaries_and_local_vector_bytes(
+    tmp_path: Path, solved_batch
+) -> None:
+    database = tmp_path / "combined-v10.db"
+    with SQLiteStore(database, project_root=FIXTURE) as store:
+        store.apply_ingestion(FIXTURE, solved_batch)
+        summary_rows = _solution_rows(store)
+        variant_id = store._connection.execute(  # noqa: SLF001 - migration fixture
+            "SELECT id FROM symbol_variants ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        store.put_embedding(variant_id, "local-feature-hash-v1-2", [1.0, 1.0])
+        expected_hits = tuple(
+            (hit.symbol.variant_id, hit.score)
+            for hit in store.search_vector([1.0, 1.0], model="local-feature-hash-v1-2")
+        )
+        vector_bytes = store._connection.execute(  # noqa: SLF001 - exact byte regression
+            "SELECT hex(vector) FROM embedding_vectors"
+        ).fetchone()[0]
+        _downgrade_embedding_schema_to_v11(store)
+        _insert_legacy_propagated_rows(store)
+
+    with SQLiteStore(database, project_root=FIXTURE) as migrated:
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+        assert _solution_rows(migrated) == summary_rows
+        assert (
+            migrated._connection.execute(  # noqa: SLF001
+                "SELECT hex(vector) FROM embedding_vectors"
+            ).fetchone()[0]
+            == vector_bytes
+        )
+        assert (
+            tuple(
+                (hit.symbol.variant_id, hit.score)
+                for hit in migrated.search_vector([1.0, 1.0], model="local-feature-hash-v1-2")
+            )
+            == expected_hits
+        )
+        assert migrated._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
+
+
 def test_v11_migration_and_payload_persistence_failures_roll_back_atomically(
     tmp_path: Path, solved_batch, monkeypatch: pytest.MonkeyPatch
 ) -> None:

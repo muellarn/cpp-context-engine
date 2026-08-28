@@ -1357,7 +1357,11 @@ class SQLiteStore:
                     vector BLOB NOT NULL,
                     PRIMARY KEY (
                         project_id, model, configuration_id, dimensions, content_hash
-                    )
+                    ),
+                    CHECK (dimensions > 0),
+                    CHECK (magnitude > 0),
+                    CHECK (typeof(vector) = 'blob'),
+                    CHECK (length(vector) = dimensions * 8)
                 );
 
                 CREATE TABLE variant_embeddings (
@@ -1412,6 +1416,15 @@ class SQLiteStore:
                         # v10 did not persist the hosted endpoint, so those vectors
                         # cannot be assigned a complete configuration identity safely.
                         continue
+                    # The legacy table had no vector integrity constraints. Validate it
+                    # before sharing: a short BLOB previously produced a plausible but
+                    # incorrect cosine score because pairwise multiplication truncated.
+                    dimensions, magnitude, vector = _validate_legacy_embedding_vector(
+                        row["dimensions"],
+                        row["magnitude"],
+                        row["vector"],
+                        variant_id=row["variant_id"],
+                    )
                     text = _embedding_text_from_snapshot(row["snapshot_json"])
                     content_hash = _embedding_content_hash(text)
                     configuration_id = row["model"]
@@ -1425,15 +1438,14 @@ class SQLiteStore:
                             row["project_id"],
                             row["model"],
                             configuration_id,
-                            row["dimensions"],
+                            dimensions,
                             content_hash,
                         ),
                     ).fetchone()
                     if existing is not None and existing["content_text"] != text:
                         raise RuntimeError("embedding content hash collision during migration")
                     if existing is not None and (
-                        existing["magnitude"] != row["magnitude"]
-                        or existing["vector"] != row["vector"]
+                        existing["magnitude"] != magnitude or existing["vector"] != vector
                     ):
                         raise RuntimeError("equal legacy embedding inputs have different vectors")
                     self._connection.execute(
@@ -1447,11 +1459,11 @@ class SQLiteStore:
                             row["project_id"],
                             row["model"],
                             configuration_id,
-                            row["dimensions"],
+                            dimensions,
                             content_hash,
                             text,
-                            row["magnitude"],
-                            row["vector"],
+                            magnitude,
+                            vector,
                         ),
                     )
                     self._connection.execute(
@@ -1466,7 +1478,7 @@ class SQLiteStore:
                             row["variant_id"],
                             row["model"],
                             configuration_id,
-                            row["dimensions"],
+                            dimensions,
                             content_hash,
                         ),
                     )
@@ -5350,7 +5362,35 @@ def _validate_vector(vector: Sequence[float]) -> tuple[float, ...]:
         raise ValueError("embedding vector must contain only finite values")
     if not any(value != 0.0 for value in values):
         raise ValueError("embedding vector magnitude must be greater than zero")
+    if not math.isfinite(sum(value * value for value in values)):
+        raise ValueError("embedding vector must have a finite magnitude")
     return values
+
+
+def _validate_legacy_embedding_vector(
+    dimensions: object,
+    magnitude: object,
+    vector: object,
+    *,
+    variant_id: object,
+) -> tuple[int, float, bytes]:
+    try:
+        if type(dimensions) is not int or dimensions <= 0:
+            raise ValueError
+        if not isinstance(vector, bytes) or len(vector) != dimensions * 8:
+            raise ValueError
+        values = _validate_vector(struct.unpack(f"<{dimensions}d", vector))
+        calculated_magnitude = math.sqrt(sum(value * value for value in values))
+        stored_magnitude = float(magnitude)
+        if (
+            not math.isfinite(calculated_magnitude)
+            or not math.isfinite(stored_magnitude)
+            or stored_magnitude != calculated_magnitude
+        ):
+            raise ValueError
+    except (TypeError, ValueError, struct.error):
+        raise RuntimeError(f"invalid legacy embedding vector for variant {variant_id!r}") from None
+    return dimensions, stored_magnitude, vector
 
 
 @lru_cache(maxsize=128)

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import cpp_context_engine.storage.sqlite as sqlite_storage
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
@@ -413,6 +414,10 @@ def test_cosine_search_is_mathematically_ordered_and_validated(
         assert "snapshot_json" not in scoring
         with pytest.raises(ValueError, match="magnitude"):
             store.search_vector([0.0, 0.0], model="fixture")
+        with pytest.raises(ValueError, match="finite magnitude"):
+            store.put_embedding("file-a", "overflow", [1e308, 1e308])
+        with pytest.raises(ValueError, match="finite magnitude"):
+            store.search_vector([1e308, 1e308], model="fixture")
         with pytest.raises(ValueError, match="dimension"):
             store.put_embedding("file-a", "fixture", [1.0, 2.0, 3.0])
 
@@ -526,6 +531,46 @@ def test_embedding_configuration_identity_isolated_with_stable_public_model(
         )
 
 
+def test_embedding_hash_collision_is_rejected_against_retained_exact_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        variants = {
+            row["symbol_id"]: row["id"]
+            for row in store._connection.execute(  # noqa: SLF001 - physical collision evidence
+                "SELECT id, symbol_id FROM symbol_variants"
+            )
+        }
+        monkeypatch.setattr(sqlite_storage, "_embedding_content_hash", lambda _text: "collision")
+        with store.embedding_write_session(root):
+            store.put_content_embeddings(
+                ((variants["symbol-alpha"], "first exact text", [1.0, 0.0]),),
+                "fixture",
+                root,
+            )
+        with (
+            pytest.raises(ValueError, match="content hash collision"),
+            store.embedding_write_session(root),
+        ):
+            store.put_content_embeddings(
+                ((variants["file-a"], "different exact text", [0.0, 1.0]),),
+                "fixture",
+                root,
+            )
+
+        assert store.embedding_count("fixture") == 1
+        assert store.embedding_vector_count("fixture") == 1
+        assert (
+            store._connection.execute(  # noqa: SLF001 - retained collision witness
+                "SELECT content_text FROM embedding_vectors"
+            ).fetchone()[0]
+            == "first exact text"
+        )
+
+
 def test_batched_embedding_failure_rolls_back_all_new_vectors_and_references(
     tmp_path: Path,
 ) -> None:
@@ -635,6 +680,77 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     assert [hit.symbol.variant_id for hit in hits] == sorted(variants)
     assert {hit.symbol.id for hit in hits} == {"symbol-alpha", "symbol-alpha-copy"}
     assert all(hit.score == pytest.approx(1.0) for hit in hits)
+
+
+@pytest.mark.parametrize(
+    ("dimensions", "magnitude", "vector"),
+    (
+        (2, math.sqrt(2.0), struct.pack("<d", 1.0)),
+        (2, 1.0, struct.pack("<2d", 1.0, float("nan"))),
+        (2, 9.0, struct.pack("<2d", 1.0, 1.0)),
+    ),
+)
+def test_v12_migration_rejects_corrupt_legacy_vectors_atomically(
+    tmp_path: Path,
+    dimensions: int,
+    magnitude: float,
+    vector: bytes,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "index.db"
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        variant_id = store._connection.execute(  # noqa: SLF001 - migration fixture
+            "SELECT id FROM symbol_variants WHERE symbol_id = 'symbol-alpha'"
+        ).fetchone()[0]
+
+    legacy = sqlite3.connect(database)
+    legacy.executescript(
+        """
+        DROP TABLE variant_embeddings;
+        DROP TABLE embedding_vectors;
+        CREATE TABLE variant_embeddings (
+            project_id INTEGER NOT NULL,
+            variant_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            magnitude REAL NOT NULL,
+            vector BLOB NOT NULL,
+            PRIMARY KEY (project_id, variant_id, model)
+        );
+        PRAGMA user_version = 11;
+        """
+    )
+    legacy.execute(
+        "INSERT INTO variant_embeddings VALUES (1, ?, 'fixture', ?, ?, ?)",
+        (variant_id, dimensions, magnitude, vector),
+    )
+    legacy.commit()
+    legacy.close()
+
+    with pytest.raises(RuntimeError, match="invalid legacy embedding vector"):
+        SQLiteStore(database, project_root=root)
+
+    unchanged = sqlite3.connect(database)
+    try:
+        assert unchanged.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert {row[1] for row in unchanged.execute("PRAGMA table_info(variant_embeddings)")} == {
+            "project_id",
+            "variant_id",
+            "model",
+            "dimensions",
+            "magnitude",
+            "vector",
+        }
+        assert (
+            unchanged.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'embedding_vectors'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        unchanged.close()
 
 
 def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
