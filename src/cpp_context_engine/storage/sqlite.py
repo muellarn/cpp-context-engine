@@ -9,8 +9,9 @@ import operator
 import re
 import sqlite3
 import struct
+import zlib
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -65,9 +66,13 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 MAX_CFG_PAGE_SIZE = 10_000
 MAX_CALL_PAGE_SIZE = 10_000
+SUMMARY_PAYLOAD_ENCODING = "zlib-json-v1"
+MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES = 16 * 1024 * 1024
+MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+MAX_SUMMARY_PAYLOAD_RECORDS = 65_536
 _TRANSLATION_UNIT_DELETE_ORDER = (
     "interprocedural_flows",
     "call_argument_bindings",
@@ -103,6 +108,10 @@ class TranslationUnitState:
     build_variant: str = DEFAULT_BUILD_VARIANT
     analysis_backend: str = "unknown"
     advanced_facts_complete: bool = False
+
+
+class SummaryPayloadError(RuntimeError):
+    """A persisted propagated-summary payload is corrupt or exceeds hard limits."""
 
 
 class SQLiteStore:
@@ -362,6 +371,8 @@ class SQLiteStore:
             self._migrate_v9()
         if current <= 9:
             self._migrate_v10()
+        if current <= 10:
+            self._migrate_v11()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -1287,6 +1298,79 @@ class SQLiteStore:
                         "ALTER TABLE translation_unit_symbols DROP COLUMN snapshot_json"
                     )
             self._connection.execute("PRAGMA user_version = 10")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _migrate_v11(self) -> None:
+        """Compact propagated summary solutions while retaining relational local inputs."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                """
+                CREATE TABLE summary_solution_payloads (
+                    project_id INTEGER NOT NULL,
+                    summary_id TEXT NOT NULL,
+                    encoding TEXT NOT NULL,
+                    effect_count INTEGER NOT NULL,
+                    origin_count INTEGER NOT NULL,
+                    uncompressed_bytes INTEGER NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    PRIMARY KEY (project_id, summary_id),
+                    CHECK (effect_count >= 0 AND origin_count >= 0),
+                    CHECK (uncompressed_bytes >= 0),
+                    FOREIGN KEY (project_id, summary_id)
+                        REFERENCES function_summaries(project_id, id) ON DELETE CASCADE
+                )
+                """
+            )
+            projects = self._connection.execute(
+                """
+                SELECT project_id FROM summary_effects WHERE is_local = 0
+                UNION
+                SELECT project_id FROM summary_return_origins WHERE is_local = 0
+                ORDER BY project_id
+                """
+            ).fetchall()
+            for project in projects:
+                project_id = int(project["project_id"])
+                effects = (
+                    self._row_to_summary_effect(row)
+                    for row in self._connection.execute(
+                        """
+                        SELECT * FROM summary_effects
+                        WHERE project_id = ? AND is_local = 0
+                        ORDER BY summary_id, id
+                        """,
+                        (project_id,),
+                    )
+                )
+                origins = (
+                    self._row_to_summary_return_origin(row)
+                    for row in self._connection.execute(
+                        """
+                        SELECT * FROM summary_return_origins
+                        WHERE project_id = ? AND is_local = 0
+                        ORDER BY summary_id, id
+                        """,
+                        (project_id,),
+                    )
+                )
+                self._write_summary_solution_groups(
+                    project_id,
+                    _ordered_summary_groups(effects),
+                    _ordered_summary_groups(origins),
+                )
+            if projects:
+                # SQLite resolves every foreign-key target even for an empty DELETE;
+                # partial legacy schemas with no propagated rows need no cleanup.
+                self._connection.execute("DELETE FROM summary_effects WHERE is_local = 0")
+                self._connection.execute("DELETE FROM summary_return_origins WHERE is_local = 0")
+            self._connection.execute("PRAGMA user_version = 11")
         except BaseException:
             self._connection.rollback()
             raise
@@ -2634,6 +2718,7 @@ class SQLiteStore:
                     item.build_variant,
                 )
                 for item in effects
+                if item.is_local
             ),
         )
         self._connection.executemany(
@@ -2666,6 +2751,7 @@ class SQLiteStore:
                     item.build_variant,
                 )
                 for item in origins
+                if item.is_local
             ),
         )
         self._connection.executemany(
@@ -2722,6 +2808,75 @@ class SQLiteStore:
             ),
         )
         self._put_interprocedural_flows(project_id, flows)
+
+    def _write_summary_solution_payload(
+        self,
+        project_id: int,
+        summary_id: str,
+        effects: Sequence[SummaryEffect],
+        origins: Sequence[SummaryReturnOrigin],
+    ) -> None:
+        if not effects and not origins:
+            return
+        effect_count, origin_count, raw_size, payload_hash, payload = _encode_summary_payload(
+            summary_id, effects, origins
+        )
+        self._connection.execute(
+            """
+            INSERT INTO summary_solution_payloads(
+                project_id, summary_id, encoding, effect_count, origin_count,
+                uncompressed_bytes, payload_hash, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                summary_id,
+                SUMMARY_PAYLOAD_ENCODING,
+                effect_count,
+                origin_count,
+                raw_size,
+                payload_hash,
+                payload,
+            ),
+        )
+
+    def _put_summary_solution_payloads(
+        self,
+        project_id: int,
+        summary_ids: set[str],
+        effects: Iterable[SummaryEffect],
+        origins: Iterable[SummaryReturnOrigin],
+    ) -> None:
+        """Persist sorted solver output one summary at a time without relational expansion."""
+
+        self._write_summary_solution_groups(
+            project_id,
+            _propagated_summary_groups(effects, summary_ids),
+            _propagated_summary_groups(origins, summary_ids),
+        )
+
+    def _write_summary_solution_groups(
+        self,
+        project_id: int,
+        effect_groups: Iterator[tuple[str, tuple[SummaryEffect | SummaryReturnOrigin, ...]]],
+        origin_groups: Iterator[tuple[str, tuple[SummaryEffect | SummaryReturnOrigin, ...]]],
+    ) -> None:
+        effect_item = next(effect_groups, None)
+        origin_item = next(origin_groups, None)
+        while effect_item is not None or origin_item is not None:
+            keys = [item[0] for item in (effect_item, origin_item) if item is not None]
+            summary_id = min(keys)
+            grouped_effects: tuple[SummaryEffect, ...] = ()
+            grouped_origins: tuple[SummaryReturnOrigin, ...] = ()
+            if effect_item is not None and effect_item[0] == summary_id:
+                grouped_effects = effect_item[1]
+                effect_item = next(effect_groups, None)
+            if origin_item is not None and origin_item[0] == summary_id:
+                grouped_origins = origin_item[1]
+                origin_item = next(origin_groups, None)
+            self._write_summary_solution_payload(
+                project_id, summary_id, grouped_effects, grouped_origins
+            )
 
     def _put_interprocedural_flows(
         self, project_id: int, flows: Iterable[InterproceduralFlow]
@@ -2945,6 +3100,11 @@ class SQLiteStore:
             f"AND summary_id IN ({impacted_placeholders})",
             parameters,
         )
+        self._connection.execute(
+            f"DELETE FROM summary_solution_payloads WHERE project_id = ? "
+            f"AND summary_id IN ({impacted_placeholders})",
+            parameters,
+        )
         solved = [item for item in solution.summaries if item.id in impacted_ids]
         self._connection.executemany(
             """
@@ -2973,19 +3133,17 @@ class SQLiteStore:
         self._put_summary_facts(
             project_id,
             (),
-            (
-                item
-                for item in solution.effects
-                if item.summary_id in impacted_ids and not item.is_local
-            ),
-            (
-                item
-                for item in solution.return_origins
-                if item.summary_id in impacted_ids and not item.is_local
-            ),
+            (),
+            (),
             (),
             (),
             (item for item in solution.flows if item.caller_summary_id in impacted_ids),
+        )
+        self._put_summary_solution_payloads(
+            project_id,
+            impacted_ids,
+            solution.effects,
+            solution.return_origins,
         )
         return len(impacted_ids)
 
@@ -3800,15 +3958,17 @@ class SQLiteStore:
             f"""
             SELECT * FROM summary_effects
             WHERE project_id = ? AND summary_id = ?
+              AND is_local = 1
               AND build_variant IN ({placeholders})
             ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
                      is_local DESC, kind, id LIMIT ?
             """,
             (project_id, summary_id, *names, limit + 1),
         ).fetchall()
-        return BoundedCfgResult(
-            tuple(self._row_to_summary_effect(row) for row in rows[:limit]), len(rows) > limit
-        )
+        local = tuple(self._row_to_summary_effect(row) for row in rows)
+        propagated, _origins = self._summary_solution_payload(project_id, summary_id, names)
+        combined = tuple(sorted((*local, *propagated), key=_summary_effect_order))
+        return BoundedCfgResult(combined[:limit], len(combined) > limit)
 
     def summary_return_origins(
         self,
@@ -3826,15 +3986,55 @@ class SQLiteStore:
             f"""
             SELECT * FROM summary_return_origins
             WHERE project_id = ? AND summary_id = ?
+              AND is_local = 1
               AND build_variant IN ({placeholders})
             ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
                      is_local DESC, kind, id LIMIT ?
             """,
             (project_id, summary_id, *names, limit + 1),
         ).fetchall()
-        return BoundedCfgResult(
-            tuple(self._row_to_summary_return_origin(row) for row in rows[:limit]),
-            len(rows) > limit,
+        local = tuple(self._row_to_summary_return_origin(row) for row in rows)
+        _effects, propagated = self._summary_solution_payload(project_id, summary_id, names)
+        combined = tuple(sorted((*local, *propagated), key=_summary_origin_order))
+        return BoundedCfgResult(combined[:limit], len(combined) > limit)
+
+    def _summary_solution_payload(
+        self, project_id: int, summary_id: str, build_variants: tuple[str, ...]
+    ) -> tuple[tuple[SummaryEffect, ...], tuple[SummaryReturnOrigin, ...]]:
+        placeholders = ",".join("?" for _ in build_variants)
+        row = self._connection.execute(
+            f"""
+            SELECT payloads.encoding, payloads.effect_count, payloads.origin_count,
+                   payloads.uncompressed_bytes, payloads.payload_hash,
+                   length(payloads.payload) AS compressed_bytes,
+                   CASE WHEN length(payloads.payload) <= ?
+                        THEN payloads.payload END AS payload
+            FROM summary_solution_payloads payloads
+            JOIN function_summaries summaries
+              ON summaries.project_id = payloads.project_id
+             AND summaries.id = payloads.summary_id
+            WHERE payloads.project_id = ? AND payloads.summary_id = ?
+              AND summaries.build_variant IN ({placeholders})
+            """,
+            (
+                MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES,
+                project_id,
+                summary_id,
+                *build_variants,
+            ),
+        ).fetchone()
+        if row is None:
+            return (), ()
+        if row["compressed_bytes"] > MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES:
+            raise SummaryPayloadError("summary payload compressed-size limit exceeded")
+        return _decode_summary_payload(
+            summary_id,
+            encoding=row["encoding"],
+            effect_count=row["effect_count"],
+            origin_count=row["origin_count"],
+            uncompressed_bytes=row["uncompressed_bytes"],
+            payload_hash=row["payload_hash"],
+            payload=row["payload"],
         )
 
     def interprocedural_flows(
@@ -4692,6 +4892,24 @@ def _call_limit(limit: int) -> int:
     return limit
 
 
+def _summary_effect_order(item: SummaryEffect) -> tuple[int, int, str, str]:
+    return (
+        0 if item.certainty == DataFlowCertainty.CERTAIN else 1,
+        0 if item.is_local else 1,
+        item.kind.value,
+        item.id,
+    )
+
+
+def _summary_origin_order(item: SummaryReturnOrigin) -> tuple[int, int, str, str]:
+    return (
+        0 if item.certainty == DataFlowCertainty.CERTAIN else 1,
+        0 if item.is_local else 1,
+        item.kind.value,
+        item.id,
+    )
+
+
 def _span_payload(span: SourceSpan) -> dict[str, object]:
     return {
         "path": str(span.path),
@@ -4764,3 +4982,260 @@ def _execute_script(connection: sqlite3.Connection, script: str) -> None:
             pending = ""
     if pending.strip():
         raise ValueError("incomplete SQLite migration statement")
+
+
+def _encode_summary_payload(
+    summary_id: str,
+    effects: Sequence[SummaryEffect],
+    origins: Sequence[SummaryReturnOrigin],
+) -> tuple[int, int, int, str, bytes]:
+    """Return deterministic bounded metadata and bytes for one propagated solution."""
+
+    if len(effects) + len(origins) > MAX_SUMMARY_PAYLOAD_RECORDS:
+        raise SummaryPayloadError("summary payload record limit exceeded")
+    effect_records: list[list[object]] = []
+    for item in effects:
+        if item.is_local or item.summary_id != summary_id:
+            raise SummaryPayloadError("summary payload contains an invalid propagated effect")
+        effect_records.append(
+            [
+                item.id,
+                item.kind.value,
+                item.location_kind.value,
+                item.certainty.value,
+                item.reason,
+                item.parameter_index,
+                list(item.access_path),
+                item.location_id,
+                item.source_access_id,
+                item.via_callsite_id,
+                item.target_symbol_id,
+                item.translation_unit_id,
+                item.build_configuration_id,
+                item.build_variant,
+            ]
+        )
+    origin_records: list[list[object]] = []
+    for item in origins:
+        if item.is_local or item.summary_id != summary_id:
+            raise SummaryPayloadError("summary payload contains an invalid propagated origin")
+        origin_records.append(
+            [
+                item.id,
+                item.kind.value,
+                item.certainty.value,
+                item.reason,
+                item.location_kind.value if item.location_kind else None,
+                item.parameter_index,
+                list(item.access_path),
+                item.location_id,
+                item.callsite_id,
+                item.via_callsite_id,
+                item.target_symbol_id,
+                item.translation_unit_id,
+                item.build_configuration_id,
+                item.build_variant,
+            ]
+        )
+    raw = json.dumps(
+        [effect_records, origin_records],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(raw) > MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES:
+        raise SummaryPayloadError("summary payload decompressed-size limit exceeded")
+    compressed = zlib.compress(raw, level=6)
+    if len(compressed) > MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES:
+        raise SummaryPayloadError("summary payload compressed-size limit exceeded")
+    return (
+        len(effect_records),
+        len(origin_records),
+        len(raw),
+        hashlib.sha256(raw).hexdigest(),
+        compressed,
+    )
+
+
+def _propagated_summary_groups(
+    records: Iterable[SummaryEffect | SummaryReturnOrigin],
+    selected_summary_ids: set[str],
+) -> Iterator[tuple[str, tuple[SummaryEffect | SummaryReturnOrigin, ...]]]:
+    """Group propagated solver output deterministically with one record list per group."""
+
+    current_id: str | None = None
+    current: list[SummaryEffect | SummaryReturnOrigin] = []
+    selected = (
+        item for item in records if not item.is_local and item.summary_id in selected_summary_ids
+    )
+    for item in sorted(selected, key=lambda value: (value.summary_id, value.id)):
+        if current_id is not None and item.summary_id != current_id:
+            yield current_id, tuple(current)
+            current = []
+        current_id = item.summary_id
+        current.append(item)
+    if current_id is not None:
+        yield current_id, tuple(current)
+
+
+def _ordered_summary_groups(
+    records: Iterable[SummaryEffect | SummaryReturnOrigin],
+) -> Iterator[tuple[str, tuple[SummaryEffect | SummaryReturnOrigin, ...]]]:
+    """Group a relational stream while rejecting non-deterministic row order."""
+
+    current_id: str | None = None
+    current: list[SummaryEffect | SummaryReturnOrigin] = []
+    previous_key: tuple[str, str] | None = None
+    for item in records:
+        key = (item.summary_id, item.id)
+        if previous_key is not None and key < previous_key:
+            raise SummaryPayloadError("stored propagated summaries are not ordered")
+        if current_id is not None and item.summary_id != current_id:
+            yield current_id, tuple(current)
+            current = []
+        current_id = item.summary_id
+        current.append(item)
+        previous_key = key
+    if current_id is not None:
+        yield current_id, tuple(current)
+
+
+def _decode_summary_payload(
+    summary_id: str,
+    *,
+    encoding: str,
+    effect_count: int,
+    origin_count: int,
+    uncompressed_bytes: int,
+    payload_hash: str,
+    payload: bytes,
+) -> tuple[tuple[SummaryEffect, ...], tuple[SummaryReturnOrigin, ...]]:
+    """Validate and decode one payload without allowing unbounded allocation."""
+
+    try:
+        if encoding != SUMMARY_PAYLOAD_ENCODING:
+            raise SummaryPayloadError("unsupported summary payload encoding")
+        if not isinstance(effect_count, int) or not isinstance(origin_count, int):
+            raise SummaryPayloadError("summary payload has invalid record counts")
+        if effect_count < 0 or origin_count < 0:
+            raise SummaryPayloadError("summary payload has invalid record counts")
+        if effect_count + origin_count > MAX_SUMMARY_PAYLOAD_RECORDS:
+            raise SummaryPayloadError("summary payload record limit exceeded")
+        if not isinstance(uncompressed_bytes, int) or not (
+            0 <= uncompressed_bytes <= MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES
+        ):
+            raise SummaryPayloadError("summary payload decompressed-size limit exceeded")
+        if not isinstance(payload, bytes) or len(payload) > MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES:
+            raise SummaryPayloadError("summary payload compressed-size limit exceeded")
+
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(payload, MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES + 1)
+        if decoder.unconsumed_tail or len(raw) > MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES:
+            raise SummaryPayloadError("summary payload decompressed-size limit exceeded")
+        remaining = MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES + 1 - len(raw)
+        raw += decoder.flush(remaining)
+        if len(raw) > MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES:
+            raise SummaryPayloadError("summary payload decompressed-size limit exceeded")
+        if not decoder.eof or decoder.unused_data:
+            raise SummaryPayloadError("summary payload compression stream is malformed")
+        if len(raw) != uncompressed_bytes:
+            raise SummaryPayloadError("summary payload decompressed size does not match metadata")
+        if hashlib.sha256(raw).hexdigest() != payload_hash:
+            raise SummaryPayloadError("summary payload hash does not match its contents")
+
+        document = json.loads(raw)
+        if not isinstance(document, list) or len(document) != 2:
+            raise SummaryPayloadError("summary payload document has an invalid shape")
+        effect_records, origin_records = document
+        if not isinstance(effect_records, list) or not isinstance(origin_records, list):
+            raise SummaryPayloadError("summary payload record groups have an invalid shape")
+        if len(effect_records) != effect_count or len(origin_records) != origin_count:
+            raise SummaryPayloadError("summary payload record counts do not match metadata")
+
+        effects = tuple(
+            _summary_effect_from_payload(summary_id, record) for record in effect_records
+        )
+        origins = tuple(
+            _summary_origin_from_payload(summary_id, record) for record in origin_records
+        )
+        return effects, origins
+    except SummaryPayloadError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, zlib.error) as error:
+        raise SummaryPayloadError("summary payload is malformed") from error
+
+
+def _summary_effect_from_payload(summary_id: str, record: object) -> SummaryEffect:
+    values = _summary_payload_record(record, 14)
+    return SummaryEffect(
+        id=_payload_string(values[0]),
+        summary_id=summary_id,
+        kind=SummaryEffectKind(_payload_string(values[1])),
+        location_kind=MemoryLocationKind(_payload_string(values[2])),
+        certainty=DataFlowCertainty(_payload_string(values[3])),
+        reason=_payload_string(values[4]),
+        parameter_index=_payload_optional_index(values[5]),
+        access_path=_payload_string_tuple(values[6]),
+        location_id=_payload_optional_string(values[7]),
+        source_access_id=_payload_optional_string(values[8]),
+        is_local=False,
+        via_callsite_id=_payload_optional_string(values[9]),
+        target_symbol_id=_payload_optional_string(values[10]),
+        translation_unit_id=_payload_string(values[11]),
+        build_configuration_id=_payload_string(values[12]),
+        build_variant=_payload_string(values[13]),
+    )
+
+
+def _summary_origin_from_payload(summary_id: str, record: object) -> SummaryReturnOrigin:
+    values = _summary_payload_record(record, 14)
+    location_kind = _payload_optional_string(values[4])
+    return SummaryReturnOrigin(
+        id=_payload_string(values[0]),
+        summary_id=summary_id,
+        kind=SummaryReturnOriginKind(_payload_string(values[1])),
+        certainty=DataFlowCertainty(_payload_string(values[2])),
+        reason=_payload_string(values[3]),
+        location_kind=MemoryLocationKind(location_kind) if location_kind else None,
+        parameter_index=_payload_optional_index(values[5]),
+        access_path=_payload_string_tuple(values[6]),
+        location_id=_payload_optional_string(values[7]),
+        callsite_id=_payload_optional_string(values[8]),
+        is_local=False,
+        via_callsite_id=_payload_optional_string(values[9]),
+        target_symbol_id=_payload_optional_string(values[10]),
+        translation_unit_id=_payload_string(values[11]),
+        build_configuration_id=_payload_string(values[12]),
+        build_variant=_payload_string(values[13]),
+    )
+
+
+def _summary_payload_record(record: object, length: int) -> list[object]:
+    if not isinstance(record, list) or len(record) != length:
+        raise SummaryPayloadError("summary payload record has an invalid shape")
+    return record
+
+
+def _payload_string(value: object) -> str:
+    if not isinstance(value, str):
+        raise SummaryPayloadError("summary payload string field has an invalid type")
+    return value
+
+
+def _payload_optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    return _payload_string(value)
+
+
+def _payload_optional_index(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SummaryPayloadError("summary payload index has an invalid value")
+    return value
+
+
+def _payload_string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SummaryPayloadError("summary payload access path has an invalid shape")
+    return tuple(value)
