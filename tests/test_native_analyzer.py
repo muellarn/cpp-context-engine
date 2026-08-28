@@ -57,6 +57,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "analyzer_project"
 PARITY_FIXTURE = Path(__file__).parent / "fixtures" / "cpp_project"
 CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
 IMPLICIT_FIXTURE = Path(__file__).parent / "fixtures" / "implicit_project"
+TEMPLATE_DATAFLOW_FIXTURE = Path(__file__).parent / "fixtures" / "template_dataflow_project"
 pytestmark = pytest.mark.native
 
 
@@ -1012,6 +1013,82 @@ def _cached_batch(
 def _cfg_for(batch, qualified_name: str):
     symbol = next(symbol for symbol in batch.symbols if symbol.qualified_name == qualified_name)
     return next(graph for graph in batch.cfg_graphs if graph.function_symbol_id == symbol.id)
+
+
+def _normalized_fact_multiset(facts):
+    return Counter(json.dumps(fact, sort_keys=True, separators=(",", ":")) for fact in facts)
+
+
+def _solution_hashes(batch):
+    return {
+        summary.function_symbol_id: summary.solution_hash for summary in batch.function_summaries
+    }
+
+
+def _semantic_analysis_rows(store):
+    tables = (
+        "cfg_graphs",
+        "cfg_blocks",
+        "cfg_elements",
+        "cfg_edges",
+        "callsites",
+        "call_targets",
+        "data_flow_analyses",
+        "memory_locations",
+        "data_accesses",
+        "data_flow_evidence",
+        "function_summaries",
+        "summary_effects",
+        "summary_return_origins",
+        "call_argument_bindings",
+        "call_result_bindings",
+        "interprocedural_flows",
+    )
+    return {
+        table: tuple(
+            tuple(row)
+            for row in store._connection.execute(  # noqa: SLF001
+                f"SELECT * FROM {table} ORDER BY id"  # noqa: S608 - fixed test table names
+            )
+        )
+        for table in tables
+    }
+
+
+def test_template_specialization_facts_are_exactly_deterministic_across_processes(
+    tmp_path: Path,
+) -> None:
+    configuration = CompilationDatabase.load(
+        TEMPLATE_DATAFLOW_FIXTURE / "compile_commands.json"
+    ).configurations[0]
+    runs = [
+        tuple(
+            fresh_native_client(analyzer_binary(), timeout_seconds=30).analyze(
+                TEMPLATE_DATAFLOW_FIXTURE, configuration
+            )
+        )
+        for _ in range(4)
+    ]
+    normalized = [_normalized_fact_multiset(facts) for facts in runs]
+    assert all(facts == normalized[0] for facts in normalized[1:])
+
+    batches = [
+        NativeClangIngestor._merge_batches(  # noqa: SLF001 - exact raw-to-domain regression
+            (_FactBatchBuilder(TEMPLATE_DATAFLOW_FIXTURE.resolve(), configuration).build(facts),)
+        )
+        for facts in runs
+    ]
+    assert all(batch == batches[0] for batch in batches[1:])
+    assert all(_solution_hashes(batch) == _solution_hashes(batches[0]) for batch in batches[1:])
+    assert all(_solution_hashes(batches[0]).values())
+
+    database_rows = []
+    for index, batch in enumerate(batches[:2]):
+        database = tmp_path / f"index-{index}.db"
+        with SQLiteStore(database, project_root=TEMPLATE_DATAFLOW_FIXTURE) as store:
+            store.apply_ingestion(TEMPLATE_DATAFLOW_FIXTURE, batch)
+            database_rows.append(_semantic_analysis_rows(store))
+    assert database_rows[0] == database_rows[1]
 
 
 @pytest.fixture(scope="module")

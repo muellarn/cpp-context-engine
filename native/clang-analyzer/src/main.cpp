@@ -437,7 +437,25 @@ constexpr unsigned kDataFlowMaxAccessPathDepth = 8;
 constexpr unsigned kDataFlowMaxLocations = 4096;
 
 struct PointsToValue {
-  std::set<const clang::FunctionDecl *> functions;
+  struct FunctionTarget {
+    std::string key;
+    const clang::FunctionDecl *declaration = nullptr;
+    bool indexed = false;
+
+    bool operator==(const FunctionTarget &other) const {
+      // AST addresses are process-local implementation details. The semantic
+      // declaration key and representability are the data-flow value.
+      return key == other.key && indexed == other.indexed;
+    }
+  };
+
+  struct FunctionTargetLess {
+    bool operator()(const FunctionTarget &left, const FunctionTarget &right) const {
+      return left.key < right.key;
+    }
+  };
+
+  std::set<FunctionTarget, FunctionTargetLess> functions;
   std::set<std::string> locations;
   bool complete = true;
   bool includesNull = false;
@@ -482,7 +500,7 @@ struct DataAccessRecord {
   const clang::Stmt *statement = nullptr;
   const clang::Expr *assignedExpression = nullptr;
   std::string expression;
-  std::vector<const clang::FunctionDecl *> pointees;
+  std::vector<PointsToValue::FunctionTarget> pointees;
   bool pointsToComplete = true;
 };
 
@@ -1420,7 +1438,9 @@ private:
     const auto cfgElementKey = [&](const clang::CFGBlock &block, unsigned index) {
       return blockKey(block) + ":element:" + std::to_string(index);
     };
-    std::map<const clang::Stmt *, std::pair<std::string, std::string>> statementAnchors;
+    std::vector<std::pair<const clang::Stmt *, std::pair<std::string, std::string>>>
+        statementAnchors;
+    llvm::SmallPtrSet<const clang::Stmt *, 32> anchoredStatements;
     std::vector<const clang::CFGBlock *> blocks(cfg.begin(), cfg.end());
     std::sort(blocks.begin(), blocks.end(), [](const auto *left, const auto *right) {
       return left->getBlockID() < right->getBlockID();
@@ -1428,9 +1448,10 @@ private:
     for (const auto *block : blocks) {
       unsigned index = 0;
       for (const auto &element : *block) {
-        if (const auto *statement = elementStatement(element))
-          statementAnchors.emplace(statement,
-                                   std::make_pair(blockKey(*block), cfgElementKey(*block, index)));
+        if (const auto *statement = elementStatement(element);
+            statement && anchoredStatements.insert(statement).second)
+          statementAnchors.emplace_back(
+              statement, std::make_pair(blockKey(*block), cfgElementKey(*block, index)));
         ++index;
       }
     }
@@ -1721,23 +1742,21 @@ private:
       while (value.locations.size() > kDataFlowMaxAliasTargets)
         value.locations.erase(std::prev(value.locations.end()));
       const auto remaining = kDataFlowMaxAliasTargets - value.locations.size();
-      std::vector<const clang::FunctionDecl *> functions(value.functions.begin(),
-                                                          value.functions.end());
-      std::sort(functions.begin(), functions.end(), [&](const auto *left, const auto *right) {
-        const auto leftKind = llvm::isa<clang::CXXMethodDecl>(left) ? "method" : "function";
-        const auto rightKind = llvm::isa<clang::CXXMethodDecl>(right) ? "method" : "function";
-        return source_.declKey(left, leftKind) < source_.declKey(right, rightKind);
-      });
-      value.functions.clear();
-      value.functions.insert(functions.begin(), functions.begin() +
-                                                     std::min(remaining, functions.size()));
+      while (value.functions.size() > remaining)
+        value.functions.erase(std::prev(value.functions.end()));
     };
 
     const auto functionTarget = [&](const clang::FunctionDecl *target) {
-      const bool indexed = source_.relative(target->getLocation()).has_value();
+      const auto *declaration = target->getDefinition();
+      if (!declaration)
+        declaration = target->getCanonicalDecl();
+      const auto targetKind =
+          llvm::isa<clang::CXXMethodDecl>(declaration) ? "method" : "function";
+      const bool indexed = source_.relative(declaration->getLocation()).has_value();
       if (!indexed)
         incompleteReasons.insert("external_indirect_target");
-      return PointsToValue{{target}, {}, indexed, false};
+      return PointsToValue{{{source_.declKey(declaration, targetKind), declaration, indexed}},
+                           {}, indexed, false};
     };
     std::function<PointsToValue(const clang::Expr *, const DataFlowState &)> evaluatePointsTo;
     evaluatePointsTo = [&](const clang::Expr *raw, const DataFlowState &state) -> PointsToValue {
@@ -2059,13 +2078,15 @@ private:
                  {"unresolved_reason", complete ? "" : "points_to_set_incomplete"}});
       // A nullable singleton is still only a possible runtime target.
       const bool certain = complete && !value.includesNull && value.functions.size() == 1;
-      for (const auto *target : value.functions) {
-        if (!source_.relative(target->getLocation())) {
+      for (const auto &target : value.functions) {
+        if (!target.indexed) {
           incompleteReasons.insert("external_indirect_target");
           continue;
         }
-        const auto targetKind = llvm::isa<clang::CXXMethodDecl>(target) ? "method" : "function";
-        auto targetKey = emitSymbol(target, targetKind);
+        const auto targetKind = llvm::isa<clang::CXXMethodDecl>(target.declaration)
+                                    ? "method"
+                                    : "function";
+        auto targetKey = emitSymbol(target.declaration, targetKind);
         if (!targetKey) {
           incompleteReasons.insert("unrepresentable_indirect_target_source");
           continue;
@@ -2343,12 +2364,9 @@ private:
     for (const auto &[block, records] : accessesByBlock) {
       for (const auto &access : records) {
         std::vector<std::string> sortedPointeeKeys;
-        for (const auto *pointee : access.pointees) {
-          const auto targetKind = llvm::isa<clang::CXXMethodDecl>(pointee) ? "method" : "function";
-          if (source_.relative(pointee->getLocation()))
-            sortedPointeeKeys.push_back(source_.declKey(pointee, targetKind));
-        }
-        std::sort(sortedPointeeKeys.begin(), sortedPointeeKeys.end());
+        for (const auto &pointee : access.pointees)
+          if (pointee.indexed)
+            sortedPointeeKeys.push_back(pointee.key);
         llvm::json::Array pointeeKeys;
         for (const auto &key : sortedPointeeKeys)
           pointeeKeys.push_back(key);
