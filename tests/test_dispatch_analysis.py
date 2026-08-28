@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
+from analyzer_discovery import analyzer_binary
 from native_cache import cached_native_client, fresh_native_client
 
 from cpp_context_engine.ingestion import NativeClangIngestor
@@ -25,26 +25,14 @@ FIXTURE = Path(__file__).parent / "fixtures" / "dispatch_project"
 pytestmark = pytest.mark.native
 
 
-def _binary() -> Path:
-    configured = os.getenv("CPP_CONTEXT_TEST_ANALYZER")
-    candidate = (
-        Path(configured)
-        if configured
-        else Path(__file__).parents[1] / "build" / "clang-analyzer" / "cpp-context-clang-analyzer"
-    )
-    if not candidate.is_file():
-        pytest.skip("Clang analyzer companion has not been built")
-    return candidate.resolve()
-
-
 def _ingestor() -> NativeClangIngestor:
     return NativeClangIngestor(  # type: ignore[arg-type]
-        cached_native_client(_binary(), timeout_seconds=90)
+        cached_native_client(analyzer_binary(), timeout_seconds=90)
     )
 
 
 def _fresh_ingestor() -> NativeClangIngestor:
-    return NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=90))
+    return NativeClangIngestor(fresh_native_client(analyzer_binary(), timeout_seconds=90))
 
 
 def _batch(*, database: str = "compile_commands.json", variant: str = "default"):

@@ -17,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from analyzer_discovery import analyzer_binary
 from native_cache import (
     CachedNativeAnalyzerClient,
     NativeFixtureCache,
@@ -57,18 +58,6 @@ PARITY_FIXTURE = Path(__file__).parent / "fixtures" / "cpp_project"
 CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
 IMPLICIT_FIXTURE = Path(__file__).parent / "fixtures" / "implicit_project"
 pytestmark = pytest.mark.native
-
-
-def _binary() -> Path:
-    configured = os.getenv("CPP_CONTEXT_TEST_ANALYZER")
-    candidate = (
-        Path(configured)
-        if configured
-        else Path(__file__).parents[1] / "build" / "clang-analyzer" / "cpp-context-clang-analyzer"
-    )
-    if not candidate.is_file():
-        pytest.skip("Clang analyzer companion has not been built")
-    return candidate.resolve()
 
 
 def _script(tmp_path: Path, body: str) -> Path:
@@ -843,7 +832,7 @@ def test_native_handshake_matches_protocol_golden() -> None:
         "required_clang_major": 18,
     }
     completed = subprocess.run(  # noqa: S603 - repository-built test binary
-        [_binary()],
+        [analyzer_binary()],
         input=json.dumps(request) + "\n",
         text=True,
         capture_output=True,
@@ -868,7 +857,7 @@ def test_real_companion_finalizes_gzip_when_rejecting_request() -> None:
     }
     malformed_analyze = {"type": "analyze"}
     completed = subprocess.run(
-        [_binary()],
+        [analyzer_binary()],
         input=(json.dumps(hello) + "\n" + json.dumps(malformed_analyze) + "\n").encode(),
         capture_output=True,
         check=False,
@@ -881,8 +870,10 @@ def test_real_companion_finalizes_gzip_when_rejecting_request() -> None:
 
 
 def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
-    gzip_client = fresh_native_client(_binary(), timeout_seconds=30)
-    plain_client = fresh_native_client(_binary(), timeout_seconds=30, prefer_compression=False)
+    gzip_client = fresh_native_client(analyzer_binary(), timeout_seconds=30)
+    plain_client = fresh_native_client(
+        analyzer_binary(), timeout_seconds=30, prefer_compression=False
+    )
 
     gzip_batch = NativeClangIngestor(gzip_client).ingest(FIXTURE, FIXTURE / "compile_commands.json")
     plain_batch = NativeClangIngestor(plain_client).ingest(
@@ -897,7 +888,7 @@ def test_implicit_lambda_copy_has_no_orphan_symbol_references() -> None:
     configuration = CompilationDatabase.load(
         IMPLICIT_FIXTURE / "compile_commands.json"
     ).configurations[0]
-    client = fresh_native_client(_binary(), timeout_seconds=30)
+    client = fresh_native_client(analyzer_binary(), timeout_seconds=30)
     facts = client.analyze(IMPLICIT_FIXTURE, configuration)
     repeated = client.analyze(IMPLICIT_FIXTURE, configuration)
     endpoint_keys = {fact["key"] for fact in facts if fact.get("fact") in {"file", "symbol"}}
@@ -917,7 +908,9 @@ def test_implicit_lambda_copy_has_no_orphan_symbol_references() -> None:
 
 def test_reopened_namespace_preserves_each_definition_occurrence() -> None:
     configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
-    facts = cached_native_client(_binary(), timeout_seconds=30).analyze(FIXTURE, configuration)
+    facts = cached_native_client(analyzer_binary(), timeout_seconds=30).analyze(
+        FIXTURE, configuration
+    )
 
     namespace_paths = {
         Path(fact["span"]["path"]).relative_to(FIXTURE.resolve()).as_posix()
@@ -1000,7 +993,7 @@ def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
 
 
 def _cfg_batch(*, database: str = "compile_commands.json", variant: str = "default"):
-    return NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=30)).ingest(
+    return NativeClangIngestor(fresh_native_client(analyzer_binary(), timeout_seconds=30)).ingest(
         CFG_FIXTURE, CFG_FIXTURE / database, build_variant=variant
     )
 
@@ -1011,7 +1004,7 @@ def _cached_batch(
     database: str = "compile_commands.json",
     variant: str = "default",
 ):
-    return NativeClangIngestor(cached_native_client(_binary(), timeout_seconds=30)).ingest(
+    return NativeClangIngestor(cached_native_client(analyzer_binary(), timeout_seconds=30)).ingest(
         fixture, fixture / database, build_variant=variant
     )
 
@@ -1202,7 +1195,7 @@ def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(
 
 
 def test_cfg_adapter_rejects_cross_graph_block_references() -> None:
-    client = cached_native_client(_binary(), timeout_seconds=30)
+    client = cached_native_client(analyzer_binary(), timeout_seconds=30)
     configuration = CompilationDatabase.load(CFG_FIXTURE / "compile_commands.json").configurations[
         0
     ]
@@ -1269,7 +1262,7 @@ def test_cfg_reindex_replaces_only_changed_tu_and_rolls_back_atomically(tmp_path
     project = tmp_path / "project"
     shutil.copytree(PARITY_FIXTURE, project)
     database = project / "compile_commands.json"
-    ingestor = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30))
+    ingestor = NativeClangIngestor(NativeAnalyzerClient(analyzer_binary(), timeout_seconds=30))
     with SQLiteStore(tmp_path / "index.db", project_root=project) as store:
         indexer = ProjectIndexer(ingestor, store)
         first = indexer.index(project, database)
@@ -1322,7 +1315,7 @@ def test_companion_preserves_baseline_canonical_ids_and_relation_parity() -> Non
         baseline = ClangIngestor().ingest(fixture, fixture / "compile_commands.json")
     except ClangUnavailableError as error:
         pytest.skip(str(error))
-    native = NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=30)).ingest(
+    native = NativeClangIngestor(fresh_native_client(analyzer_binary(), timeout_seconds=30)).ingest(
         fixture, fixture / "compile_commands.json"
     )
     names = {"demo::Base", "demo::Derived", "demo::Derived::compute", "demo::helper", "run"}
@@ -1353,7 +1346,8 @@ def test_switching_from_baseline_to_companion_forces_reindex(tmp_path: Path) -> 
     with SQLiteStore(tmp_path / "index.db", project_root=fixture) as store:
         first = ProjectIndexer(baseline, store).index(fixture, database)
         upgraded = ProjectIndexer(
-            NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=30)), store
+            NativeClangIngestor(fresh_native_client(analyzer_binary(), timeout_seconds=30)),
+            store,
         ).index(fixture, database)
         states = store.translation_unit_states(fixture)
 
@@ -1663,7 +1657,7 @@ def test_doctor_checks_real_companion(capsys: pytest.CaptureFixture[str]) -> Non
                 "--compile-commands",
                 str(FIXTURE / "compile_commands.json"),
                 "--clang-analyzer",
-                str(_binary()),
+                str(analyzer_binary()),
                 "--json",
             ]
         )
@@ -1698,7 +1692,7 @@ def test_cli_index_reports_companion_coverage(
                 "--compile-commands",
                 str(fixture / "compile_commands.json"),
                 "--clang-analyzer",
-                str(_binary()),
+                str(analyzer_binary()),
                 "--db",
                 str(tmp_path / "index.db"),
                 "--embedding-dimensions",
