@@ -1747,12 +1747,30 @@ private:
     };
 
     const auto functionTarget = [&](const clang::FunctionDecl *target) {
-      const auto *declaration = target->getDefinition();
-      if (!declaration)
-        declaration = target->getCanonicalDecl();
+      const clang::FunctionDecl *declaration = nullptr;
+      std::optional<std::tuple<int, std::string, std::int64_t>> declarationRank;
+      for (const auto *redecl : target->redecls()) {
+        const auto relative = source_.relative(redecl->getLocation());
+        if (!relative)
+          continue;
+        const auto rank = std::make_tuple(redecl->isThisDeclarationADefinition() ? 0 : 1,
+                                          *relative,
+                                          source_.offset(redecl->getLocation(), false));
+        // A canonical declaration can be an external header declaration. Pick the
+        // same project-representable redeclaration for every reference to the entity.
+        if (!declarationRank || rank < *declarationRank) {
+          declaration = redecl;
+          declarationRank = rank;
+        }
+      }
+      const bool indexed = declaration != nullptr;
+      if (!declaration) {
+        declaration = target->getDefinition();
+        if (!declaration)
+          declaration = target->getCanonicalDecl();
+      }
       const auto targetKind =
           llvm::isa<clang::CXXMethodDecl>(declaration) ? "method" : "function";
-      const bool indexed = source_.relative(declaration->getLocation()).has_value();
       if (!indexed)
         incompleteReasons.insert("external_indirect_target");
       return PointsToValue{{{source_.declKey(declaration, targetKind), declaration, indexed}},

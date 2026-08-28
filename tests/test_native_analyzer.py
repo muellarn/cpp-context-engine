@@ -1091,6 +1091,59 @@ def test_template_specialization_facts_are_exactly_deterministic_across_processe
     assert database_rows[0] == database_rows[1]
 
 
+def test_indirect_target_keeps_an_indexed_redeclaration_after_an_external_declaration(
+    tmp_path: Path,
+) -> None:
+    external_header = tmp_path / "external.hpp"
+    external_header.write_text("int external_target(int);\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text(
+        '#include "../external.hpp"\n'
+        "int external_target(int);\n"
+        "int call_external(int value) {\n"
+        "  auto target = &external_target;\n"
+        "  return target(value);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    database = project / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(project),
+                    "file": str(source),
+                    "arguments": ["clang++", "-std=c++20", "-c", str(source)],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configuration = CompilationDatabase.load(database).configurations[0]
+    facts = fresh_native_client(analyzer_binary(), timeout_seconds=30).analyze(
+        project, configuration
+    )
+    target_key = next(
+        fact["key"]
+        for fact in facts
+        if fact.get("fact") == "symbol" and fact.get("qualified_name") == "external_target"
+    )
+
+    assert any(
+        target_key in fact.get("pointee_keys", ())
+        for fact in facts
+        if fact.get("fact") == "data_access_v1"
+    )
+    assert any(
+        fact.get("target_key") == target_key
+        for fact in facts
+        if fact.get("fact") == "call_target_v1"
+    )
+    _FactBatchBuilder(project.resolve(), configuration).build(facts)
+
+
 @pytest.fixture(scope="module")
 def deterministic_cfg_batches():
     """Two genuinely fresh analyses shared by the CFG determinism assertions."""
