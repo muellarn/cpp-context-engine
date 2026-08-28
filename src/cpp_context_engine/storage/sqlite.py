@@ -1410,6 +1410,9 @@ class SQLiteStore:
                         )
                         self._delete_translation_units(project_id, batch_unit_ids)
                     self._stage_ingestion_batch(project_id, batch)
+                    # Release TU-local tuples before requesting the next batch;
+                    # Python for-loops otherwise retain the previous loop value.
+                    del batch
 
                 if remaining_changed_ids:
                     raise ValueError("ingestion stream ended before every changed translation unit")
@@ -1436,9 +1439,13 @@ class SQLiteStore:
                     """,
                     (project_id, selected_variant.name),
                 )
+                # Cleanup is part of the same transaction as publication. A
+                # cleanup error can therefore still roll the entire run back.
+                self._clear_ingestion_tracking()
                 return invalidated_summaries
         finally:
-            self._clear_ingestion_tracking()
+            if self._connection.in_transaction:
+                self._connection.rollback()
 
     def _reset_ingestion_tracking(self) -> None:
         self._connection.execute(
@@ -1450,11 +1457,11 @@ class SQLiteStore:
             "(id TEXT PRIMARY KEY) WITHOUT ROWID"
         )
         self._clear_ingestion_tracking()
+        self._connection.commit()
 
     def _clear_ingestion_tracking(self) -> None:
         self._connection.execute("DELETE FROM temp._ingestion_affected_symbols")
         self._connection.execute("DELETE FROM temp._ingestion_affected_functions")
-        self._connection.commit()
 
     def _track_replaced_units(
         self, project_id: int, build_variant: str, unit_ids: Iterable[str]

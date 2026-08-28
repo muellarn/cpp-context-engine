@@ -12,7 +12,7 @@ import threading
 import time
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from io import BufferedRandom
@@ -605,6 +605,14 @@ class NativeAnalyzerClient:
         return records
 
 
+def _raise_completed_failure(futures: Iterable[Future[IngestionBatch]]) -> None:
+    """Surface a failed out-of-order worker before waiting on an earlier TU."""
+
+    for future in futures:
+        if future.done() and not future.cancelled() and future.exception() is not None:
+            future.result()
+
+
 class NativeClangIngestor:
     """Convert complete companion facts into the existing durable domain model."""
 
@@ -670,8 +678,22 @@ class NativeClangIngestor:
         next_configuration = worker_count
         try:
             for index in range(len(selected)):
+                current = futures[index]
+                watched = set(futures.values())
+                while not current.done():
+                    completed, _pending = wait(watched, return_when=FIRST_COMPLETED)
+                    # Dict insertion order selects the earliest input failure if
+                    # several workers fail in the same completion interval.
+                    _raise_completed_failure(futures.values())
+                    watched.difference_update(completed)
+                _raise_completed_failure(futures.values())
                 batch = futures.pop(index).result()
-                yield batch
+                try:
+                    yield batch
+                finally:
+                    # A suspended generator otherwise keeps this completed batch
+                    # alive while waiting for the following analyzer process.
+                    del batch
                 if next_configuration < len(selected):
                     futures[next_configuration] = executor.submit(
                         analyze, selected[next_configuration]

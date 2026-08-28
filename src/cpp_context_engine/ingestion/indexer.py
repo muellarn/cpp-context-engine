@@ -97,7 +97,12 @@ class ProjectIndexer:
             for batch in batch_stream:
                 for result_name, batch_name in _BATCH_COUNT_FIELDS:
                     counts[result_name] += len(getattr(batch, batch_name))
-                yield batch
+                try:
+                    yield batch
+                finally:
+                    # Do not retain an already staged TU while the producer is
+                    # blocked building the next potentially large batch.
+                    del batch
 
         removed = len(set(previous) - current_ids)
         try:

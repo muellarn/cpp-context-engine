@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import weakref
 from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -136,6 +138,55 @@ def test_project_indexer_consumes_tu_batches_without_project_wide_batch(tmp_path
     assert ingestor.yielded == 120
 
 
+def test_staged_batch_is_released_before_waiting_for_the_next_batch(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = _database(root, 2)
+    second_requested = threading.Event()
+    release_second = threading.Event()
+    failures: list[BaseException] = []
+    first_payload: list[weakref.ReferenceType[str]] = []
+
+    class Payload(str):
+        pass
+
+    def first_batch(configuration: BuildConfiguration) -> IngestionBatch:
+        batch = _batch(configuration)
+        payload = Payload("x" * (1024 * 1024))
+        first_payload.append(weakref.ref(payload))
+        return replace(batch, symbols=(replace(batch.symbols[0], source_text=payload),))
+
+    class BlockingIngestor(_StreamingOnlyIngestor):
+        def iter_configuration_batches(
+            self, _project_root: Path, configurations: Iterable[BuildConfiguration]
+        ) -> Iterator[IngestionBatch]:
+            for index, configuration in enumerate(configurations):
+                if index == 1:
+                    second_requested.set()
+                    assert release_second.wait(timeout=5)
+                yield first_batch(configuration) if index == 0 else _batch(configuration)
+
+    def index_in_background() -> None:
+        try:
+            with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+                ProjectIndexer(BlockingIngestor(), store).index(root, database)
+        except BaseException as error:  # pragma: no cover - surfaced below
+            failures.append(error)
+
+    worker = threading.Thread(target=index_in_background)
+    worker.start()
+    assert second_requested.wait(timeout=5)
+    try:
+        assert len(first_payload) == 1
+        assert first_payload[0]() is None
+    finally:
+        release_second.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+
+
 def test_stream_failure_rolls_back_all_staged_units_and_orphans(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -153,6 +204,38 @@ def test_stream_failure_rolls_back_all_staged_units_and_orphans(tmp_path: Path) 
         with pytest.raises(RuntimeError, match="injected streamed ingestion failure"):
             ProjectIndexer(_StreamingOnlyIngestor(fail_after=100), store).index(root, database)
 
+        assert _semantic_dump(store) == before
+        assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
+
+
+def test_tracking_cleanup_failure_happens_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = _database(root, 2)
+
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        ProjectIndexer(_StreamingOnlyIngestor(), store).index(root, database)
+        before = _semantic_dump(store)
+        changed = root / "unit-000.cpp"
+        changed.write_text(changed.read_text(encoding="utf-8") + "// changed\n", encoding="utf-8")
+        original_clear = store._clear_ingestion_tracking  # noqa: SLF001
+        calls = 0
+
+        def fail_final_cleanup() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected tracking cleanup failure")
+            original_clear()
+
+        monkeypatch.setattr(store, "_clear_ingestion_tracking", fail_final_cleanup)
+
+        with pytest.raises(RuntimeError, match="tracking cleanup failure"):
+            ProjectIndexer(_StreamingOnlyIngestor(), store).index(root, database)
+
+        assert calls == 2
         assert _semantic_dump(store) == before
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
 
