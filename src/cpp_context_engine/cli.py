@@ -143,6 +143,10 @@ def _add_project_options(
         parser.add_argument("--analyzer-max-record-bytes", type=int)
         parser.add_argument("--analyzer-max-stderr-bytes", type=int)
         parser.add_argument("--analyzer-max-workers", type=int)
+        parser.add_argument("--analyzer-max-spool-registries", type=int)
+        parser.add_argument("--analyzer-max-spool-bytes", type=int)
+        parser.add_argument("--analyzer-max-spool-files", type=int)
+        parser.add_argument("--analyzer-max-domain-batches", type=int)
 
 
 def _add_embedding_options(parser: argparse.ArgumentParser) -> None:
@@ -214,6 +218,14 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         or base.analyzer_max_stderr_bytes,
         analyzer_max_workers=getattr(args, "analyzer_max_workers", None)
         or base.analyzer_max_workers,
+        analyzer_max_spool_registries=getattr(args, "analyzer_max_spool_registries", None)
+        or base.analyzer_max_spool_registries,
+        analyzer_max_spool_bytes=getattr(args, "analyzer_max_spool_bytes", None)
+        or base.analyzer_max_spool_bytes,
+        analyzer_max_spool_files=getattr(args, "analyzer_max_spool_files", None)
+        or base.analyzer_max_spool_files,
+        analyzer_max_domain_batches=getattr(args, "analyzer_max_domain_batches", None)
+        or base.analyzer_max_domain_batches,
         embedding_provider=getattr(args, "embedding_provider", None) or base.embedding_provider,
         embedding_base_url=getattr(args, "embedding_base_url", None) or base.embedding_base_url,
         embedding_model=getattr(args, "embedding_model", None) or base.embedding_model,
