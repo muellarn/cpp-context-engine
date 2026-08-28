@@ -207,6 +207,146 @@ def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path
     ]
 
 
+def test_native_configuration_batches_bound_the_completed_reorder_window(tmp_path: Path) -> None:
+    started: list[int] = []
+    second_completed = threading.Event()
+
+    class OutOfOrderClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            index = int(configuration.id.removeprefix("build-"))
+            started.append(index)
+            if index == 0:
+                assert second_completed.wait(timeout=2)
+            elif index == 1:
+                second_completed.set()
+            return []
+
+    configurations = []
+    for index in range(8):
+        source = tmp_path / f"ordered-{index}.cpp"
+        source.write_text(f"int ordered_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    batches = NativeClangIngestor(  # type: ignore[arg-type]
+        OutOfOrderClient(), max_workers=2
+    ).iter_configuration_batches(tmp_path, configurations)
+    first = next(batches)
+
+    assert [unit.build_configuration_id for unit in first.translation_units] == ["build-0"]
+    # A completed later item must not cause unbounded refill while the next ordered
+    # batch is still retained by the consumer.
+    assert sorted(started) == [0, 1]
+    assert [batch.translation_units[0].build_configuration_id for batch in batches] == [
+        f"build-{index}" for index in range(1, 8)
+    ]
+
+
+def test_closing_native_configuration_batches_cancels_pending_workers(tmp_path: Path) -> None:
+    pending_started = threading.Event()
+    pending_cancelled = threading.Event()
+
+    class CancellableClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze_stream(
+            self,
+            _root: Path,
+            configuration: BuildConfiguration,
+            _consume: object,
+            *,
+            cancelled: threading.Event,
+        ) -> None:
+            if configuration.id == "build-0":
+                return
+            pending_started.set()
+            if cancelled.wait(timeout=2):
+                pending_cancelled.set()
+
+    configurations = []
+    for index in range(2):
+        source = tmp_path / f"cancel-{index}.cpp"
+        source.write_text(f"int cancel_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    batches = NativeClangIngestor(  # type: ignore[arg-type]
+        CancellableClient(), max_workers=2
+    ).iter_configuration_batches(tmp_path, configurations)
+    next(batches)
+    assert pending_started.wait(timeout=2)
+    batches.close()
+
+    assert pending_cancelled.is_set()
+
+
+def test_later_native_worker_failure_cancels_the_slow_ordered_worker(tmp_path: Path) -> None:
+    slow_started = threading.Event()
+    slow_cancelled = threading.Event()
+
+    class OutOfOrderFailingClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze_stream(
+            self,
+            _root: Path,
+            configuration: BuildConfiguration,
+            _consume: object,
+            *,
+            cancelled: threading.Event,
+        ) -> None:
+            if configuration.id == "build-0":
+                slow_started.set()
+                if cancelled.wait(timeout=2):
+                    slow_cancelled.set()
+                return
+            assert slow_started.wait(timeout=2)
+            raise RuntimeError("injected later worker failure")
+
+    configurations = []
+    for index in range(2):
+        source = tmp_path / f"later-failure-{index}.cpp"
+        source.write_text(f"int later_failure_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    batches = NativeClangIngestor(  # type: ignore[arg-type]
+        OutOfOrderFailingClient(), max_workers=2
+    ).iter_configuration_batches(tmp_path, configurations)
+    with pytest.raises(RuntimeError, match="injected later worker failure"):
+        next(batches)
+
+    assert slow_cancelled.is_set()
+
+
 def test_native_worker_failure_cancels_pending_work_without_partial_batch(tmp_path: Path) -> None:
     started: list[int] = []
     lock = threading.Lock()

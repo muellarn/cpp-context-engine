@@ -12,7 +12,7 @@ import threading
 import time
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from io import BufferedRandom
@@ -605,6 +605,14 @@ class NativeAnalyzerClient:
         return records
 
 
+def _raise_completed_failure(futures: Iterable[Future[IngestionBatch]]) -> None:
+    """Surface a failed out-of-order worker before waiting on an earlier TU."""
+
+    for future in futures:
+        if future.done() and not future.cancelled() and future.exception() is not None:
+            future.result()
+
+
 class NativeClangIngestor:
     """Convert complete companion facts into the existing durable domain model."""
 
@@ -634,6 +642,14 @@ class NativeClangIngestor:
     def ingest_configurations(
         self, project_root: Path, configurations: Iterable[BuildConfiguration]
     ) -> IngestionBatch:
+        batches = list(self.iter_configuration_batches(project_root, configurations))
+        return self._merge_batches(batches)
+
+    def iter_configuration_batches(
+        self, project_root: Path, configurations: Iterable[BuildConfiguration]
+    ) -> Iterator[IngestionBatch]:
+        """Yield TU batches in input order with a bounded parallel reorder window."""
+
         root = project_root.resolve(strict=False)
         self.client.probe()
         selected = tuple(configurations)
@@ -648,41 +664,49 @@ class NativeClangIngestor:
                 analyze_stream(root, configuration, facts.add, cancelled=cancelled)
                 return builder.build(facts)
 
-        # Each configuration is a separate companion process. Aggregate completed
-        # batches in input order so durable IDs and output remain deterministic.
-        # Large C++ TUs can be memory intensive. Default to one companion and let
-        # operators raise this explicit hard bound for their measured workload.
+        # Each configuration is a separate companion process. Submit only one fixed
+        # window and refill it after the next ordered batch has been consumed. This
+        # prevents a slow early TU from retaining an unbounded tail of completed TUs.
         worker_count = min(self.max_workers, max(1, len(selected)))
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(analyze, configuration): index
-                for index, configuration in enumerate(selected[:worker_count])
-            }
-            batches_by_index: dict[int, IngestionBatch] = {}
-            next_configuration = worker_count
-            try:
-                while futures:
-                    done, _pending = wait(futures, return_when=FIRST_COMPLETED)
-                    failed = next(
-                        (future for future in done if future.exception() is not None), None
+        if not selected:
+            return
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        futures: dict[int, Future[IngestionBatch]] = {
+            index: executor.submit(analyze, configuration)
+            for index, configuration in enumerate(selected[:worker_count])
+        }
+        next_configuration = worker_count
+        try:
+            for index in range(len(selected)):
+                current = futures[index]
+                watched = set(futures.values())
+                while not current.done():
+                    completed, _pending = wait(watched, return_when=FIRST_COMPLETED)
+                    # Dict insertion order selects the earliest input failure if
+                    # several workers fail in the same completion interval.
+                    _raise_completed_failure(futures.values())
+                    watched.difference_update(completed)
+                _raise_completed_failure(futures.values())
+                batch = futures.pop(index).result()
+                try:
+                    yield batch
+                finally:
+                    # A suspended generator otherwise keeps this completed batch
+                    # alive while waiting for the following analyzer process.
+                    del batch
+                if next_configuration < len(selected):
+                    futures[next_configuration] = executor.submit(
+                        analyze, selected[next_configuration]
                     )
-                    if failed is not None:
-                        failed.result()
-                    completed = sorted((futures.pop(future), future.result()) for future in done)
-                    for index, batch in completed:
-                        batches_by_index[index] = batch
-                    for _index, _batch in completed:
-                        if next_configuration >= len(selected):
-                            break
-                        future = executor.submit(analyze, selected[next_configuration])
-                        futures[future] = next_configuration
-                        next_configuration += 1
-            except BaseException:
-                cancelled.set()
-                for future in futures:
-                    future.cancel()
-                raise
-        batches = [batches_by_index[index] for index in range(len(selected))]
+                    next_configuration += 1
+        finally:
+            cancelled.set()
+            for future in futures.values():
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    @staticmethod
+    def _merge_batches(batches: Sequence[IngestionBatch]) -> IngestionBatch:
         callsites = tuple(site for batch in batches for site in batch.callsites)
         call_targets = tuple(target for batch in batches for target in batch.call_targets)
         all_edges = tuple(edge for batch in batches for edge in batch.edges)

@@ -1332,168 +1332,277 @@ class SQLiteStore:
     ) -> int:
         """Atomically replace changed units and optionally remove stale units."""
 
-        root = str(project_root.resolve(strict=False))
         selected_variant = build_variant or (
             batch.build_variants[0]
             if batch.build_variants
             else BuildVariant(DEFAULT_BUILD_VARIANT, Path("."))
         )
+        return self.apply_ingestion_batches(
+            project_root,
+            (batch,),
+            current_translation_unit_ids=current_translation_unit_ids,
+            changed_translation_unit_ids=frozenset(unit.id for unit in batch.translation_units),
+            build_variant=selected_variant,
+        )
+
+    def apply_ingestion_batches(
+        self,
+        project_root: Path,
+        batches: Iterable[IngestionBatch],
+        *,
+        current_translation_unit_ids: frozenset[str] | None = None,
+        changed_translation_unit_ids: frozenset[str] | None = None,
+        build_variant: BuildVariant | None = None,
+    ) -> int:
+        """Atomically stage and retire TU-sized batches before global finalization."""
+
+        root = str(project_root.resolve(strict=False))
+        selected_variant = build_variant or BuildVariant(DEFAULT_BUILD_VARIANT, Path("."))
         # Canonical symbols are derived once from the newly inserted variants at
         # the end of this transaction. Deferral keeps child fact insertion valid
         # without a redundant provisional canonical-symbol write pass.
+        self._reset_ingestion_tracking()
         self._connection.execute("PRAGMA defer_foreign_keys = ON")
-        with self._connection:
-            project_id = self._ensure_project(root)
-            self._put_build_variant(project_id, selected_variant)
-            existing: set[str] = set()
-            if current_translation_unit_ids is not None:
-                existing = {
+        try:
+            with self._connection:
+                project_id = self._ensure_project(root)
+                self._put_build_variant(project_id, selected_variant)
+                existing: set[str] = set()
+                if current_translation_unit_ids is not None:
+                    existing = {
+                        row[0]
+                        for row in self._connection.execute(
+                            """
+                            SELECT id FROM translation_units
+                            WHERE project_id = ? AND build_variant = ?
+                            """,
+                            (project_id, selected_variant.name),
+                        )
+                    }
+                removed_ids = (
+                    existing - current_translation_unit_ids
+                    if current_translation_unit_ids is not None
+                    else set()
+                )
+                replaced_ids = removed_ids | set(changed_translation_unit_ids or ())
+                remaining_changed_ids = (
+                    set(changed_translation_unit_ids)
+                    if changed_translation_unit_ids is not None
+                    else None
+                )
+                if replaced_ids:
+                    self._track_replaced_units(project_id, selected_variant.name, replaced_ids)
+                    self._delete_translation_units(project_id, replaced_ids)
+
+                for batch in batches:
+                    batch_unit_ids = {unit.id for unit in batch.translation_units}
+                    if remaining_changed_ids is not None:
+                        unexpected = batch_unit_ids - remaining_changed_ids
+                        if unexpected:
+                            raise ValueError(
+                                "ingestion stream returned an unexpected or duplicate "
+                                "translation unit"
+                            )
+                        remaining_changed_ids -= batch_unit_ids
+                    if changed_translation_unit_ids is None and batch_unit_ids:
+                        self._track_replaced_units(
+                            project_id, selected_variant.name, batch_unit_ids
+                        )
+                        self._delete_translation_units(project_id, batch_unit_ids)
+                    self._stage_ingestion_batch(project_id, batch)
+                    # Release TU-local tuples before requesting the next batch;
+                    # Python for-loops otherwise retain the previous loop value.
+                    del batch
+
+                if remaining_changed_ids:
+                    raise ValueError("ingestion stream ended before every changed translation unit")
+
+                self._refresh_indexed_override_candidates(project_id, selected_variant.name)
+                affected_functions = {
                     row[0]
                     for row in self._connection.execute(
-                        """
-                        SELECT id FROM translation_units
-                        WHERE project_id = ? AND build_variant = ?
-                        """,
-                        (project_id, selected_variant.name),
+                        "SELECT id FROM temp._ingestion_affected_functions ORDER BY id"
                     )
                 }
-            changed_ids = {unit.id for unit in batch.translation_units}
-            removed_ids = (
-                existing - current_translation_unit_ids
-                if current_translation_unit_ids is not None
-                else set()
-            )
-            replaced_ids = removed_ids | changed_ids
-            affected_symbols = self._symbols_from_units(project_id, replaced_ids)
-            affected_functions = self._summary_functions_from_units(project_id, replaced_ids)
-            affected_functions |= self._reverse_summary_callers(
-                project_id, selected_variant.name, affected_functions
-            )
-            self._delete_translation_units(project_id, replaced_ids)
+                affected_functions |= self._reverse_summary_callers(
+                    project_id, selected_variant.name, affected_functions
+                )
+                invalidated_summaries = self._refresh_summary_solutions(
+                    project_id, selected_variant.name, affected_functions
+                )
+                self._refresh_tracked_symbols(project_id)
+                self._delete_orphans(project_id)
+                self._connection.execute(
+                    """
+                    UPDATE build_variants SET reindex_required = 0
+                    WHERE project_id = ? AND name = ?
+                    """,
+                    (project_id, selected_variant.name),
+                )
+                # Cleanup is part of the same transaction as publication. A
+                # cleanup error can therefore still roll the entire run back.
+                self._clear_ingestion_tracking()
+                return invalidated_summaries
+        finally:
+            if self._connection.in_transaction:
+                self._connection.rollback()
 
-            for configuration in batch.build_configurations:
-                self._connection.execute(
-                    """
-                    INSERT INTO build_configurations(
-                        project_id, id, source_path, directory, arguments_json,
-                        command_hash, output, build_variant
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(project_id, id) DO UPDATE SET
-                        source_path = excluded.source_path,
-                        directory = excluded.directory,
-                        arguments_json = excluded.arguments_json,
-                        command_hash = excluded.command_hash,
-                        output = excluded.output
-                    """,
-                    (
-                        project_id,
-                        configuration.id,
-                        str(configuration.source_path),
-                        str(configuration.directory),
-                        json.dumps(configuration.arguments),
-                        configuration.command_hash,
-                        str(configuration.output) if configuration.output else None,
-                        configuration.build_variant,
-                    ),
-                )
-            for unit in batch.translation_units:
-                self._connection.execute(
-                    """
-                    INSERT INTO translation_units(
-                        project_id, id, build_configuration_id, source_path,
-                        content_hash, diagnostics_json, build_variant,
-                        analysis_backend, advanced_facts_complete
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        project_id,
-                        unit.id,
-                        unit.build_configuration_id,
-                        str(unit.source_path),
-                        unit.content_hash,
-                        json.dumps(unit.diagnostics),
-                        unit.build_variant,
-                        unit.analysis_backend,
-                        int(unit.advanced_facts_complete),
-                    ),
-                )
-                self._connection.executemany(
-                    """
-                    INSERT INTO dependencies(
-                        project_id, translation_unit_id, path, content_hash
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        (project_id, unit.id, str(path), content_hash)
-                        for path, content_hash in unit.dependencies
-                    ),
-                )
+    def _reset_ingestion_tracking(self) -> None:
+        self._connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _ingestion_affected_symbols "
+            "(id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        self._connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _ingestion_affected_functions "
+            "(id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        self._clear_ingestion_tracking()
+        self._connection.commit()
 
-            symbols = tuple(batch.symbols)
-            for symbol in symbols:
-                self._connection.execute(
-                    """
-                    INSERT OR IGNORE INTO translation_unit_symbols(
-                        project_id, translation_unit_id, symbol_id,
-                        is_definition
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        project_id,
-                        symbol.translation_unit_id,
-                        symbol.id,
-                        int(bool(symbol.metadata.get("is_definition"))),
-                    ),
-                )
-            self._put_symbol_variants(project_id, symbols)
-            self._put_occurrences(project_id, batch.occurrences)
-            self._put_edges(project_id, batch.edges)
-            self._put_cfg_facts(
-                project_id,
-                batch.cfg_graphs,
-                batch.cfg_blocks,
-                batch.cfg_elements,
-                batch.cfg_edges,
+    def _clear_ingestion_tracking(self) -> None:
+        self._connection.execute("DELETE FROM temp._ingestion_affected_symbols")
+        self._connection.execute("DELETE FROM temp._ingestion_affected_functions")
+
+    def _track_replaced_units(
+        self, project_id: int, build_variant: str, unit_ids: Iterable[str]
+    ) -> None:
+        ids = sorted(set(unit_ids))
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            self._connection.execute(
+                f"""
+                INSERT OR IGNORE INTO temp._ingestion_affected_symbols(id)
+                SELECT DISTINCT symbol_id FROM translation_unit_symbols
+                WHERE project_id = ? AND translation_unit_id IN ({placeholders})
+                """,
+                (project_id, *chunk),
             )
-            self._put_call_facts(project_id, batch.callsites, batch.call_targets)
-            self._put_data_flow_facts(
-                project_id,
-                batch.data_flow_analyses,
-                batch.memory_locations,
-                batch.data_accesses,
-                batch.data_flow_evidence,
+            functions = self._summary_functions_from_units(project_id, set(chunk))
+            functions |= self._reverse_summary_callers(project_id, build_variant, functions)
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO temp._ingestion_affected_functions(id) VALUES (?)",
+                ((function_id,) for function_id in functions),
             )
-            self._put_summary_facts(
-                project_id,
-                batch.function_summaries,
-                batch.summary_effects,
-                batch.summary_return_origins,
-                batch.call_argument_bindings,
-                batch.call_result_bindings,
-                batch.interprocedural_flows,
-            )
-            self._refresh_indexed_override_candidates(project_id, selected_variant.name)
-            affected_functions |= {
-                summary.function_symbol_id for summary in batch.function_summaries
-            }
-            affected_functions |= self._reverse_summary_callers(
-                project_id, selected_variant.name, affected_functions
-            )
-            invalidated_summaries = self._refresh_summary_solutions(
-                project_id, selected_variant.name, affected_functions
-            )
-            self._refresh_symbols(
-                project_id, affected_symbols | {symbol.id for symbol in batch.symbols}
-            )
-            self._delete_orphans(project_id)
+
+    def _stage_ingestion_batch(self, project_id: int, batch: IngestionBatch) -> None:
+        for configuration in batch.build_configurations:
             self._connection.execute(
                 """
-                UPDATE build_variants SET reindex_required = 0
-                WHERE project_id = ? AND name = ?
+                INSERT INTO build_configurations(
+                    project_id, id, source_path, directory, arguments_json,
+                    command_hash, output, build_variant
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, id) DO UPDATE SET
+                    source_path = excluded.source_path,
+                    directory = excluded.directory,
+                    arguments_json = excluded.arguments_json,
+                    command_hash = excluded.command_hash,
+                    output = excluded.output
                 """,
-                (project_id, selected_variant.name),
+                (
+                    project_id,
+                    configuration.id,
+                    str(configuration.source_path),
+                    str(configuration.directory),
+                    json.dumps(configuration.arguments),
+                    configuration.command_hash,
+                    str(configuration.output) if configuration.output else None,
+                    configuration.build_variant,
+                ),
             )
-            return invalidated_summaries
+        for unit in batch.translation_units:
+            self._connection.execute(
+                """
+                INSERT INTO translation_units(
+                    project_id, id, build_configuration_id, source_path,
+                    content_hash, diagnostics_json, build_variant,
+                    analysis_backend, advanced_facts_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    unit.id,
+                    unit.build_configuration_id,
+                    str(unit.source_path),
+                    unit.content_hash,
+                    json.dumps(unit.diagnostics),
+                    unit.build_variant,
+                    unit.analysis_backend,
+                    int(unit.advanced_facts_complete),
+                ),
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO dependencies(
+                    project_id, translation_unit_id, path, content_hash
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (project_id, unit.id, str(path), content_hash)
+                    for path, content_hash in unit.dependencies
+                ),
+            )
+
+        symbols = tuple(batch.symbols)
+        self._connection.executemany(
+            """
+            INSERT OR IGNORE INTO translation_unit_symbols(
+                project_id, translation_unit_id, symbol_id, is_definition
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    symbol.translation_unit_id,
+                    symbol.id,
+                    int(bool(symbol.metadata.get("is_definition"))),
+                )
+                for symbol in symbols
+            ),
+        )
+        self._connection.executemany(
+            "INSERT OR IGNORE INTO temp._ingestion_affected_symbols(id) VALUES (?)",
+            ((symbol.id,) for symbol in symbols),
+        )
+        self._connection.executemany(
+            "INSERT OR IGNORE INTO temp._ingestion_affected_functions(id) VALUES (?)",
+            ((summary.function_symbol_id,) for summary in batch.function_summaries),
+        )
+        self._put_symbol_variants(project_id, symbols)
+        self._put_occurrences(project_id, batch.occurrences)
+        self._put_edges(project_id, batch.edges)
+        self._put_cfg_facts(
+            project_id,
+            batch.cfg_graphs,
+            batch.cfg_blocks,
+            batch.cfg_elements,
+            batch.cfg_edges,
+        )
+        self._put_call_facts(project_id, batch.callsites, batch.call_targets)
+        self._put_data_flow_facts(
+            project_id,
+            batch.data_flow_analyses,
+            batch.memory_locations,
+            batch.data_accesses,
+            batch.data_flow_evidence,
+        )
+        self._put_summary_facts(
+            project_id,
+            batch.function_summaries,
+            batch.summary_effects,
+            batch.summary_return_origins,
+            batch.call_argument_bindings,
+            batch.call_result_bindings,
+            batch.interprocedural_flows,
+        )
+
+    def _refresh_tracked_symbols(self, project_id: int) -> None:
+        cursor = self._connection.execute(
+            "SELECT id FROM temp._ingestion_affected_symbols ORDER BY id"
+        )
+        while rows := cursor.fetchmany(500):
+            self._refresh_symbols(project_id, {row[0] for row in rows})
 
     def _put_build_variant(self, project_id: int, variant: BuildVariant) -> None:
         self._connection.execute(
