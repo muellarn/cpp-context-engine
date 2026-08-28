@@ -99,6 +99,41 @@ _TRANSLATION_UNIT_DELETE_ORDER = (
     "translation_unit_symbols",
     "dependencies",
 )
+_BULK_INGESTION_TABLES = frozenset(
+    {
+        "build_configurations",
+        "build_variants",
+        "translation_units",
+        "dependencies",
+        "translation_unit_symbols",
+        "symbol_variants",
+        "occurrences",
+        "edges",
+        "cfg_graphs",
+        "cfg_blocks",
+        "cfg_elements",
+        "cfg_edges",
+        "callsites",
+        "call_targets",
+        "data_flow_analyses",
+        "memory_locations",
+        "data_accesses",
+        "data_flow_evidence",
+        "function_summaries",
+        "summary_effects",
+        "summary_return_origins",
+        "call_argument_bindings",
+        "call_result_bindings",
+        "interprocedural_flows",
+        "summary_solution_payloads",
+    }
+)
+
+
+def _quote_identifier(value: str) -> str:
+    """Quote a SQLite identifier obtained from the local schema."""
+
+    return '"' + value.replace('"', '""') + '"'
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +146,17 @@ class TranslationUnitState:
     build_variant: str = DEFAULT_BUILD_VARIANT
     analysis_backend: str = "unknown"
     advanced_facts_complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaIndexClassification:
+    table: str
+    name: str
+    unique: bool
+    origin: str
+    deferred: bool
+    reason: str
+    create_sql: str | None
 
 
 class SummaryPayloadError(RuntimeError):
@@ -140,7 +186,90 @@ class SQLiteStore:
         )
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
+        self._defer_variant_fts = False
         self._migrate()
+
+    def _classify_schema_indexes(
+        self,
+    ) -> dict[tuple[str, str], SchemaIndexClassification]:
+        """Classify every SQLite index; only bulk-table secondaries are deferrable."""
+
+        definitions = {
+            str(row["name"]): row["sql"]
+            for row in self._connection.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'index'"
+            )
+        }
+        result: dict[tuple[str, str], SchemaIndexClassification] = {}
+        tables = self._connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name"
+        )
+        for table_row in tables:
+            table = str(table_row["name"])
+            for row in self._connection.execute(f"PRAGMA index_list({_quote_identifier(table)})"):
+                name = str(row["name"])
+                unique = bool(row["unique"])
+                origin = str(row["origin"])
+                create_sql = definitions.get(name)
+                deferred = (
+                    origin == "c"
+                    and not unique
+                    and table in _BULK_INGESTION_TABLES
+                    and create_sql is not None
+                )
+                if origin in {"pk", "u"} or unique:
+                    reason = "primary/unique constraint required during insertion"
+                elif deferred:
+                    reason = "non-unique secondary index on a bulk-ingestion table"
+                elif table.startswith(("symbol_fts_", "symbol_variant_fts_")):
+                    reason = "FTS shadow index managed by SQLite"
+                else:
+                    reason = "table is not populated by fresh project ingestion"
+                result[(table, name)] = SchemaIndexClassification(
+                    table, name, unique, origin, deferred, reason, create_sql
+                )
+        return result
+
+    def _execute_deferred_schema_step(self, step: str, sql: str) -> None:
+        """Execute one named step; kept separate for atomic failure-injection tests."""
+
+        del step
+        self._connection.execute(sql)
+
+    def _should_defer_fresh_generation(self) -> bool:
+        return self._connection.execute("SELECT 1 FROM projects LIMIT 1").fetchone() is None
+
+    def _drop_fresh_generation_indexes(self) -> tuple[SchemaIndexClassification, ...]:
+        deferred = tuple(
+            sorted(
+                (item for item in self._classify_schema_indexes().values() if item.deferred),
+                key=lambda item: item.name,
+            )
+        )
+        for item in deferred:
+            self._execute_deferred_schema_step(
+                f"drop-index:{item.name}", f"DROP INDEX {_quote_identifier(item.name)}"
+            )
+        return deferred
+
+    def _restore_fresh_generation_indexes(
+        self, deferred: Sequence[SchemaIndexClassification]
+    ) -> None:
+        for item in deferred:
+            if item.create_sql is None:  # pragma: no cover - guaranteed by classification
+                raise RuntimeError(f"missing schema SQL for deferred index {item.name}")
+            self._execute_deferred_schema_step(f"create-index:{item.name}", item.create_sql)
+
+    def _validate_fresh_generation(self) -> None:
+        self._execute_deferred_schema_step(
+            "fts:variant-integrity",
+            "INSERT INTO symbol_variant_fts(symbol_variant_fts) VALUES('integrity-check')",
+        )
+        if rows := list(self._connection.execute("PRAGMA foreign_key_check")):
+            raise RuntimeError(f"fresh generation failed foreign-key validation: {rows[0]}")
+        quick_check = self._connection.execute("PRAGMA quick_check").fetchone()[0]
+        if quick_check != "ok":
+            raise RuntimeError(f"fresh generation failed integrity validation: {quick_check}")
 
     def __enter__(self) -> SQLiteStore:
         return self
@@ -1578,8 +1707,9 @@ class SQLiteStore:
             if manage_transaction:
                 self._connection.commit()
 
-    def _rebuild_variant_fts(self) -> None:
-        self._connection.execute("DELETE FROM symbol_variant_fts")
+    def _rebuild_variant_fts(self, *, clear: bool = True) -> None:
+        if clear:
+            self._connection.execute("DELETE FROM symbol_variant_fts")
         rows = self._connection.execute(
             """
             SELECT project_id, id, symbol_id, build_variant, snapshot_json
@@ -1647,9 +1777,18 @@ class SQLiteStore:
         # the end of this transaction. Deferral keeps child fact insertion valid
         # without a redundant provisional canonical-symbol write pass.
         self._reset_ingestion_tracking()
-        self._connection.execute("PRAGMA defer_foreign_keys = ON")
+        fresh_generation = self._should_defer_fresh_generation()
+        deferred_indexes: tuple[SchemaIndexClassification, ...] = ()
         try:
             with self._connection:
+                # Start the transaction explicitly: Python's sqlite3 wrapper does
+                # not implicitly begin one for DDL, and index drops must never be
+                # observable or survive a failed fresh generation.
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute("PRAGMA defer_foreign_keys = ON")
+                if fresh_generation:
+                    deferred_indexes = self._drop_fresh_generation_indexes()
+                    self._defer_variant_fts = True
                 project_id = self._ensure_project(root)
                 self._put_build_variant(project_id, selected_variant)
                 existing: set[str] = set()
@@ -1702,6 +1841,8 @@ class SQLiteStore:
                 if remaining_changed_ids:
                     raise ValueError("ingestion stream ended before every changed translation unit")
 
+                if fresh_generation:
+                    self._restore_fresh_generation_indexes(deferred_indexes)
                 self._refresh_indexed_override_candidates(project_id, selected_variant.name)
                 affected_functions = {
                     row[0]
@@ -1716,6 +1857,11 @@ class SQLiteStore:
                     project_id, selected_variant.name, affected_functions
                 )
                 self._refresh_tracked_symbols(project_id)
+                if fresh_generation:
+                    self._execute_deferred_schema_step(
+                        "fts:variant-rebuild", "DELETE FROM symbol_variant_fts"
+                    )
+                    self._rebuild_variant_fts(clear=False)
                 self._delete_orphans(project_id)
                 self._delete_orphan_embedding_vectors(project_id)
                 self._connection.execute(
@@ -1728,8 +1874,11 @@ class SQLiteStore:
                 # Cleanup is part of the same transaction as publication. A
                 # cleanup error can therefore still roll the entire run back.
                 self._clear_ingestion_tracking()
+                if fresh_generation:
+                    self._validate_fresh_generation()
                 return invalidated_summaries
         finally:
+            self._defer_variant_fts = False
             if self._connection.in_transaction:
                 self._connection.rollback()
 
@@ -2369,13 +2518,14 @@ class SQLiteStore:
                     (project_id, *chunk),
                 )
             )
-            self._connection.execute(
-                f"""
-                DELETE FROM symbol_variant_fts
-                WHERE project_id = ? AND variant_id IN ({placeholders})
-                """,
-                (project_id, *chunk),
-            )
+            if not self._defer_variant_fts:
+                self._connection.execute(
+                    f"""
+                    DELETE FROM symbol_variant_fts
+                    WHERE project_id = ? AND variant_id IN ({placeholders})
+                    """,
+                    (project_id, *chunk),
+                )
         changed = [
             variant_id
             for _, variant_id, snapshot in records
@@ -2419,27 +2569,28 @@ class SQLiteStore:
                 for symbol, variant_id, snapshot in records
             ),
         )
-        self._connection.executemany(
-            """
-            INSERT INTO symbol_variant_fts(
-                project_id, variant_id, symbol_id, build_variant,
-                qualified_name, signature, documentation, source_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        if not self._defer_variant_fts:
+            self._connection.executemany(
+                """
+                INSERT INTO symbol_variant_fts(
+                    project_id, variant_id, symbol_id, build_variant,
+                    qualified_name, signature, documentation, source_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
-                    project_id,
-                    variant_id,
-                    symbol.id,
-                    symbol.build_variant,
-                    symbol.qualified_name,
-                    symbol.signature,
-                    symbol.documentation,
-                    symbol.source_text,
-                )
-                for symbol, variant_id, _ in records
-            ),
-        )
+                    (
+                        project_id,
+                        variant_id,
+                        symbol.id,
+                        symbol.build_variant,
+                        symbol.qualified_name,
+                        symbol.signature,
+                        symbol.documentation,
+                        symbol.source_text,
+                    )
+                    for symbol, variant_id, _ in records
+                ),
+            )
 
     def _refresh_symbols(self, project_id: int, symbol_ids: set[str]) -> None:
         preferred: dict[str, CodeSymbol] = {}
