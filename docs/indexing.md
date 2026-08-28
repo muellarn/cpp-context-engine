@@ -285,8 +285,21 @@ and translation-unit replacement. Schema v10 removes the redundant symbol snapsh
 from translation-unit membership rows; canonical symbols continue to be derived
 from the versioned build/TU `symbol_variants` snapshots.
 
+Schema v11 stores propagated interprocedural effects and return origins as bounded,
+deterministic compressed payloads while retaining relational local facts and the
+existing query API. Schema v12 separates variant-to-vector references from a project-local,
+content-addressed vector pool. Its key includes the public model, the complete
+non-secret provider configuration identity, dimension, and SHA-256 of the exact
+bounded embedding text; the text is retained to detect a hash collision. Equal
+inputs across translation units or named builds therefore share one vector while
+search and stale cleanup remain variant- and build-scoped. Missing IDs, symbol
+loads, provider calls, validation, and writes are processed in fixed-size batches
+inside one transaction, followed by deterministic orphan-vector collection.
+Legacy hosted vectors are invalidated during the v12 migration because schema v11 did not
+persist their endpoint identity; local vectors retain their exact search behavior.
+
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
-are stored by model ID and dimension. `SQLiteVectorSearch` accepts any provider
+are stored by content, model/configuration identity, and dimension. `SQLiteVectorSearch` accepts any provider
 implementing `EmbeddingProvider`; `SQLiteStore.search_vector` computes true cosine
 similarity and rejects empty, non-finite, zero-magnitude, or dimension-mismatched
 vectors.

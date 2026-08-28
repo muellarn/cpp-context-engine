@@ -152,6 +152,41 @@ def _insert_legacy_propagated_rows(store: SQLiteStore) -> None:
     store._connection.commit()  # noqa: SLF001
 
 
+def _downgrade_embedding_schema_to_v11(store: SQLiteStore) -> None:
+    store._connection.executescript(  # noqa: SLF001 - construct a real v11 boundary
+        """
+        CREATE TABLE variant_embeddings_v11 (
+            project_id INTEGER NOT NULL,
+            variant_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            magnitude REAL NOT NULL,
+            vector BLOB NOT NULL,
+            PRIMARY KEY (project_id, variant_id, model),
+            FOREIGN KEY (project_id, variant_id)
+                REFERENCES symbol_variants(project_id, id) ON DELETE CASCADE
+        );
+        INSERT INTO variant_embeddings_v11(
+            project_id, variant_id, model, dimensions, magnitude, vector
+        )
+        SELECT references_.project_id, references_.variant_id, references_.model,
+               references_.dimensions, vectors.magnitude, vectors.vector
+        FROM variant_embeddings references_
+        JOIN embedding_vectors vectors
+          ON vectors.project_id = references_.project_id
+         AND vectors.model = references_.model
+         AND vectors.configuration_id = references_.configuration_id
+         AND vectors.dimensions = references_.dimensions
+         AND vectors.content_hash = references_.content_hash;
+        DROP TABLE variant_embeddings;
+        DROP TABLE embedding_vectors;
+        ALTER TABLE variant_embeddings_v11 RENAME TO variant_embeddings;
+        PRAGMA user_version = 11;
+        """
+    )
+    store._connection.commit()  # noqa: SLF001
+
+
 def test_schema_v11_stores_propagated_summary_payloads_separately(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -164,8 +199,23 @@ def test_schema_v11_stores_propagated_summary_payloads_separately(tmp_path: Path
             )
         }
 
-    assert SCHEMA_VERSION == 11
-    assert "summary_solution_payloads" in tables
+    assert SCHEMA_VERSION == 12
+    assert {"summary_solution_payloads", "embedding_vectors", "variant_embeddings"} <= tables
+
+
+def test_v11_summary_database_upgrades_to_v12_without_changing_solution_payloads(
+    tmp_path: Path, solved_batch
+) -> None:
+    database = tmp_path / "v11.db"
+    with SQLiteStore(database, project_root=FIXTURE) as store:
+        store.apply_ingestion(FIXTURE, solved_batch)
+        before = _solution_rows(store)
+        _downgrade_embedding_schema_to_v11(store)
+
+    with SQLiteStore(database, project_root=FIXTURE) as migrated:
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+        assert _solution_rows(migrated) == before
+        assert migrated._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
 
 
 def test_propagated_payloads_preserve_exact_solution_and_bounded_api(
@@ -420,7 +470,7 @@ def test_v10_migration_compacts_existing_rows_without_changing_results(
         _insert_legacy_propagated_rows(store)
 
     with SQLiteStore(database, project_root=FIXTURE) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 11  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
         assert (
             migrated._connection.execute(  # noqa: SLF001
                 "SELECT count(*) FROM summary_effects WHERE is_local = 0"
@@ -434,6 +484,46 @@ def test_v10_migration_compacts_existing_rows_without_changing_results(
             )
             for summary_id in summary_ids
         } == expected
+
+
+def test_v10_direct_upgrade_preserves_summaries_and_local_vector_bytes(
+    tmp_path: Path, solved_batch
+) -> None:
+    database = tmp_path / "combined-v10.db"
+    with SQLiteStore(database, project_root=FIXTURE) as store:
+        store.apply_ingestion(FIXTURE, solved_batch)
+        summary_rows = _solution_rows(store)
+        variant_id = store._connection.execute(  # noqa: SLF001 - migration fixture
+            "SELECT id FROM symbol_variants ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        store.put_embedding(variant_id, "local-feature-hash-v1-2", [1.0, 1.0])
+        expected_hits = tuple(
+            (hit.symbol.variant_id, hit.score)
+            for hit in store.search_vector([1.0, 1.0], model="local-feature-hash-v1-2")
+        )
+        vector_bytes = store._connection.execute(  # noqa: SLF001 - exact byte regression
+            "SELECT hex(vector) FROM embedding_vectors"
+        ).fetchone()[0]
+        _downgrade_embedding_schema_to_v11(store)
+        _insert_legacy_propagated_rows(store)
+
+    with SQLiteStore(database, project_root=FIXTURE) as migrated:
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+        assert _solution_rows(migrated) == summary_rows
+        assert (
+            migrated._connection.execute(  # noqa: SLF001
+                "SELECT hex(vector) FROM embedding_vectors"
+            ).fetchone()[0]
+            == vector_bytes
+        )
+        assert (
+            tuple(
+                (hit.symbol.variant_id, hit.score)
+                for hit in migrated.search_vector([1.0, 1.0], model="local-feature-hash-v1-2")
+            )
+            == expected_hits
+        )
+        assert migrated._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
 
 
 def test_v11_migration_and_payload_persistence_failures_roll_back_atomically(
@@ -502,6 +592,41 @@ def test_v11_migration_and_payload_persistence_failures_roll_back_atomically(
             indexer.index(project, project / "compile_commands.json")
         assert _solution_rows(store) == before
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
+
+
+def test_v10_direct_upgrade_rolls_back_v11_when_v12_fails(
+    tmp_path: Path, solved_batch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "combined-rollback.db"
+    with SQLiteStore(database, project_root=FIXTURE) as store:
+        store.apply_ingestion(FIXTURE, solved_batch)
+        _insert_legacy_propagated_rows(store)
+
+    def fail_v12(self: SQLiteStore, *, manage_transaction: bool = True) -> None:
+        assert not manage_transaction
+        assert self._connection.execute(  # noqa: SLF001 - observe intermediate v11 state
+            "SELECT 1 FROM sqlite_master WHERE name = 'summary_solution_payloads'"
+        ).fetchone()
+        raise RuntimeError("injected v12 migration failure")
+
+    monkeypatch.setattr(SQLiteStore, "_migrate_v12", fail_v12)
+    with pytest.raises(RuntimeError, match="v12 migration failure"):
+        SQLiteStore(database, project_root=FIXTURE)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'summary_solution_payloads'"
+            ).fetchone()
+            is None
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM summary_effects WHERE is_local = 0"
+        ).fetchone()[0]
+    finally:
+        connection.close()
 
 
 def test_noop_header_refresh_stale_cleanup_and_build_variants_are_isolated(

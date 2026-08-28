@@ -12,6 +12,7 @@ import struct
 import zlib
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -66,7 +67,9 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
+DEFAULT_EMBEDDING_TEXT_CHARS = 32_000
+EMBEDDING_BATCH_SIZE = 128
 MAX_CFG_PAGE_SIZE = 10_000
 MAX_CALL_PAGE_SIZE = 10_000
 SUMMARY_PAYLOAD_ENCODING = "zlib-json-v1"
@@ -372,7 +375,22 @@ class SQLiteStore:
         if current <= 9:
             self._migrate_v10()
         if current <= 10:
-            self._migrate_v11()
+            self._migrate_v11_and_v12()
+        elif current == 11:
+            self._migrate_v12()
+
+    def _migrate_v11_and_v12(self) -> None:
+        """Upgrade v10 through both dependent schema steps as one transaction."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._migrate_v11(manage_transaction=False)
+            self._migrate_v12(manage_transaction=False)
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
 
     def _migrate_v3(self) -> None:
         """Add build/TU evidence tables without discarding baseline v2 reads."""
@@ -1304,14 +1322,185 @@ class SQLiteStore:
         else:
             self._connection.commit()
 
-    def _migrate_v11(self) -> None:
+    def _migrate_v12(self, *, manage_transaction: bool = True) -> None:
+        """Content-address vectors while retaining variant-scoped search rows."""
+
+        try:
+            if manage_transaction:
+                self._connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(variant_embeddings)")
+            }
+            if "configuration_id" in columns:
+                # Migration tests may rewind user_version while retaining newer,
+                # independently unrelated tables. Keep that already-normalized data.
+                self._connection.execute("PRAGMA user_version = 12")
+                if manage_transaction:
+                    self._connection.commit()
+                return
+            has_legacy_embeddings = bool(columns)
+            if has_legacy_embeddings:
+                self._connection.execute(
+                    "ALTER TABLE variant_embeddings RENAME TO variant_embeddings_v10"
+                )
+            _execute_script(
+                self._connection,
+                """
+                CREATE TABLE embedding_vectors (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    configuration_id TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    content_text TEXT NOT NULL,
+                    magnitude REAL NOT NULL,
+                    vector BLOB NOT NULL,
+                    PRIMARY KEY (
+                        project_id, model, configuration_id, dimensions, content_hash
+                    ),
+                    CHECK (dimensions > 0),
+                    CHECK (magnitude > 0),
+                    CHECK (typeof(vector) = 'blob'),
+                    CHECK (length(vector) = dimensions * 8)
+                );
+
+                CREATE TABLE variant_embeddings (
+                    project_id INTEGER NOT NULL,
+                    variant_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    configuration_id TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (project_id, variant_id, model, configuration_id),
+                    FOREIGN KEY (project_id, variant_id)
+                        REFERENCES symbol_variants(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (
+                        project_id, model, configuration_id, dimensions, content_hash
+                    )
+                        REFERENCES embedding_vectors(
+                            project_id, model, configuration_id, dimensions, content_hash
+                        )
+                );
+
+                CREATE INDEX variant_embeddings_search
+                    ON variant_embeddings(
+                        project_id, model, configuration_id, dimensions, variant_id
+                    );
+                CREATE INDEX variant_embeddings_content
+                    ON variant_embeddings(
+                        project_id, model, configuration_id, dimensions, content_hash
+                    );
+                """,
+            )
+            if not has_legacy_embeddings:
+                self._connection.execute("PRAGMA user_version = 12")
+                if manage_transaction:
+                    self._connection.commit()
+                return
+            cursor = self._connection.execute(
+                """
+                SELECT embeddings.project_id, embeddings.variant_id, embeddings.model,
+                       embeddings.dimensions, embeddings.magnitude, embeddings.vector,
+                       variants.snapshot_json
+                FROM variant_embeddings_v10 embeddings
+                JOIN symbol_variants variants
+                  ON variants.project_id = embeddings.project_id
+                 AND variants.id = embeddings.variant_id
+                ORDER BY embeddings.project_id, embeddings.model,
+                         embeddings.dimensions, embeddings.variant_id
+                """
+            )
+            while rows := cursor.fetchmany(EMBEDDING_BATCH_SIZE):
+                for row in rows:
+                    if str(row["model"]).startswith("openai-compatible:"):
+                        # v10 did not persist the hosted endpoint, so those vectors
+                        # cannot be assigned a complete configuration identity safely.
+                        continue
+                    # The legacy table had no vector integrity constraints. Validate it
+                    # before sharing: a short BLOB previously produced a plausible but
+                    # incorrect cosine score because pairwise multiplication truncated.
+                    dimensions, magnitude, vector = _validate_legacy_embedding_vector(
+                        row["dimensions"],
+                        row["magnitude"],
+                        row["vector"],
+                        variant_id=row["variant_id"],
+                    )
+                    text = _embedding_text_from_snapshot(row["snapshot_json"])
+                    content_hash = _embedding_content_hash(text)
+                    configuration_id = row["model"]
+                    existing = self._connection.execute(
+                        """
+                        SELECT content_text, magnitude, vector FROM embedding_vectors
+                        WHERE project_id = ? AND model = ? AND configuration_id = ?
+                          AND dimensions = ? AND content_hash = ?
+                        """,
+                        (
+                            row["project_id"],
+                            row["model"],
+                            configuration_id,
+                            dimensions,
+                            content_hash,
+                        ),
+                    ).fetchone()
+                    if existing is not None and existing["content_text"] != text:
+                        raise RuntimeError("embedding content hash collision during migration")
+                    if existing is not None and (
+                        existing["magnitude"] != magnitude or existing["vector"] != vector
+                    ):
+                        raise RuntimeError("equal legacy embedding inputs have different vectors")
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO embedding_vectors(
+                            project_id, model, configuration_id, dimensions, content_hash,
+                            content_text, magnitude, vector
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["project_id"],
+                            row["model"],
+                            configuration_id,
+                            dimensions,
+                            content_hash,
+                            text,
+                            magnitude,
+                            vector,
+                        ),
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO variant_embeddings(
+                            project_id, variant_id, model, configuration_id,
+                            dimensions, content_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["project_id"],
+                            row["variant_id"],
+                            row["model"],
+                            configuration_id,
+                            dimensions,
+                            content_hash,
+                        ),
+                    )
+            self._connection.execute("DROP TABLE variant_embeddings_v10")
+            self._connection.execute("PRAGMA user_version = 12")
+        except BaseException:
+            if manage_transaction:
+                self._connection.rollback()
+            raise
+        else:
+            if manage_transaction:
+                self._connection.commit()
+
+    def _migrate_v11(self, *, manage_transaction: bool = True) -> None:
         """Compact propagated summary solutions while retaining relational local inputs."""
 
         try:
-            self._connection.execute("BEGIN IMMEDIATE")
+            if manage_transaction:
+                self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(
                 """
-                CREATE TABLE summary_solution_payloads (
+                CREATE TABLE IF NOT EXISTS summary_solution_payloads (
                     project_id INTEGER NOT NULL,
                     summary_id TEXT NOT NULL,
                     encoding TEXT NOT NULL,
@@ -1344,6 +1533,11 @@ class SQLiteStore:
                         """
                         SELECT * FROM summary_effects
                         WHERE project_id = ? AND is_local = 0
+                          AND NOT EXISTS (
+                              SELECT 1 FROM summary_solution_payloads payloads
+                              WHERE payloads.project_id = summary_effects.project_id
+                                AND payloads.summary_id = summary_effects.summary_id
+                          )
                         ORDER BY summary_id, id
                         """,
                         (project_id,),
@@ -1355,6 +1549,11 @@ class SQLiteStore:
                         """
                         SELECT * FROM summary_return_origins
                         WHERE project_id = ? AND is_local = 0
+                          AND NOT EXISTS (
+                              SELECT 1 FROM summary_solution_payloads payloads
+                              WHERE payloads.project_id = summary_return_origins.project_id
+                                AND payloads.summary_id = summary_return_origins.summary_id
+                          )
                         ORDER BY summary_id, id
                         """,
                         (project_id,),
@@ -1372,10 +1571,12 @@ class SQLiteStore:
                 self._connection.execute("DELETE FROM summary_return_origins WHERE is_local = 0")
             self._connection.execute("PRAGMA user_version = 11")
         except BaseException:
-            self._connection.rollback()
+            if manage_transaction:
+                self._connection.rollback()
             raise
         else:
-            self._connection.commit()
+            if manage_transaction:
+                self._connection.commit()
 
     def _rebuild_variant_fts(self) -> None:
         self._connection.execute("DELETE FROM symbol_variant_fts")
@@ -1516,6 +1717,7 @@ class SQLiteStore:
                 )
                 self._refresh_tracked_symbols(project_id)
                 self._delete_orphans(project_id)
+                self._delete_orphan_embedding_vectors(project_id)
                 self._connection.execute(
                     """
                     UPDATE build_variants SET reindex_required = 0
@@ -1787,6 +1989,7 @@ class SQLiteStore:
             )
             self._refresh_symbols(project_id, affected)
             self._delete_orphans(project_id)
+            self._delete_orphan_embedding_vectors(project_id)
             return True
 
     def _ensure_project(self, root: str) -> int:
@@ -4595,42 +4798,19 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
     ) -> None:
-        project_id = self._project_id(project_root)
         symbol = self.get_symbol(symbol_id, project_root, build_scope=build_scope)
         if symbol is None or not symbol.variant_id:
             raise KeyError(f"symbol variant is not indexed: {symbol_id}")
-        variant_id = symbol.variant_id
-        normalized = _validate_vector(vector)
-        dimensions = {
-            row[0]
-            for row in self._connection.execute(
-                """
-                SELECT DISTINCT dimensions FROM variant_embeddings
-                WHERE project_id = ? AND model = ?
-                """,
-                (project_id, model),
-            )
-        }
-        if dimensions and dimensions != {len(normalized)}:
-            raise ValueError(
-                f"embedding model {model!r} already uses dimension {next(iter(dimensions))}, "
-                f"not {len(normalized)}"
-            )
-        magnitude = math.sqrt(sum(value * value for value in normalized))
-        encoded = struct.pack(f"<{len(normalized)}d", *normalized)
-        with self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO variant_embeddings(
-                    project_id, variant_id, model, dimensions, magnitude, vector
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, variant_id, model) DO UPDATE SET
-                    dimensions = excluded.dimensions,
-                    magnitude = excluded.magnitude,
-                    vector = excluded.vector
-                """,
-                (project_id, variant_id, model, len(normalized), magnitude, encoded),
+        text = _embedding_text(symbol)
+        with self.embedding_write_session(project_root):
+            self.put_content_embeddings(
+                ((symbol.variant_id, text, vector),),
+                model,
+                project_root,
+                build_scope=build_scope,
+                configuration_id=configuration_id,
             )
 
     def put_embeddings(
@@ -4640,30 +4820,242 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
     ) -> None:
         """Validate and persist one embedding batch in a single transaction."""
 
+        selected_entries = tuple(entries)
+        content_entries: list[tuple[str, str, Sequence[float]]] = []
+        for symbol_id, vector in selected_entries:
+            symbol = self.get_symbol(symbol_id, project_root, build_scope=build_scope)
+            if symbol is None or not symbol.variant_id:
+                raise KeyError(f"symbol variant is not indexed: {symbol_id}")
+            content_entries.append((symbol.variant_id, _embedding_text(symbol), vector))
+        with self.embedding_write_session(project_root):
+            self.put_content_embeddings(
+                content_entries,
+                model,
+                project_root,
+                build_scope=build_scope,
+                configuration_id=configuration_id,
+            )
+
+    @contextmanager
+    def embedding_write_session(self, project_root: Path | None = None) -> Iterator[None]:
+        """Publish all embedding batches together or roll every batch back."""
+
+        if self._connection.in_transaction:
+            raise RuntimeError("embedding write sessions cannot be nested")
         project_id = self._project_id(project_root)
-        dimensions = {
-            row[0]
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._delete_orphan_embedding_vectors(project_id)
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def attach_existing_embeddings(
+        self,
+        entries: Sequence[tuple[str, str]],
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Attach content already in the vector pool and return content misses."""
+
+        if not self._connection.in_transaction:
+            raise RuntimeError("embedding attachment requires an embedding write session")
+        if not entries:
+            return ()
+        project_id = self._project_id(project_root)
+        configuration = configuration_id or model
+        self._validate_embedding_variants(project_id, (entry[0] for entry in entries), build_scope)
+        dimensions = self._embedding_configuration_dimensions(project_id, model, configuration)
+        if not dimensions:
+            return tuple(entries)
+        if len(dimensions) != 1:
+            raise RuntimeError(f"embedding configuration {configuration!r} has mixed dimensions")
+        dimension = next(iter(dimensions))
+        texts_by_hash: dict[str, str] = {}
+        for _, text in entries:
+            content_hash = _embedding_content_hash(text)
+            previous = texts_by_hash.setdefault(content_hash, text)
+            if previous != text:
+                raise ValueError("embedding content hash collision")
+        existing: set[str] = set()
+        hashes = sorted(texts_by_hash)
+        for offset in range(0, len(hashes), 500):
+            chunk = hashes[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self._connection.execute(
+                f"""
+                SELECT content_hash, content_text FROM embedding_vectors
+                WHERE project_id = ? AND model = ?
+                  AND configuration_id = ? AND dimensions = ?
+                  AND content_hash IN ({placeholders})
+                """,
+                (project_id, model, configuration, dimension, *chunk),
+            ):
+                if texts_by_hash[row["content_hash"]] != row["content_text"]:
+                    raise ValueError("embedding content hash collision")
+                existing.add(row["content_hash"])
+        attached = [
+            (
+                project_id,
+                variant_id,
+                model,
+                configuration,
+                dimension,
+                _embedding_content_hash(text),
+            )
+            for variant_id, text in entries
+            if _embedding_content_hash(text) in existing
+        ]
+        self._connection.executemany(
+            """
+            INSERT INTO variant_embeddings(
+                project_id, variant_id, model, configuration_id, dimensions, content_hash
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, variant_id, model, configuration_id) DO UPDATE SET
+                dimensions = excluded.dimensions,
+                content_hash = excluded.content_hash
+            """,
+            attached,
+        )
+        return tuple(
+            (variant_id, text)
+            for variant_id, text in entries
+            if _embedding_content_hash(text) not in existing
+        )
+
+    def put_content_embeddings(
+        self,
+        entries: Iterable[tuple[str, str, Sequence[float]]],
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
+    ) -> None:
+        """Validate and store one bounded content/vector batch in the active session."""
+
+        if not self._connection.in_transaction:
+            raise RuntimeError("embedding writes require an embedding write session")
+        selected = tuple(entries)
+        if not selected:
+            return
+        project_id = self._project_id(project_root)
+        configuration = configuration_id or model
+        self._validate_embedding_variants(project_id, (entry[0] for entry in selected), build_scope)
+        expected_dimensions = self._embedding_configuration_dimensions(
+            project_id, model, configuration
+        )
+        if len(expected_dimensions) > 1:
+            raise RuntimeError(f"embedding configuration {configuration!r} has mixed dimensions")
+        expected = next(iter(expected_dimensions)) if expected_dimensions else None
+        vectors: dict[str, tuple[str, int, float, bytes]] = {}
+        references: list[tuple[object, ...]] = []
+        for variant_id, text, vector in selected:
+            normalized = _validate_vector(vector)
+            if expected is None:
+                expected = len(normalized)
+            if len(normalized) != expected:
+                raise ValueError(
+                    f"embedding model {model!r} already uses dimension "
+                    f"{expected}, not {len(normalized)}"
+                )
+            content_hash = _embedding_content_hash(text)
+            magnitude = math.sqrt(sum(value * value for value in normalized))
+            encoded = struct.pack(f"<{len(normalized)}d", *normalized)
+            previous = vectors.setdefault(
+                content_hash,
+                (text, len(normalized), magnitude, encoded),
+            )
+            if previous[0] != text:
+                raise ValueError("embedding content hash collision")
+            if previous[3] != encoded:
+                raise ValueError("equal embedding inputs produced different vectors")
+            references.append(
+                (project_id, variant_id, model, configuration, len(normalized), content_hash)
+            )
+        for content_hash, (text, dimensions, magnitude, encoded) in vectors.items():
+            existing = self._connection.execute(
+                """
+                SELECT content_text, vector FROM embedding_vectors
+                WHERE project_id = ? AND model = ? AND configuration_id = ?
+                  AND dimensions = ? AND content_hash = ?
+                """,
+                (project_id, model, configuration, dimensions, content_hash),
+            ).fetchone()
+            if existing is not None:
+                if existing["content_text"] != text:
+                    raise ValueError("embedding content hash collision")
+                if existing["vector"] != encoded:
+                    raise ValueError("equal embedding inputs produced different vectors")
+                continue
+            self._connection.execute(
+                """
+                INSERT INTO embedding_vectors(
+                    project_id, model, configuration_id, dimensions, content_hash,
+                    content_text, magnitude, vector
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    model,
+                    configuration,
+                    dimensions,
+                    content_hash,
+                    text,
+                    magnitude,
+                    encoded,
+                ),
+            )
+        self._connection.executemany(
+            """
+            INSERT INTO variant_embeddings(
+                project_id, variant_id, model, configuration_id, dimensions, content_hash
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, variant_id, model, configuration_id) DO UPDATE SET
+                dimensions = excluded.dimensions,
+                content_hash = excluded.content_hash
+            """,
+            references,
+        )
+
+    def _embedding_configuration_dimensions(
+        self, project_id: int, model: str, configuration_id: str
+    ) -> set[int]:
+        return {
+            int(row[0])
             for row in self._connection.execute(
                 """
-                SELECT DISTINCT dimensions FROM variant_embeddings
-                WHERE project_id = ? AND model = ?
+                SELECT DISTINCT dimensions FROM embedding_vectors
+                WHERE project_id = ? AND model = ? AND configuration_id = ?
                 """,
-                (project_id, model),
+                (project_id, model, configuration_id),
             )
         }
-        selected_entries = tuple(entries)
-        variant_ids = {symbol_id for symbol_id, _ in selected_entries}
-        exact_variants: set[str] = set()
+
+    def _validate_embedding_variants(
+        self,
+        project_id: int,
+        variant_ids: Iterable[str],
+        build_scope: BuildScope | tuple[str, ...] | None,
+    ) -> None:
+        selected = sorted(set(variant_ids))
         names = self._scope_names(build_scope)
         scope_placeholders = ",".join("?" for _ in names)
-        ordered_ids = sorted(variant_ids)
-        for offset in range(0, len(ordered_ids), 500):
-            chunk = ordered_ids[offset : offset + 500]
+        found: set[str] = set()
+        for offset in range(0, len(selected), 500):
+            chunk = selected[offset : offset + 500]
             placeholders = ",".join("?" for _ in chunk)
-            exact_variants.update(
+            found.update(
                 row[0]
                 for row in self._connection.execute(
                     f"""
@@ -4674,49 +5066,25 @@ class SQLiteStore:
                     (project_id, *names, *chunk),
                 )
             )
-        resolved: dict[str, str] = {variant_id: variant_id for variant_id in exact_variants}
-        for symbol_id in variant_ids - exact_variants:
-            symbol = self.get_symbol(symbol_id, project_root, build_scope=build_scope)
-            if symbol is None or not symbol.variant_id:
-                raise KeyError(f"symbol variant is not indexed: {symbol_id}")
-            resolved[symbol_id] = symbol.variant_id
+        missing = set(selected) - found
+        if missing:
+            raise KeyError(f"symbol variant is not indexed: {min(missing)}")
 
-        rows: list[tuple[object, ...]] = []
-        expected_dimensions = next(iter(dimensions)) if dimensions else None
-        for symbol_id, vector in selected_entries:
-            normalized = _validate_vector(vector)
-            if expected_dimensions is None:
-                expected_dimensions = len(normalized)
-            if len(normalized) != expected_dimensions:
-                raise ValueError(
-                    f"embedding model {model!r} already uses dimension "
-                    f"{expected_dimensions}, not {len(normalized)}"
-                )
-            magnitude = math.sqrt(sum(value * value for value in normalized))
-            encoded = struct.pack(f"<{len(normalized)}d", *normalized)
-            rows.append(
-                (
-                    project_id,
-                    resolved[symbol_id],
-                    model,
-                    len(normalized),
-                    magnitude,
-                    encoded,
-                )
+    def _delete_orphan_embedding_vectors(self, project_id: int) -> None:
+        self._connection.execute(
+            """
+            DELETE FROM embedding_vectors
+            WHERE project_id = ? AND NOT EXISTS (
+                SELECT 1 FROM variant_embeddings references_
+                WHERE references_.project_id = embedding_vectors.project_id
+                  AND references_.configuration_id = embedding_vectors.configuration_id
+                  AND references_.model = embedding_vectors.model
+                  AND references_.dimensions = embedding_vectors.dimensions
+                  AND references_.content_hash = embedding_vectors.content_hash
             )
-        with self._connection:
-            self._connection.executemany(
-                """
-                INSERT INTO variant_embeddings(
-                    project_id, variant_id, model, dimensions, magnitude, vector
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, variant_id, model) DO UPDATE SET
-                    dimensions = excluded.dimensions,
-                    magnitude = excluded.magnitude,
-                    vector = excluded.vector
-                """,
-                rows,
-            )
+            """,
+            (project_id,),
+        )
 
     def missing_embedding_symbol_ids(
         self,
@@ -4724,10 +5092,12 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
     ) -> tuple[str, ...]:
         """Return stable IDs whose current source snapshot has no vector for ``model``."""
 
         project_id = self._project_id(project_root)
+        configuration = configuration_id or model
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
         return tuple(
@@ -4737,15 +5107,16 @@ class SQLiteStore:
                     f"""
                     SELECT variants.symbol_id FROM symbol_variants variants
                     LEFT JOIN variant_embeddings embeddings
-                      ON embeddings.project_id = variants.project_id
+                     ON embeddings.project_id = variants.project_id
                      AND embeddings.variant_id = variants.id
                      AND embeddings.model = ?
+                     AND embeddings.configuration_id = ?
                     WHERE variants.project_id = ?
                       AND variants.build_variant IN ({placeholders})
                       AND embeddings.variant_id IS NULL
                     ORDER BY variants.build_variant, variants.symbol_id
                     """,
-                    (model, project_id, *names),
+                    (model, configuration, project_id, *names),
                 )
             )
         )
@@ -4756,8 +5127,10 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
     ) -> tuple[str, ...]:
         project_id = self._project_id(project_root)
+        configuration = configuration_id or model
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
         return tuple(
@@ -4766,24 +5139,94 @@ class SQLiteStore:
                 f"""
                 SELECT variants.id FROM symbol_variants variants
                 LEFT JOIN variant_embeddings embeddings
-                  ON embeddings.project_id = variants.project_id
+                 ON embeddings.project_id = variants.project_id
                  AND embeddings.variant_id = variants.id
                  AND embeddings.model = ?
+                 AND embeddings.configuration_id = ?
                 WHERE variants.project_id = ?
                   AND variants.build_variant IN ({placeholders})
                   AND embeddings.variant_id IS NULL
                 ORDER BY variants.build_variant, variants.id
                 """,
-                (model, project_id, *names),
+                (model, configuration, project_id, *names),
             )
         )
 
-    def embedding_count(self, model: str, project_root: Path | None = None) -> int:
+    def iter_missing_embedding_variant_id_batches(
+        self,
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
+        batch_size: int = EMBEDDING_BATCH_SIZE,
+    ) -> Iterator[tuple[str, ...]]:
+        if batch_size <= 0:
+            raise ValueError("embedding batch size must be positive")
         project_id = self._project_id(project_root)
+        configuration = configuration_id or model
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        last_variant = ""
+        while True:
+            rows = self._connection.execute(
+                f"""
+                SELECT variants.id FROM symbol_variants variants
+                LEFT JOIN variant_embeddings embeddings
+                 ON embeddings.project_id = variants.project_id
+                 AND embeddings.variant_id = variants.id
+                 AND embeddings.model = ?
+                 AND embeddings.configuration_id = ?
+                WHERE variants.project_id = ?
+                  AND variants.build_variant IN ({placeholders})
+                  AND variants.id > ?
+                  AND embeddings.variant_id IS NULL
+                ORDER BY variants.id
+                LIMIT ?
+                """,
+                (model, configuration, project_id, *names, last_variant, batch_size),
+            ).fetchall()
+            if not rows:
+                return
+            batch = tuple(row[0] for row in rows)
+            yield batch
+            last_variant = batch[-1]
+
+    def embedding_count(
+        self,
+        model: str,
+        project_root: Path | None = None,
+        *,
+        configuration_id: str | None = None,
+    ) -> int:
+        project_id = self._project_id(project_root)
+        configuration = configuration_id or model
         return int(
             self._connection.execute(
-                "SELECT count(*) FROM variant_embeddings WHERE project_id = ? AND model = ?",
-                (project_id, model),
+                """
+                SELECT count(*) FROM variant_embeddings
+                WHERE project_id = ? AND model = ? AND configuration_id = ?
+                """,
+                (project_id, model, configuration),
+            ).fetchone()[0]
+        )
+
+    def embedding_vector_count(
+        self,
+        model: str,
+        project_root: Path | None = None,
+        *,
+        configuration_id: str | None = None,
+    ) -> int:
+        project_id = self._project_id(project_root)
+        configuration = configuration_id or model
+        return int(
+            self._connection.execute(
+                """
+                SELECT count(*) FROM embedding_vectors
+                WHERE project_id = ? AND model = ? AND configuration_id = ?
+                """,
+                (project_id, model, configuration),
             ).fetchone()[0]
         )
 
@@ -4795,26 +5238,35 @@ class SQLiteStore:
         limit: int = 20,
         project_root: Path | None = None,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
     ) -> Sequence[SearchHit]:
         if limit <= 0:
             raise ValueError("vector search limit must be greater than zero")
         query_vector = _validate_vector(vector)
         query_magnitude = math.sqrt(sum(value * value for value in query_vector))
         project_id = self._project_id(project_root)
+        configuration = configuration_id or model
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
         dimensions = {
             row[0]
             for row in self._connection.execute(
                 f"""
-                SELECT DISTINCT dimensions FROM variant_embeddings embeddings
+                SELECT DISTINCT vectors.dimensions FROM variant_embeddings embeddings
+                JOIN embedding_vectors vectors
+                  ON vectors.project_id = embeddings.project_id
+                 AND vectors.model = embeddings.model
+                 AND vectors.configuration_id = embeddings.configuration_id
+                 AND vectors.dimensions = embeddings.dimensions
+                 AND vectors.content_hash = embeddings.content_hash
                 JOIN symbol_variants variants
                   ON variants.project_id = embeddings.project_id
                  AND variants.id = embeddings.variant_id
                 WHERE embeddings.project_id = ? AND embeddings.model = ?
+                  AND embeddings.configuration_id = ?
                   AND variants.build_variant IN ({placeholders})
                 """,
-                (project_id, model, *names),
+                (project_id, model, configuration, *names),
             )
         }
         if dimensions and dimensions != {len(query_vector)}:
@@ -4827,19 +5279,35 @@ class SQLiteStore:
             f"""
             SELECT variants.id, variants.build_variant,
                    _cpp_context_cosine(
-                       embeddings.vector, embeddings.magnitude, ?, ?
+                       vectors.vector, vectors.magnitude, ?, ?
                    ) AS score
             FROM variant_embeddings embeddings
+            JOIN embedding_vectors vectors
+              ON vectors.project_id = embeddings.project_id
+             AND vectors.model = embeddings.model
+             AND vectors.configuration_id = embeddings.configuration_id
+             AND vectors.dimensions = embeddings.dimensions
+             AND vectors.content_hash = embeddings.content_hash
             JOIN symbol_variants variants
               ON variants.project_id = embeddings.project_id
              AND variants.id = embeddings.variant_id
             WHERE embeddings.project_id = ? AND embeddings.model = ?
+              AND embeddings.configuration_id = ?
               AND embeddings.dimensions = ?
               AND variants.build_variant IN ({placeholders})
             ORDER BY score DESC, variants.build_variant, variants.id
             LIMIT ?
             """,
-            (query_blob, query_magnitude, project_id, model, len(query_vector), *names, limit),
+            (
+                query_blob,
+                query_magnitude,
+                project_id,
+                model,
+                configuration,
+                len(query_vector),
+                *names,
+                limit,
+            ),
         ).fetchall()
         symbols = self.get_symbols(
             (row["id"] for row in selected),
@@ -4853,6 +5321,39 @@ class SQLiteStore:
         )
 
 
+def _embedding_text(symbol: CodeSymbol, max_text_chars: int = DEFAULT_EMBEDDING_TEXT_CHARS) -> str:
+    return "\n".join(
+        part
+        for part in (
+            symbol.qualified_name,
+            symbol.signature,
+            symbol.documentation,
+            symbol.source_text,
+        )
+        if part
+    )[:max_text_chars]
+
+
+def _embedding_text_from_snapshot(
+    snapshot_json: str, max_text_chars: int = DEFAULT_EMBEDDING_TEXT_CHARS
+) -> str:
+    snapshot = json.loads(snapshot_json)
+    return "\n".join(
+        str(part)
+        for part in (
+            snapshot.get("qualified_name", ""),
+            snapshot.get("signature", ""),
+            snapshot.get("documentation", ""),
+            snapshot.get("source_text", ""),
+        )
+        if part
+    )[:max_text_chars]
+
+
+def _embedding_content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _validate_vector(vector: Sequence[float]) -> tuple[float, ...]:
     values = tuple(float(value) for value in vector)
     if not values:
@@ -4861,7 +5362,35 @@ def _validate_vector(vector: Sequence[float]) -> tuple[float, ...]:
         raise ValueError("embedding vector must contain only finite values")
     if not any(value != 0.0 for value in values):
         raise ValueError("embedding vector magnitude must be greater than zero")
+    if not math.isfinite(sum(value * value for value in values)):
+        raise ValueError("embedding vector must have a finite magnitude")
     return values
+
+
+def _validate_legacy_embedding_vector(
+    dimensions: object,
+    magnitude: object,
+    vector: object,
+    *,
+    variant_id: object,
+) -> tuple[int, float, bytes]:
+    try:
+        if type(dimensions) is not int or dimensions <= 0:
+            raise ValueError
+        if not isinstance(vector, bytes) or len(vector) != dimensions * 8:
+            raise ValueError
+        values = _validate_vector(struct.unpack(f"<{dimensions}d", vector))
+        calculated_magnitude = math.sqrt(sum(value * value for value in values))
+        stored_magnitude = float(magnitude)
+        if (
+            not math.isfinite(calculated_magnitude)
+            or not math.isfinite(stored_magnitude)
+            or stored_magnitude != calculated_magnitude
+        ):
+            raise ValueError
+    except (TypeError, ValueError, struct.error):
+        raise RuntimeError(f"invalid legacy embedding vector for variant {variant_id!r}") from None
+    return dimensions, stored_magnitude, vector
 
 
 @lru_cache(maxsize=128)

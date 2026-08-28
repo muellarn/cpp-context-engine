@@ -61,6 +61,23 @@ def test_openai_embedding_provider_orders_results_and_hides_secret() -> None:
     assert "top-secret" not in repr(provider)
 
 
+def test_openai_embedding_configuration_identity_includes_endpoint_but_not_secret() -> None:
+    first = OpenAICompatibleEmbeddingProvider(
+        "https://first.invalid/v1", "code-model", "first-secret"
+    )
+    second = OpenAICompatibleEmbeddingProvider(
+        "https://second.invalid/v1", "code-model", "second-secret"
+    )
+    rotated_secret = OpenAICompatibleEmbeddingProvider(
+        "https://first.invalid/v1", "code-model", "rotated-secret"
+    )
+
+    assert first.model_id == second.model_id
+    assert first.configuration_id != second.configuration_id
+    assert first.configuration_id == rotated_secret.configuration_id
+    assert "secret" not in first.configuration_id
+
+
 def test_openai_embedding_provider_rejects_duplicate_response_indexes() -> None:
     provider = OpenAICompatibleEmbeddingProvider(
         "http://localhost:11434/v1",
