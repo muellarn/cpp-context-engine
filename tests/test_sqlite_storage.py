@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 import sqlite3
 import struct
+import threading
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,10 +15,12 @@ import cpp_context_engine.storage.sqlite as sqlite_storage
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
+    BuildScope,
     CodeSymbol,
     GraphDirection,
     GraphEdge,
     GraphRelation,
+    IndexProfile,
     OccurrenceKind,
     SearchQuery,
     SourceSpan,
@@ -24,7 +29,15 @@ from cpp_context_engine.models import (
     TranslationUnit,
 )
 from cpp_context_engine.search.vector import SQLiteVectorSearch
-from cpp_context_engine.storage.sqlite import _TRANSLATION_UNIT_DELETE_ORDER, SQLiteStore
+from cpp_context_engine.storage.sqlite import (
+    _TRANSLATION_UNIT_DELETE_ORDER,
+    VECTOR_ENCODING_RAW_F64LE_V1,
+    VECTOR_ENCODING_ZLIB_F64LE_V1,
+    SQLiteStore,
+    _decode_stored_vector,
+    _encode_vector_blob,
+    _TrustedEmbeddingAttachment,
+)
 
 
 def _batch(root: Path) -> IngestionBatch:
@@ -97,6 +110,222 @@ class _RecordingEmbeddingProvider:
         return tuple((float(index + 1), 1.0) for index, _text in enumerate(texts))
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        (0.0, -0.0, 5e-324, -5e-324),
+        tuple(float(index) / 7.0 for index in range(128)),
+        (1.0,) * 128,
+    ],
+)
+def test_vector_storage_encoding_round_trips_exact_float64_bytes(
+    values: tuple[float, ...],
+) -> None:
+    raw = struct.pack(f"<{len(values)}d", *values)
+    encoding, stored = _encode_vector_blob(raw)
+
+    assert encoding in {VECTOR_ENCODING_RAW_F64LE_V1, VECTOR_ENCODING_ZLIB_F64LE_V1}
+    assert _decode_stored_vector(stored, encoding, len(values)) == raw
+    assert _encode_vector_blob(raw) == (encoding, stored)
+
+
+def test_vector_storage_encoding_falls_back_when_compression_is_not_smaller() -> None:
+    raw = bytes(range(64))
+    assert _encode_vector_blob(raw) == (VECTOR_ENCODING_RAW_F64LE_V1, raw)
+
+
+@pytest.mark.parametrize(
+    ("blob", "encoding", "dimensions"),
+    [
+        (b"short", VECTOR_ENCODING_RAW_F64LE_V1, 1),
+        (zlib.compress(b"short"), VECTOR_ENCODING_ZLIB_F64LE_V1, 1),
+        (zlib.compress(b"12345678")[:-1], VECTOR_ENCODING_ZLIB_F64LE_V1, 1),
+        (zlib.compress(b"12345678") + b"trailing", VECTOR_ENCODING_ZLIB_F64LE_V1, 1),
+        (zlib.compress(b"123456789"), VECTOR_ENCODING_ZLIB_F64LE_V1, 1),
+        (zlib.compress(b"0" * 1_000_000), VECTOR_ENCODING_ZLIB_F64LE_V1, 1),
+        (b"12345678", 99, 1),
+    ],
+)
+def test_vector_storage_decoder_rejects_malformed_or_oversized_payloads(
+    blob: bytes, encoding: int, dimensions: int
+) -> None:
+    with pytest.raises(RuntimeError):
+        _decode_stored_vector(blob, encoding, dimensions)
+
+
+def _downgrade_embedding_schema_to_v13(database: Path) -> None:
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = OFF")
+    vectors = connection.execute(
+        """
+        SELECT project_id, model, configuration_id, dimensions, content_hash,
+               content_text, magnitude, vector_encoding, vector
+        FROM embedding_vectors
+        """
+    ).fetchall()
+    references = connection.execute("SELECT * FROM variant_embeddings").fetchall()
+    connection.executescript(
+        """
+        DROP TABLE variant_embeddings;
+        DROP TABLE embedding_vectors;
+        CREATE TABLE embedding_vectors (
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            model TEXT NOT NULL,
+            configuration_id TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            content_text TEXT NOT NULL,
+            magnitude REAL NOT NULL,
+            vector BLOB NOT NULL,
+            PRIMARY KEY (project_id, model, configuration_id, dimensions, content_hash),
+            CHECK (dimensions > 0), CHECK (magnitude > 0),
+            CHECK (typeof(vector) = 'blob'), CHECK (length(vector) = dimensions * 8)
+        );
+        CREATE TABLE variant_embeddings (
+            project_id INTEGER NOT NULL,
+            variant_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            configuration_id TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            PRIMARY KEY (project_id, variant_id, model, configuration_id),
+            FOREIGN KEY (project_id, variant_id)
+                REFERENCES symbol_variants(project_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (project_id, model, configuration_id, dimensions, content_hash)
+                REFERENCES embedding_vectors(
+                    project_id, model, configuration_id, dimensions, content_hash
+                )
+        );
+        CREATE INDEX variant_embeddings_search ON variant_embeddings(
+            project_id, model, configuration_id, dimensions, variant_id
+        );
+        CREATE INDEX variant_embeddings_content ON variant_embeddings(
+            project_id, model, configuration_id, dimensions, content_hash
+        );
+        PRAGMA user_version = 13;
+        """
+    )
+    connection.executemany(
+        "INSERT INTO embedding_vectors VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            (
+                row["project_id"],
+                row["model"],
+                row["configuration_id"],
+                row["dimensions"],
+                row["content_hash"],
+                row["content_text"],
+                row["magnitude"],
+                _decode_stored_vector(row["vector"], row["vector_encoding"], row["dimensions"]),
+            )
+            for row in vectors
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO variant_embeddings VALUES (?, ?, ?, ?, ?, ?)",
+        (tuple(row) for row in references),
+    )
+    connection.commit()
+    connection.close()
+
+
+def _open_migration_store(database: Path, root: Path) -> SQLiteStore:
+    store = SQLiteStore.__new__(SQLiteStore)
+    store.path = database
+    store.project_root = root
+    store.build_scope = BuildScope.single()
+    store._connection = sqlite3.connect(database)  # noqa: SLF001 - migration fixture
+    store._connection.row_factory = sqlite3.Row  # noqa: SLF001
+    store._connection.execute("PRAGMA foreign_keys = ON")  # noqa: SLF001
+    return store
+
+
+def test_v13_embedding_migration_preserves_canonical_vectors_and_ranking(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "index.db"
+    values = [1.0] * 128
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_embedding("symbol-alpha", "fixture", values)
+    _downgrade_embedding_schema_to_v13(database)
+
+    with SQLiteStore(database, project_root=root) as store:
+        row = store._connection.execute(  # noqa: SLF001
+            "SELECT dimensions, magnitude, vector_encoding, vector FROM embedding_vectors"
+        ).fetchone()
+        assert row is not None
+        assert row["vector_encoding"] == VECTOR_ENCODING_ZLIB_F64LE_V1
+        assert _decode_stored_vector(row["vector"], row["vector_encoding"], 128) == struct.pack(
+            "<128d", *values
+        )
+        assert row["magnitude"] == math.sqrt(128.0)
+        hits = store.search_vector(values, model="fixture")
+        assert [hit.symbol.id for hit in hits] == ["symbol-alpha"]
+        assert hits[0].score == pytest.approx(1.0)
+        assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
+
+
+@pytest.mark.parametrize("stage", ["create", "copy", "index", "foreign-key", "publication"])
+def test_v13_embedding_migration_failure_rolls_back_every_stage(tmp_path: Path, stage: str) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "index.db"
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_embedding("symbol-alpha", "fixture", [1.0] * 128)
+    _downgrade_embedding_schema_to_v13(database)
+
+    store = _open_migration_store(database, root)
+
+    def fail_at(candidate: str) -> None:
+        if candidate == stage:
+            raise RuntimeError(f"injected {stage} failure")
+
+    store._embedding_migration_checkpoint = fail_at  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match=f"injected {stage} failure"):
+        store._migrate_v14()  # noqa: SLF001
+    assert not store._connection.in_transaction  # noqa: SLF001
+    assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 13  # noqa: SLF001
+    assert "vector_encoding" not in {  # noqa: SLF001
+        row[1] for row in store._connection.execute("PRAGMA table_info(embedding_vectors)")
+    }
+    assert store._connection.execute("SELECT count(*) FROM embedding_vectors").fetchone()[0] == 1  # noqa: SLF001
+    store._connection.close()  # noqa: SLF001
+
+
+def test_v13_embedding_migration_rejects_embedding_foreign_key_corruption(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "index.db"
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_embedding("symbol-alpha", "fixture", [1.0] * 128)
+    _downgrade_embedding_schema_to_v13(database)
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("UPDATE variant_embeddings SET content_hash = 'missing'")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="embedding migration foreign-key failure"):
+        SQLiteStore(database, project_root=root)
+
+    unchanged = sqlite3.connect(database)
+    try:
+        assert unchanged.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert "vector_encoding" not in {
+            row[1] for row in unchanged.execute("PRAGMA table_info(embedding_vectors)")
+        }
+    finally:
+        unchanged.close()
+
+
 def test_schema_round_trip_fts_graph_and_occurrences(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -115,6 +344,161 @@ def test_schema_round_trip_fts_graph_and_occurrences(tmp_path: Path) -> None:
         assert store.neighbors("file-a") == (
             GraphEdge("file-a", symbol.id, GraphRelation.CONTAINS),
         )
+
+
+def _create_v12_profile_fixture(database: Path, root: Path) -> None:
+    """Create a structurally accurate v12 database with representative TU rows."""
+
+    batch = _batch(root)
+    native_unit = replace(
+        batch.translation_units[0],
+        analysis_backend="clang-libtooling",
+        advanced_facts_complete=True,
+    )
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(root, replace(batch, translation_units=(native_unit,)))
+        with store._connection:  # noqa: SLF001 - construct the legacy schema fixture
+            store._connection.execute(  # noqa: SLF001
+                """
+                INSERT INTO translation_units(
+                    project_id, id, build_configuration_id, source_path, content_hash,
+                    diagnostics_json, indexed_at, build_variant, analysis_backend,
+                    advanced_facts_complete, index_profile, navigation_facts_complete,
+                    cfg_facts_complete, data_flow_facts_complete, summary_facts_complete
+                )
+                SELECT project_id, 'unit-baseline', build_configuration_id, source_path,
+                       content_hash, diagnostics_json, indexed_at, build_variant,
+                       'baseline', 0, 'full', 0, 0, 0, 0
+                FROM translation_units WHERE id = ?
+                """,
+                (native_unit.id,),
+            )
+            for column in (
+                "summary_facts_complete",
+                "data_flow_facts_complete",
+                "cfg_facts_complete",
+                "navigation_facts_complete",
+                "index_profile",
+            ):
+                store._connection.execute(  # noqa: SLF001
+                    f'ALTER TABLE translation_units DROP COLUMN "{column}"'
+                )
+            store._connection.execute(  # noqa: SLF001
+                'ALTER TABLE build_variants DROP COLUMN "index_profile"'
+            )
+            store._connection.execute("PRAGMA user_version = 12")  # noqa: SLF001
+
+
+def test_v13_migration_upgrades_real_v12_profile_and_coverage_rows(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "legacy-v12.db"
+    _create_v12_profile_fixture(database, root)
+
+    with sqlite3.connect(database) as legacy:
+        assert legacy.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert "index_profile" not in {
+            row[1] for row in legacy.execute("PRAGMA table_info(build_variants)")
+        }
+        assert {
+            "index_profile",
+            "navigation_facts_complete",
+            "cfg_facts_complete",
+            "data_flow_facts_complete",
+            "summary_facts_complete",
+        }.isdisjoint(row[1] for row in legacy.execute("PRAGMA table_info(translation_units)"))
+
+    with SQLiteStore(database, project_root=root) as migrated:
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
+        assert "vector_encoding" in {  # noqa: SLF001
+            row[1] for row in migrated._connection.execute("PRAGMA table_info(embedding_vectors)")
+        }
+        states = migrated.translation_unit_states(root)
+        build_profiles = migrated.build_index_profiles(root)
+
+    assert build_profiles == {"default": IndexProfile.FULL}
+    native = states["unit-a"]
+    assert native.index_profile is IndexProfile.FULL
+    assert native.navigation_facts_complete
+    assert native.cfg_facts_complete
+    assert native.data_flow_facts_complete
+    assert native.summary_facts_complete
+    baseline = states["unit-baseline"]
+    assert baseline.index_profile is IndexProfile.FULL
+    assert not baseline.navigation_facts_complete
+    assert not baseline.cfg_facts_complete
+    assert not baseline.data_flow_facts_complete
+    assert not baseline.summary_facts_complete
+
+
+def test_v13_migration_failure_rolls_back_all_profile_columns(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "legacy-v12.db"
+    _create_v12_profile_fixture(database, root)
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    altered = 0
+
+    def deny_second_alter(
+        action: int, _arg1: str | None, _arg2: str | None, _db: str | None, _source: str | None
+    ) -> int:
+        nonlocal altered
+        if action == sqlite3.SQLITE_ALTER_TABLE:
+            altered += 1
+            if altered == 2:
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(deny_second_alter)
+    store = SQLiteStore.__new__(SQLiteStore)
+    store._connection = connection  # noqa: SLF001 - exercise migration transaction directly
+    with pytest.raises(sqlite3.DatabaseError):
+        store._migrate_v13()  # noqa: SLF001
+    connection.set_authorizer(None)
+
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert "index_profile" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(build_variants)")
+    }
+    assert "index_profile" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(translation_units)")
+    }
+    connection.close()
+
+
+def test_combined_v12_to_v14_failure_rolls_back_profile_and_vector_schema(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "legacy-v12.db"
+    _create_v12_profile_fixture(database, root)
+    _downgrade_embedding_schema_to_v13(database)
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA user_version = 12")
+    connection.commit()
+    connection.close()
+
+    store = _open_migration_store(database, root)
+
+    def fail_publication(stage: str) -> None:
+        if stage == "publication":
+            raise RuntimeError("injected publication failure")
+
+    store._embedding_migration_checkpoint = fail_publication  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="injected publication failure"):
+        store._migrate_v13_and_v14()  # noqa: SLF001
+
+    assert not store._connection.in_transaction  # noqa: SLF001
+    assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+    assert "vector_encoding" not in {  # noqa: SLF001
+        row[1] for row in store._connection.execute("PRAGMA table_info(embedding_vectors)")
+    }
+    assert "index_profile" not in {  # noqa: SLF001
+        row[1] for row in store._connection.execute("PRAGMA table_info(translation_units)")
+    }
+    store._connection.close()  # noqa: SLF001
 
 
 def test_symbol_refresh_lookup_uses_v9_preference_index(tmp_path: Path) -> None:
@@ -422,6 +806,134 @@ def test_cosine_search_is_mathematically_ordered_and_validated(
             store.put_embedding("file-a", "fixture", [1.0, 2.0, 3.0])
 
 
+@pytest.mark.parametrize(
+    ("encoding", "blob", "magnitude"),
+    [
+        (VECTOR_ENCODING_RAW_F64LE_V1, struct.pack("<2d", float("nan"), 1.0), 1.0),
+        (
+            VECTOR_ENCODING_ZLIB_F64LE_V1,
+            zlib.compress(struct.pack("<2d", float("inf"), 1.0)),
+            1.0,
+        ),
+        (VECTOR_ENCODING_RAW_F64LE_V1, struct.pack("<2d", 1.0, 1.0), float("inf")),
+        (VECTOR_ENCODING_RAW_F64LE_V1, struct.pack("<2d", 1.0, 1.0), 9.0),
+    ],
+)
+def test_cosine_search_rejects_corrupt_stored_values(
+    tmp_path: Path, encoding: int, blob: bytes, magnitude: float
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_embedding("symbol-alpha", "fixture", [1.0, 1.0])
+        store._connection.execute("PRAGMA ignore_check_constraints = ON")  # noqa: SLF001
+        store._connection.execute(  # noqa: SLF001
+            "UPDATE embedding_vectors SET vector_encoding = ?, vector = ?, magnitude = ?",
+            (encoding, blob, magnitude),
+        )
+
+        with pytest.raises(sqlite3.OperationalError, match="user-defined function"):
+            store.search_vector([1.0, 1.0], model="fixture")
+
+
+def test_cosine_search_rejects_corrupt_query_before_sql(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_embedding("symbol-alpha", "fixture", [1.0, 1.0])
+        statements: list[str] = []
+        store._connection.set_trace_callback(statements.append)  # noqa: SLF001
+        with pytest.raises(ValueError, match="finite"):
+            store.search_vector([float("nan"), 1.0], model="fixture")
+        store._connection.set_trace_callback(None)  # noqa: SLF001
+
+    assert not any("_cpp_context_cosine" in statement for statement in statements)
+
+
+def test_cosine_search_validates_query_once_and_unpacks_each_candidate_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_embedding("symbol-alpha", "fixture", [1.0, 1.0])
+        store.put_embedding("file-a", "fixture", [-1.0, 0.0])
+        validations = 0
+        unpacks = 0
+        original_validate = sqlite_storage._validate_vector
+        original_decode = sqlite_storage._decode_vector_blob
+
+        def count_validate(values: object) -> tuple[float, ...]:
+            nonlocal validations
+            validations += 1
+            return original_validate(values)  # type: ignore[arg-type]
+
+        def count_decode(blob: bytes) -> tuple[float, ...]:
+            nonlocal unpacks
+            unpacks += 1
+            return original_decode(blob)
+
+        monkeypatch.setattr(sqlite_storage, "_validate_vector", count_validate)
+        monkeypatch.setattr(sqlite_storage, "_decode_vector_blob", count_decode)
+        hits = store.search_vector([1.0, 1.0], model="fixture")
+
+    assert [hit.symbol.id for hit in hits] == ["symbol-alpha", "file-a"]
+    assert validations == 1
+    assert unpacks == 2
+
+
+def test_concurrent_vector_searches_are_isolated_and_release_lock_on_error(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_embedding("symbol-alpha", "fixture", [1.0, 0.0])
+        store.put_embedding("file-a", "fixture", [0.0, 1.0])
+        barrier = threading.Barrier(2)
+
+        def search(query: list[float]) -> tuple[list[str], bool]:
+            barrier.wait(timeout=2)
+            hits = store.search_vector(query, model="fixture")
+            return [hit.symbol.id for hit in hits], hasattr(
+                store._vector_query_state,
+                "current",  # noqa: SLF001
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            alpha = executor.submit(search, [1.0, 0.0])
+            file_symbol = executor.submit(search, [0.0, 1.0])
+            assert alpha.result(timeout=5) == (["symbol-alpha", "file-a"], False)
+            assert file_symbol.result(timeout=5) == (["file-a", "symbol-alpha"], False)
+
+        with store._vector_search_lock:  # noqa: SLF001 - prove the lock is reentrant
+            assert store.search_vector([1.0, 0.0], model="fixture")[0].symbol.id == "symbol-alpha"
+
+        barrier = threading.Barrier(2)
+
+        def fail_dimension() -> str:
+            barrier.wait(timeout=2)
+            with pytest.raises(ValueError, match="dimension"):
+                store.search_vector([1.0, 0.0, 0.0], model="fixture")
+            return "failed-cleanly"
+
+        def search_after_failure() -> str:
+            barrier.wait(timeout=2)
+            return store.search_vector([0.0, 1.0], model="fixture")[0].symbol.id
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            failed = executor.submit(fail_dimension)
+            successful = executor.submit(search_after_failure)
+            assert failed.result(timeout=5) == "failed-cleanly"
+            assert successful.result(timeout=5) == "file-a"
+
+        assert store.search_vector([1.0, 0.0], model="fixture")[0].symbol.id == "symbol-alpha"
+
+
 def test_embedding_batch_validates_atomically(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -502,6 +1014,269 @@ def test_vector_index_shares_equal_text_and_processes_bounded_batches(tmp_path: 
         )
 
     assert shared == 1
+
+
+def test_missing_vector_index_streams_snapshot_text_without_symbol_hydration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    provider = _RecordingEmbeddingProvider()
+
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        search = SQLiteVectorSearch(store, provider, project_root=root, batch_size=1)
+        monkeypatch.setattr(
+            store,
+            "get_symbols",
+            lambda *_args, **_kwargs: pytest.fail("missing-index path hydrated symbols"),
+        )
+
+        assert search.index_missing() == 2
+        assert provider.calls == [
+            ("source.cpp\nsource.cpp",),
+            ("alpha\nint alpha()\nReturns the important answer.\nint alpha() { return 7; }",),
+        ]
+
+
+def test_trusted_embedding_batches_reject_forged_stale_and_cross_store_use(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = SQLiteStore(tmp_path / "first.db", project_root=first_root)
+    second = SQLiteStore(tmp_path / "second.db", project_root=second_root)
+    try:
+        first.apply_ingestion(first_root, _batch(first_root))
+        second.apply_ingestion(second_root, _batch(second_root))
+        with first.embedding_write_session(first_root):
+            batch = next(first.iter_missing_embedding_record_batches("fixture", first_root))
+            forged = replace(batch, capability=object())
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                first._attach_existing_embeddings_trusted(  # noqa: SLF001
+                    forged, "fixture", first_root
+                )
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                first._attach_existing_embeddings_trusted(  # noqa: SLF001
+                    replace(batch), "fixture", first_root
+                )
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                first._attach_existing_embeddings_trusted(  # noqa: SLF001
+                    batch, "fixture", first_root, build_scope=BuildScope(("other",))
+                )
+            put_before_attach = _TrustedEmbeddingAttachment(batch.capability, (), 2)
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                first._put_content_embeddings_trusted(  # noqa: SLF001
+                    put_before_attach, (), "fixture", first_root
+                )
+            with (
+                second.embedding_write_session(second_root),
+                pytest.raises(RuntimeError, match="stale or foreign"),
+            ):
+                second._attach_existing_embeddings_trusted(  # noqa: SLF001
+                    batch, "fixture", second_root
+                )
+        with (
+            first.embedding_write_session(first_root),
+            pytest.raises(RuntimeError, match="stale or foreign"),
+        ):
+            first._attach_existing_embeddings_trusted(  # noqa: SLF001
+                batch, "fixture", first_root
+            )
+    finally:
+        first.close()
+        second.close()
+
+
+def test_trusted_embedding_batch_is_single_use_and_canonical(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        with store.embedding_write_session(root):
+            batch = next(store.iter_missing_embedding_record_batches("fixture", root))
+            attachment = store._attach_existing_embeddings_trusted(  # noqa: SLF001
+                batch, "fixture", root
+            )
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                store._attach_existing_embeddings_trusted(batch, "fixture", root)  # noqa: SLF001
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                store._put_content_embeddings_trusted(  # noqa: SLF001
+                    replace(attachment), (), "fixture", root
+                )
+            forged = tuple(
+                (variant_id, text + " forged", [1.0, 0.0])
+                for variant_id, text in attachment.records
+            )
+            with pytest.raises(RuntimeError, match="do not match"):
+                store._put_content_embeddings_trusted(  # noqa: SLF001
+                    attachment, forged, "fixture", root
+                )
+            valid = tuple(
+                (variant_id, text, [1.0, float(index + 1)])
+                for index, (variant_id, text) in enumerate(attachment.records)
+            )
+            store._put_content_embeddings_trusted(  # noqa: SLF001
+                attachment, valid, "fixture", root
+            )
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                store._put_content_embeddings_trusted(  # noqa: SLF001
+                    attachment, valid, "fixture", root
+                )
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                store._attach_existing_embeddings_trusted(batch, "fixture", root)  # noqa: SLF001
+
+
+def test_consumed_trusted_batches_leave_registry_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    additions = tuple(
+        replace(
+            batch.symbols[1],
+            id=f"symbol-{index}",
+            qualified_name=f"symbol_{index}",
+            source_text=f"int symbol_{index}();",
+        )
+        for index in range(4)
+    )
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, replace(batch, symbols=(*batch.symbols, *additions)))
+        consumed = 0
+        with store.embedding_write_session(root):
+            for trusted in store.iter_missing_embedding_record_batches(
+                "fixture", root, batch_size=1
+            ):
+                assert len(store._trusted_embedding_registry or {}) == 1  # noqa: SLF001
+                attachment = store._attach_existing_embeddings_trusted(  # noqa: SLF001
+                    trusted, "fixture", root
+                )
+                entries = tuple(
+                    (variant_id, text, [1.0, float(consumed + 1)])
+                    for variant_id, text in attachment.records
+                )
+                store._put_content_embeddings_trusted(  # noqa: SLF001
+                    attachment, entries, "fixture", root
+                )
+                consumed += 1
+                assert len(store._trusted_embedding_registry or {}) == 0  # noqa: SLF001
+                with pytest.raises(RuntimeError, match="stale or foreign"):
+                    store._attach_existing_embeddings_trusted(  # noqa: SLF001
+                        trusted, "fixture", root
+                    )
+
+        assert consumed > 2
+
+
+def test_trusted_iterator_rejects_a_second_outstanding_batch(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    addition = replace(batch.symbols[1], id="symbol-extra", qualified_name="extra")
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, replace(batch, symbols=(*batch.symbols, addition)))
+        with (
+            pytest.raises(RuntimeError, match="still outstanding"),
+            store.embedding_write_session(root),
+        ):
+            iterator = store.iter_missing_embedding_record_batches("fixture", root, batch_size=1)
+            next(iterator)
+            assert len(store._trusted_embedding_registry or {}) == 1  # noqa: SLF001
+            next(iterator)
+
+        assert store._trusted_embedding_registry is None  # noqa: SLF001
+        assert not store._connection.in_transaction  # noqa: SLF001
+        assert (
+            SQLiteVectorSearch(
+                store, _RecordingEmbeddingProvider(), project_root=root, batch_size=1
+            ).index_missing()
+            == 3
+        )
+
+
+def test_no_miss_trusted_attach_immediately_releases_capability(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    provider = _RecordingEmbeddingProvider()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        SQLiteVectorSearch(store, provider, project_root=root).index_missing()
+        missing_variant = store._connection.execute(  # noqa: SLF001
+            "SELECT id FROM symbol_variants ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        with store._connection:  # noqa: SLF001
+            store._connection.execute(  # noqa: SLF001
+                "DELETE FROM variant_embeddings WHERE variant_id = ?", (missing_variant,)
+            )
+
+        with store.embedding_write_session(root):
+            trusted = next(
+                store.iter_missing_embedding_record_batches(
+                    "fixture", root, configuration_id=provider.configuration_id
+                )
+            )
+            attachment = store._attach_existing_embeddings_trusted(  # noqa: SLF001
+                trusted, "fixture", root, configuration_id=provider.configuration_id
+            )
+            assert attachment.records == ()
+            assert len(store._trusted_embedding_registry or {}) == 0  # noqa: SLF001
+            with pytest.raises(RuntimeError, match="stale or foreign"):
+                store._attach_existing_embeddings_trusted(  # noqa: SLF001
+                    trusted, "fixture", root, configuration_id=provider.configuration_id
+                )
+
+
+def test_embedding_commit_failure_rolls_back_and_allows_new_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    provider = _RecordingEmbeddingProvider()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        original_commit = store._commit_embedding_session  # noqa: SLF001
+        monkeypatch.setattr(
+            store,
+            "_commit_embedding_session",
+            lambda: (_ for _ in ()).throw(RuntimeError("injected commit failure")),
+        )
+        with pytest.raises(RuntimeError, match="injected commit failure"):
+            SQLiteVectorSearch(store, provider, project_root=root).index_missing()
+
+        assert not store._connection.in_transaction  # noqa: SLF001
+        assert store.embedding_count(provider.model_id) == 0
+        assert store.embedding_vector_count(provider.model_id) == 0
+        monkeypatch.setattr(store, "_commit_embedding_session", original_commit)
+        assert SQLiteVectorSearch(store, provider, project_root=root).index_missing() == 2
+
+
+def test_public_embedding_writes_keep_variant_scope_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        calls = 0
+        original = store._validate_embedding_variants  # noqa: SLF001
+
+        def recording_validation(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, "_validate_embedding_variants", recording_validation)
+        variant = store.missing_embedding_variant_ids("fixture")[0]
+        with store.embedding_write_session(root):
+            assert store.attach_existing_embeddings(((variant, "text"),), "fixture", root) == (
+                (variant, "text"),
+            )
+            store.put_content_embeddings(((variant, "text", [1.0, 0.0]),), "fixture", root)
+
+        assert calls == 2
 
 
 def test_embedding_configuration_identity_isolated_with_stable_public_model(
@@ -616,6 +1391,49 @@ def test_batched_embedding_failure_rolls_back_all_new_vectors_and_references(
         )
 
 
+@pytest.mark.parametrize("failure", ["wrong-count", "cancel"])
+def test_missing_embedding_session_rolls_back_provider_failure(
+    tmp_path: Path, failure: str
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+
+    class FailingProvider(_RecordingEmbeddingProvider):
+        def embed(self, _texts: list[str]) -> tuple[tuple[float, ...], ...]:
+            if failure == "cancel":
+                raise KeyboardInterrupt
+            return ()
+
+    provider = FailingProvider()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        search = SQLiteVectorSearch(store, provider, project_root=root, batch_size=1)
+        expected = KeyboardInterrupt if failure == "cancel" else ValueError
+        with pytest.raises(expected):
+            search.index_missing()
+
+        assert store.embedding_count(provider.model_id) == 0
+        assert store.embedding_vector_count(provider.model_id) == 0
+
+
+def test_equal_embedding_input_with_different_vector_rolls_back(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        variants = store.missing_embedding_variant_ids("fixture")
+        with store.embedding_write_session(root):
+            store.put_content_embeddings(((variants[0], "same", [1.0, 0.0]),), "fixture", root)
+        with (
+            pytest.raises(ValueError, match="equal embedding inputs"),
+            store.embedding_write_session(root),
+        ):
+            store.put_content_embeddings(((variants[1], "same", [0.0, 1.0]),), "fixture", root)
+
+        assert store.embedding_count("fixture") == 1
+        assert store.embedding_vector_count("fixture") == 1
+
+
 def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -670,7 +1488,7 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     legacy.close()
 
     with SQLiteStore(database, project_root=root) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
         assert store.embedding_count("fixture") == 2
         assert store.embedding_vector_count("fixture") == 1
         assert store.embedding_count("openai-compatible:legacy") == 0
@@ -767,7 +1585,13 @@ def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
+        assert "vector_encoding" in {
+            row[1]
+            for row in store._connection.execute(  # noqa: SLF001
+                "PRAGMA table_info(embedding_vectors)"
+            )
+        }
 
     assert {"embedding_vectors", "variant_embeddings"} <= tables
 

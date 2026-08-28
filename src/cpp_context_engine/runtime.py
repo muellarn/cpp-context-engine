@@ -22,7 +22,7 @@ from cpp_context_engine.ingestion import (
     ProjectIndexer,
 )
 from cpp_context_engine.llm import LLMProvider, OpenAICompatibleProvider
-from cpp_context_engine.models import BuildScope
+from cpp_context_engine.models import BuildScope, IndexProfile
 from cpp_context_engine.retrieval import HybridRetriever, RetrievalConfig
 from cpp_context_engine.search import (
     DeterministicLocalEmbeddingProvider,
@@ -43,6 +43,7 @@ class IndexOperationResult:
     analysis_backend: str = "libclang-baseline"
     advanced_facts_complete: bool = False
     analyzer_capabilities: tuple[str, ...] = ()
+    index_profile: IndexProfile = IndexProfile.FULL
 
 
 @dataclass(slots=True)
@@ -141,6 +142,7 @@ def index_project(config: AppConfig) -> IndexOperationResult:
                 max_decoded_bytes=config.analyzer_max_decoded_bytes,
                 max_record_bytes=config.analyzer_max_record_bytes,
                 max_stderr_bytes=config.analyzer_max_stderr_bytes,
+                profile=config.index_profile,
             )
             info = client.probe()
             ingestor = NativeClangIngestor(
@@ -150,17 +152,20 @@ def index_project(config: AppConfig) -> IndexOperationResult:
                 max_spool_bytes=config.analyzer_max_spool_bytes,
                 max_spool_fds=config.analyzer_max_spool_files,
                 max_domain_batches=config.analyzer_max_domain_batches,
+                profile=config.index_profile,
             )
             analysis_backend = "clang-libtooling"
-            advanced_complete = True
+            advanced_complete = config.index_profile is IndexProfile.FULL
             capabilities = tuple(sorted(info.capabilities))
         else:
+            if config.index_profile is IndexProfile.NAVIGATION:
+                raise ValueError("navigation profile requires the native Clang analyzer")
             ingestor = ClangIngestor(library_file=config.libclang_library_file)
             analysis_backend = "libclang-baseline"
             advanced_complete = False
             capabilities = ()
         results = tuple(
-            ProjectIndexer(ingestor, store).index(
+            ProjectIndexer(ingestor, store, profile=config.index_profile).index(
                 config.project_root,
                 variant.compilation_database,
                 build_variant=variant,
@@ -199,6 +204,7 @@ def index_project(config: AppConfig) -> IndexOperationResult:
             analysis_backend,
             advanced_complete,
             capabilities,
+            config.index_profile,
         )
 
 

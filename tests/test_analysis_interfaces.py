@@ -744,3 +744,50 @@ def test_http_search_uses_request_scope_and_sanitizes_paths(tmp_path: Path) -> N
     assert {item["build_variant"] for item in document["items"]} == {"beta"}
     assert all(not item["path"].startswith("/") for item in document["items"])
     assert str(project) not in json.dumps(document)
+
+
+def test_navigation_coverage_returns_structured_deep_unavailable_even_with_stale_rows(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = _config(project, tmp_path / "index.db")
+    _seed(config)
+    assert config.database_path is not None
+    with SQLiteStore(config.database_path, project_root=project) as store, store._connection:  # noqa: SLF001
+        store._connection.execute(  # noqa: SLF001
+            """
+            UPDATE translation_units
+            SET index_profile = 'navigation', cfg_facts_complete = 0,
+                data_flow_facts_complete = 0, summary_facts_complete = 0,
+                advanced_facts_complete = 0
+            """
+        )
+
+    with build_runtime(config) as runtime:
+        cfg = runtime.analysis_service.control_flow(CfgRequest(function_symbol_id="cxx:analyze"))
+        flow = runtime.analysis_service.data_flow(FlowRequest(function_symbol_id="cxx:analyze"))
+        http = TestClient(
+            create_app(
+                retrieval_service=runtime.retrieval_service,
+                analysis_service=runtime.analysis_service,
+            )
+        ).post("/v1/cfg", json={"function_symbol_id": "cxx:analyze"})
+
+    assert cfg.available is False
+    assert "control-flow facts" in cfg.unavailable_reason
+    assert {item.profile for item in cfg.coverage} == {"navigation"}
+    assert flow.available is False
+    assert "data-flow and summary facts" in flow.unavailable_reason
+    assert all(not item.data_flow and not item.summaries for item in flow.coverage)
+    assert http.status_code == 200
+    assert http.json()["available"] is False
+
+    async def scenario() -> None:
+        async with Client(create_mcp_server(config), mode="legacy") as mcp:
+            result = await mcp.call_tool("control_flow", {"symbol_id": "cxx:analyze"})
+            assert not result.is_error
+            assert result.structured_content["available"] is False
+            assert result.structured_content["coverage"]
+
+    anyio.run(scenario)

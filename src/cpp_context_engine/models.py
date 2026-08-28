@@ -14,6 +14,11 @@ MAX_BUILD_VARIANTS = 16
 MAX_BUILD_VARIANT_NAME_CHARS = 128
 
 
+class IndexProfile(StrEnum):
+    FULL = "full"
+    NAVIGATION = "navigation"
+
+
 class SymbolKind(StrEnum):
     FILE = "file"
     FUNCTION = "function"
@@ -253,6 +258,11 @@ class TranslationUnit:
     build_variant: str = DEFAULT_BUILD_VARIANT
     analysis_backend: str = "unknown"
     advanced_facts_complete: bool = False
+    index_profile: IndexProfile = IndexProfile.FULL
+    navigation_facts_complete: bool | None = None
+    cfg_facts_complete: bool | None = None
+    data_flow_facts_complete: bool | None = None
+    summary_facts_complete: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

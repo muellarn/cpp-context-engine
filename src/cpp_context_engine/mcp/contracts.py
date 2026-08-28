@@ -10,6 +10,7 @@ from cpp_context_engine.models import (
     CallTargetCertainty,
     GraphDirection,
     GraphRelation,
+    IndexProfile,
     SymbolKind,
 )
 
@@ -158,6 +159,7 @@ class IndexProjectResult(ToolOutput):
     analysis_backend: str
     advanced_facts_complete: bool
     analyzer_capabilities: list[str] = Field(default_factory=list)
+    index_profile: IndexProfile = IndexProfile.FULL
 
 
 class AnswerSource(ToolOutput):

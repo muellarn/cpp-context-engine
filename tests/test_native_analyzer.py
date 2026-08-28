@@ -26,7 +26,9 @@ from native_cache import (
     staged_fixture,
 )
 
+from cpp_context_engine.api import QueryRequest
 from cpp_context_engine.cli import main
+from cpp_context_engine.config import AppConfig
 from cpp_context_engine.ingestion import (
     AnalyzerLimitError,
     AnalyzerProtocolError,
@@ -49,8 +51,11 @@ from cpp_context_engine.models import (
     BuildVariant,
     CfgEdgeKind,
     GraphRelation,
+    IndexProfile,
     OccurrenceKind,
+    SymbolKind,
 )
+from cpp_context_engine.runtime import build_runtime, index_project
 from cpp_context_engine.storage import SQLiteStore
 
 FIXTURE = Path(__file__).parent / "fixtures" / "analyzer_project"
@@ -58,6 +63,7 @@ PARITY_FIXTURE = Path(__file__).parent / "fixtures" / "cpp_project"
 CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
 IMPLICIT_FIXTURE = Path(__file__).parent / "fixtures" / "implicit_project"
 TEMPLATE_DATAFLOW_FIXTURE = Path(__file__).parent / "fixtures" / "template_dataflow_project"
+DATAFLOW_FIXTURE = Path(__file__).parent / "fixtures" / "dataflow_project"
 pytestmark = pytest.mark.native
 
 
@@ -92,6 +98,7 @@ def _fake_hello(*, gzip_transport: bool = False) -> dict[str, object]:
         "points_to_v1",
         "function_summaries_v1",
         "interprocedural_bindings_v1",
+        "analysis_profiles_v1",
     ]
     if gzip_transport:
         capabilities.append("gzip_jsonl_v1")
@@ -870,6 +877,44 @@ def test_real_companion_finalizes_gzip_when_rejecting_request() -> None:
     assert records[-1]["code"] == "invalid_request"
 
 
+def test_full_profile_accepts_old_v5_companion_but_navigation_requires_capability(
+    tmp_path: Path,
+) -> None:
+    hello = _fake_hello()
+    hello["capabilities"].remove("analysis_profiles_v1")  # type: ignore[union-attr]
+    binary = _script(
+        tmp_path,
+        f"""import json, sys
+requests = [json.loads(line) for line in sys.stdin]
+hello = {hello!r}
+print(json.dumps(hello), flush=True)
+if len(requests) > 1:
+    request = requests[1]
+    print(json.dumps({{"type": "begin", "request_id": request["request_id"]}}), flush=True)
+    complete = {{"type": "complete", "request_id": request["request_id"], "success": True}}
+    print(json.dumps(complete), flush=True)
+""",
+    )
+    source = tmp_path / "old.cpp"
+    source.write_text("int old_companion;\n", encoding="utf-8")
+    configuration = BuildConfiguration(
+        id="old",
+        source_path=source,
+        directory=tmp_path,
+        arguments=("clang++", str(source)),
+        command_hash="old",
+    )
+
+    assert (
+        NativeAnalyzerClient(binary, prefer_compression=False).analyze(tmp_path, configuration)
+        == ()
+    )
+    with pytest.raises(AnalyzerProtocolError, match="does not support the navigation profile"):
+        NativeAnalyzerClient(
+            binary, prefer_compression=False, profile=IndexProfile.NAVIGATION
+        ).analyze(tmp_path, configuration)
+
+
 def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
     gzip_client = fresh_native_client(analyzer_binary(), timeout_seconds=30)
     plain_client = fresh_native_client(
@@ -883,6 +928,258 @@ def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
     repeated = NativeClangIngestor(gzip_client).ingest(FIXTURE, FIXTURE / "compile_commands.json")
 
     assert gzip_batch == plain_batch == repeated
+
+
+def test_navigation_profile_preserves_navigation_facts_and_omits_deep_facts() -> None:
+    configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
+    full = fresh_native_client(
+        analyzer_binary(), timeout_seconds=30, profile=IndexProfile.FULL
+    ).analyze(FIXTURE, configuration)
+    navigation = fresh_native_client(
+        analyzer_binary(), timeout_seconds=30, profile=IndexProfile.NAVIGATION
+    ).analyze(FIXTURE, configuration)
+    navigation_kinds = {
+        "file",
+        "include",
+        "symbol",
+        "occurrence",
+        "edge",
+        "callsite_v1",
+        "call_target_v1",
+        "callsite_resolution_v1",
+    }
+
+    def normalized(facts):
+        return {json.dumps(fact, separators=(",", ":"), sort_keys=True) for fact in facts}
+
+    assert normalized(fact for fact in full if fact.get("fact") in navigation_kinds) == normalized(
+        navigation
+    )
+    assert {fact["fact"] for fact in navigation} <= navigation_kinds
+    full_batch = _FactBatchBuilder(FIXTURE.resolve(), configuration).build(full)
+    batch = _FactBatchBuilder(FIXTURE.resolve(), configuration, IndexProfile.NAVIGATION).build(
+        navigation
+    )
+
+    assert batch.symbols == full_batch.symbols
+    file_symbols = tuple(symbol for symbol in batch.symbols if symbol.kind is SymbolKind.FILE)
+    normal_symbols = tuple(symbol for symbol in batch.symbols if symbol.kind is not SymbolKind.FILE)
+    assert file_symbols
+    assert all(symbol.metadata["advanced_facts_complete"] is True for symbol in file_symbols)
+    assert all("advanced_facts_complete" not in symbol.metadata for symbol in normal_symbols)
+    assert all("index_profile" not in symbol.metadata for symbol in batch.symbols)
+    for field in ("occurrences", "edges", "callsites", "call_targets"):
+        assert getattr(batch, field) == getattr(full_batch, field)
+    assert all(unit.index_profile is IndexProfile.NAVIGATION for unit in batch.translation_units)
+    assert all(unit.navigation_facts_complete for unit in batch.translation_units)
+    assert not batch.cfg_graphs
+    assert not batch.data_flow_analyses
+    assert not batch.function_summaries
+
+
+def test_navigation_profile_preserves_dataflow_resolved_indirect_call_targets() -> None:
+    configuration = CompilationDatabase.load(
+        DATAFLOW_FIXTURE / "compile_commands.json"
+    ).configurations[0]
+    full = fresh_native_client(
+        analyzer_binary(), timeout_seconds=30, profile=IndexProfile.FULL
+    ).analyze(DATAFLOW_FIXTURE, configuration)
+    navigation = fresh_native_client(
+        analyzer_binary(), timeout_seconds=30, profile=IndexProfile.NAVIGATION
+    ).analyze(DATAFLOW_FIXTURE, configuration)
+    navigation_kinds = {
+        "file",
+        "include",
+        "symbol",
+        "occurrence",
+        "edge",
+        "callsite_v1",
+        "call_target_v1",
+        "callsite_resolution_v1",
+    }
+
+    def normalized(facts):
+        return {json.dumps(fact, separators=(",", ":"), sort_keys=True) for fact in facts}
+
+    assert normalized(navigation) == normalized(
+        fact for fact in full if fact.get("fact") in navigation_kinds
+    )
+    assert any(fact.get("fact") == "callsite_resolution_v1" for fact in navigation)
+
+
+@pytest.mark.parametrize(
+    "project",
+    [DATAFLOW_FIXTURE, TEMPLATE_DATAFLOW_FIXTURE, IMPLICIT_FIXTURE, CFG_FIXTURE],
+)
+def test_navigation_profile_retains_exact_ordered_facts_across_advanced_fixtures(
+    project: Path,
+) -> None:
+    configuration = CompilationDatabase.load(project / "compile_commands.json").configurations[0]
+    full = fresh_native_client(
+        analyzer_binary(), timeout_seconds=30, profile=IndexProfile.FULL
+    ).analyze(project, configuration)
+    navigation = fresh_native_client(
+        analyzer_binary(), timeout_seconds=30, profile=IndexProfile.NAVIGATION
+    ).analyze(project, configuration)
+    retained = {
+        "file",
+        "include",
+        "symbol",
+        "occurrence",
+        "edge",
+        "callsite_v1",
+        "call_target_v1",
+        "callsite_resolution_v1",
+    }
+
+    assert tuple(fact for fact in full if fact.get("fact") in retained) == navigation
+    assert not {
+        "cfg_graph_v1",
+        "cfg_block_v1",
+        "cfg_element_v1",
+        "cfg_edge_v1",
+        "memory_location_v1",
+        "data_access_v1",
+        "data_flow_evidence_v1",
+        "data_flow_analysis_v1",
+        "function_summary_v1",
+        "summary_effect_v1",
+        "summary_return_origin_v1",
+        "call_argument_binding_v1",
+        "call_result_binding_v1",
+    }.intersection(fact["fact"] for fact in navigation)
+
+
+def test_profile_transitions_clear_deep_facts_noop_and_roll_back_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = CFG_FIXTURE / "compile_commands.json"
+    configurations = CompilationDatabase.load(database).configurations
+    full = NativeClangIngestor(
+        cached_native_client(analyzer_binary(), timeout_seconds=30, profile=IndexProfile.FULL),
+        profile=IndexProfile.FULL,
+    )
+    navigation = NativeClangIngestor(
+        cached_native_client(
+            analyzer_binary(), timeout_seconds=30, profile=IndexProfile.NAVIGATION
+        ),
+        profile=IndexProfile.NAVIGATION,
+    )
+    with SQLiteStore(tmp_path / "profiles.db", project_root=CFG_FIXTURE) as store:
+        first = ProjectIndexer(full, store, profile=IndexProfile.FULL).index(CFG_FIXTURE, database)
+        assert first.indexed_cfg_graphs > 0
+
+        switched = ProjectIndexer(navigation, store, profile=IndexProfile.NAVIGATION).index(
+            CFG_FIXTURE, database
+        )
+        states = store.translation_unit_states(CFG_FIXTURE)
+        assert switched.indexed_translation_units == len(configurations)
+        assert {state.index_profile for state in states.values()} == {IndexProfile.NAVIGATION}
+        assert all(state.navigation_facts_complete for state in states.values())
+        assert all(not state.cfg_facts_complete for state in states.values())
+        for table in (
+            "cfg_graphs",
+            "data_flow_analyses",
+            "function_summaries",
+            "summary_solution_payloads",
+        ):
+            assert store._connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0  # noqa: SLF001, S608
+
+        repeated = ProjectIndexer(navigation, store, profile=IndexProfile.NAVIGATION).index(
+            CFG_FIXTURE, database
+        )
+        assert repeated.indexed_translation_units == 0
+        assert repeated.skipped_translation_units == len(configurations)
+
+        original_stage = store._stage_ingestion_batch  # noqa: SLF001
+
+        def fail_stage(*args, **kwargs):
+            original_stage(*args, **kwargs)
+            raise RuntimeError("injected profile transition failure")
+
+        monkeypatch.setattr(store, "_stage_ingestion_batch", fail_stage)
+        with pytest.raises(RuntimeError, match="injected profile transition failure"):
+            ProjectIndexer(full, store, profile=IndexProfile.FULL).index(CFG_FIXTURE, database)
+
+        rolled_back = store.translation_unit_states(CFG_FIXTURE)
+        assert {state.index_profile for state in rolled_back.values()} == {IndexProfile.NAVIGATION}
+        assert store._connection.execute("SELECT count(*) FROM cfg_graphs").fetchone()[0] == 0  # noqa: SLF001
+
+
+def test_navigation_index_matches_full_navigation_tables_embeddings_and_ranking(
+    tmp_path: Path,
+) -> None:
+    analyzer = analyzer_binary()
+    full_config = AppConfig(
+        project_root=FIXTURE,
+        index_directory=tmp_path / "full",
+        database_path=tmp_path / "full.db",
+        compilation_database=FIXTURE / "compile_commands.json",
+        clang_analyzer_path=analyzer,
+        index_profile=IndexProfile.FULL,
+        embedding_dimensions=32,
+    )
+    navigation_config = replace(
+        full_config,
+        index_directory=tmp_path / "navigation",
+        database_path=tmp_path / "navigation.db",
+        index_profile=IndexProfile.NAVIGATION,
+    )
+
+    full_result = index_project(full_config)
+    navigation_result = index_project(navigation_config)
+    assert navigation_result.index_profile is IndexProfile.NAVIGATION
+    assert navigation_result.indexing.indexed_cfg_graphs == 0
+    assert navigation_result.indexing.indexed_data_flow_analyses == 0
+    assert (
+        navigation_result.indexing.indexed_symbols,
+        navigation_result.indexing.indexed_occurrences,
+        navigation_result.indexing.indexed_edges,
+        navigation_result.indexing.indexed_callsites,
+        navigation_result.indexing.indexed_call_targets,
+        navigation_result.embedded_symbols,
+    ) == (
+        full_result.indexing.indexed_symbols,
+        full_result.indexing.indexed_occurrences,
+        full_result.indexing.indexed_edges,
+        full_result.indexing.indexed_callsites,
+        full_result.indexing.indexed_call_targets,
+        full_result.embedded_symbols,
+    )
+
+    tables = (
+        "symbols",
+        "symbol_variants",
+        "occurrences",
+        "edges",
+        "callsites",
+        "call_targets",
+        "variant_embeddings",
+        "embedding_vectors",
+    )
+    with (
+        sqlite3.connect(full_config.database_path) as full_db,
+        sqlite3.connect(navigation_config.database_path) as navigation_db,
+    ):
+        for table in tables:
+            assert (
+                full_db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                == navigation_db.execute(  # noqa: S608
+                    f"SELECT * FROM {table} ORDER BY rowid"  # noqa: S608
+                ).fetchall()
+            )
+
+    with (
+        build_runtime(full_config) as full_runtime,
+        build_runtime(navigation_config) as navigation_runtime,
+    ):
+        full_hits = full_runtime.query_context(QueryRequest("evaluate", max_results=20)).context
+        navigation_hits = navigation_runtime.query_context(
+            QueryRequest("evaluate", max_results=20)
+        ).context
+    assert [(item.hit.symbol, item.hit.score) for item in navigation_hits.items] == [
+        (item.hit.symbol, item.hit.score) for item in full_hits.items
+    ]
 
 
 def test_implicit_lambda_copy_has_no_orphan_symbol_references() -> None:
@@ -966,7 +1263,17 @@ def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
     ]
     assert len(lambdas) == 1
     assert lambdas[0].metadata["stable_lambda_key"].startswith("lambda:")
-    assert all(symbol.metadata["advanced_facts_complete"] for symbol in batch.symbols)
+    assert all(
+        symbol.metadata.get("advanced_facts_complete") is True
+        for symbol in batch.symbols
+        if symbol.kind is SymbolKind.FILE
+    )
+    assert all(
+        "advanced_facts_complete" not in symbol.metadata
+        for symbol in batch.symbols
+        if symbol.kind is not SymbolKind.FILE
+    )
+    assert all("index_profile" not in symbol.metadata for symbol in batch.symbols)
 
     definition = next(
         symbol

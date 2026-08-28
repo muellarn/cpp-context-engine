@@ -17,6 +17,7 @@ from cpp_context_engine.models import (
     DEFAULT_BUILD_VARIANT,
     BuildConfiguration,
     BuildVariant,
+    IndexProfile,
 )
 from cpp_context_engine.storage.sqlite import SQLiteStore, TranslationUnitState
 
@@ -51,9 +52,16 @@ class IndexingResult:
 class ProjectIndexer:
     """Reparse only units whose command, source, or project dependency changed."""
 
-    def __init__(self, ingestor: Any, store: SQLiteStore) -> None:
+    def __init__(
+        self,
+        ingestor: Any,
+        store: SQLiteStore,
+        *,
+        profile: IndexProfile = IndexProfile.FULL,
+    ) -> None:
         self._ingestor = ingestor
         self._store = store
+        self._profile = IndexProfile(profile)
 
     def index(
         self,
@@ -79,6 +87,7 @@ class ProjectIndexer:
                 advanced_facts_complete=bool(
                     getattr(self._ingestor, "advanced_facts_complete", False)
                 ),
+                profile=self._profile,
             )
         ]
         counts = {result_name: 0 for result_name, _batch_name in _BATCH_COUNT_FIELDS}
@@ -114,6 +123,7 @@ class ProjectIndexer:
                     translation_unit_id(configuration) for configuration in changed
                 ),
                 build_variant=variant,
+                index_profile=self._profile,
             )
         finally:
             close = getattr(batch_stream, "close", None)
@@ -134,6 +144,7 @@ class ProjectIndexer:
         *,
         analysis_backend: str,
         advanced_facts_complete: bool,
+        profile: IndexProfile = IndexProfile.FULL,
     ) -> bool:
         if state is None:
             return True
@@ -142,6 +153,7 @@ class ProjectIndexer:
         if (
             state.analysis_backend != analysis_backend
             or state.advanced_facts_complete != advanced_facts_complete
+            or state.index_profile != profile
         ):
             return True
         source_path = configuration.source_path

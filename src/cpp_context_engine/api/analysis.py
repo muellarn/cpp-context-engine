@@ -49,6 +49,17 @@ class ScopeResult(Contract):
     label: str
 
 
+class CoverageEntry(Contract):
+    build_variant: str
+    translation_unit_id: str
+    analysis_backend: str
+    profile: Literal["full", "navigation"]
+    navigation: bool
+    control_flow: bool
+    data_flow: bool
+    summaries: bool
+
+
 class SourceLocation(Contract):
     path: str
     start_line: int = Field(ge=1)
@@ -68,6 +79,7 @@ class BuildInfo(Contract):
     target: str
     platform: str
     reindex_required: bool
+    profile: Literal["full", "navigation"]
 
 
 class BuildListResult(Contract):
@@ -132,6 +144,9 @@ class ControlFlowResult(Contract):
     scope: ScopeResult
     graphs: Annotated[list[CfgGraphResult], Field(max_length=MAX_CFG_GRAPHS)]
     truncated: bool
+    available: bool = Field(default=True, exclude_if=lambda value: value is True)
+    unavailable_reason: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    coverage: list[CoverageEntry] = Field(default_factory=list, exclude_if=lambda value: not value)
 
 
 class FlowRequest(Contract):
@@ -243,6 +258,9 @@ class DataFlowResult(Contract):
     scope: ScopeResult
     analyses: Annotated[list[DataFlowAnalysisResult], Field(max_length=MAX_FLOW_ANALYSES)]
     truncated: bool
+    available: bool = Field(default=True, exclude_if=lambda value: value is True)
+    unavailable_reason: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    coverage: list[CoverageEntry] = Field(default_factory=list, exclude_if=lambda value: not value)
 
 
 class CallRequest(Contract):
@@ -286,6 +304,7 @@ class AnalysisQueryService:
 
     def list_builds(self) -> BuildListResult:
         reindex = set(self.store.reindex_required_variants(self.project_root))
+        profiles = self.store.build_index_profiles(self.project_root)
         variants = self.store.build_variants(self.project_root, limit=MAX_BUILD_VARIANTS + 1)
         return BuildListResult(
             builds=[
@@ -294,6 +313,7 @@ class AnalysisQueryService:
                     target=item.target,
                     platform=item.platform,
                     reindex_required=item.name in reindex,
+                    profile=profiles[item.name].value,
                 )
                 for item in variants[:MAX_BUILD_VARIANTS]
             ],
@@ -304,6 +324,19 @@ class AnalysisQueryService:
     def control_flow(self, request: CfgRequest) -> ControlFlowResult:
         scope = self.resolve_scope(request.builds)
         function_symbol_id = self._require_symbol(request.function_symbol_id, scope)
+        coverage = self._coverage(function_symbol_id, scope)
+        if not coverage or not all(item.control_flow for item in coverage):
+            return ControlFlowResult(
+                function_symbol_id=function_symbol_id,
+                scope=self._scope_result(scope),
+                graphs=[],
+                truncated=False,
+                available=False,
+                unavailable_reason=(
+                    "control-flow facts are not covered by the selected index profile"
+                ),
+                coverage=coverage,
+            )
         graphs = self.store.cfg_graphs(
             function_symbol_id,
             self.project_root,
@@ -404,6 +437,19 @@ class AnalysisQueryService:
     def data_flow(self, request: FlowRequest) -> DataFlowResult:
         scope = self.resolve_scope(request.builds)
         function_symbol_id = self._require_symbol(request.function_symbol_id, scope)
+        coverage = self._coverage(function_symbol_id, scope)
+        if not coverage or not all(item.data_flow and item.summaries for item in coverage):
+            return DataFlowResult(
+                function_symbol_id=function_symbol_id,
+                scope=self._scope_result(scope),
+                analyses=[],
+                truncated=False,
+                available=False,
+                unavailable_reason=(
+                    "data-flow and summary facts are not covered by the selected index profile"
+                ),
+                coverage=coverage,
+            )
         graphs = self.store.cfg_graphs(
             function_symbol_id,
             self.project_root,
@@ -670,6 +716,23 @@ class AnalysisQueryService:
             raise ValueError("requested symbol ID is not present in the selected build scope")
         # Variant IDs are public handles, but compiler fact tables reference canonical symbol IDs.
         return symbol.id
+
+    def _coverage(self, symbol_id: str, scope: BuildScope) -> list[CoverageEntry]:
+        return [
+            CoverageEntry(
+                build_variant=item.build_variant,
+                translation_unit_id=item.translation_unit_id,
+                analysis_backend=item.analysis_backend,
+                profile=item.index_profile.value,
+                navigation=item.navigation_facts_complete,
+                control_flow=item.cfg_facts_complete,
+                data_flow=item.data_flow_facts_complete,
+                summaries=item.summary_facts_complete,
+            )
+            for item in self.store.analysis_coverage(
+                symbol_id, self.project_root, build_scope=scope
+            )
+        ]
 
     @staticmethod
     def _scope_result(scope: BuildScope) -> ScopeResult:

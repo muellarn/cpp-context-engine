@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Protocol
 
 from cpp_context_engine.models import BuildScope, SearchHit, SearchQuery
-from cpp_context_engine.storage.sqlite import EMBEDDING_BATCH_SIZE, SQLiteStore, _embedding_text
+from cpp_context_engine.storage.sqlite import (
+    EMBEDDING_BATCH_SIZE,
+    SQLiteStore,
+    _embedding_text,
+    _TrustedEmbeddingBatch,
+)
 
 
 class EmbeddingProvider(Protocol):
@@ -69,43 +74,75 @@ class SQLiteVectorSearch:
                     )
                     for symbol in present
                 )
-                missing = self._store.attach_existing_embeddings(
-                    records,
-                    self._provider.model_id,
-                    self._project_root,
-                    build_scope=self._build_scope,
-                    configuration_id=self._configuration_id,
-                )
-                unique_texts = tuple(dict.fromkeys(text for _, text in missing))
-                if unique_texts:
-                    vectors = self._provider.embed(unique_texts)
-                    if len(vectors) != len(unique_texts):
-                        raise ValueError(
-                            "embedding provider returned a different number of vectors than texts"
-                        )
-                    by_text = dict(zip(unique_texts, vectors, strict=True))
-                    self._store.put_content_embeddings(
-                        ((variant_id, text, by_text[text]) for variant_id, text in missing),
-                        self._provider.model_id,
-                        self._project_root,
-                        build_scope=self._build_scope,
-                        configuration_id=self._configuration_id,
-                    )
+                self._index_records(records)
                 indexed += len(present)
         return indexed
 
     def index_missing(self) -> int:
-        return self.index(
-            variant_id
-            for batch in self._store.iter_missing_embedding_variant_id_batches(
+        indexed = 0
+        with self._store.embedding_write_session(self._project_root):
+            for batch in self._store.iter_missing_embedding_record_batches(
                 self._provider.model_id,
                 self._project_root,
                 build_scope=self._build_scope,
                 configuration_id=self._configuration_id,
                 batch_size=self._batch_size,
-            )
-            for variant_id in batch
+                max_text_chars=self._max_text_chars,
+            ):
+                indexed += self._index_trusted_batch(batch)
+        return indexed
+
+    def _index_records(self, records: Sequence[tuple[str, str]]) -> None:
+        missing = self._store.attach_existing_embeddings(
+            records,
+            self._provider.model_id,
+            self._project_root,
+            build_scope=self._build_scope,
+            configuration_id=self._configuration_id,
         )
+        entries = self._embed_missing(missing)
+        if not entries:
+            return
+        self._store.put_content_embeddings(
+            entries,
+            self._provider.model_id,
+            self._project_root,
+            build_scope=self._build_scope,
+            configuration_id=self._configuration_id,
+        )
+
+    def _index_trusted_batch(self, batch: _TrustedEmbeddingBatch) -> int:
+        attachment = self._store._attach_existing_embeddings_trusted(  # noqa: SLF001
+            batch,
+            self._provider.model_id,
+            self._project_root,
+            build_scope=self._build_scope,
+            configuration_id=self._configuration_id,
+        )
+        entries = self._embed_missing(attachment.records)
+        if not entries:
+            return attachment.total_records
+        self._store._put_content_embeddings_trusted(  # noqa: SLF001
+            attachment,
+            entries,
+            self._provider.model_id,
+            self._project_root,
+            build_scope=self._build_scope,
+            configuration_id=self._configuration_id,
+        )
+        return attachment.total_records
+
+    def _embed_missing(
+        self, missing: Sequence[tuple[str, str]]
+    ) -> tuple[tuple[str, str, Sequence[float]], ...]:
+        unique_texts = tuple(dict.fromkeys(text for _, text in missing))
+        if not unique_texts:
+            return ()
+        vectors = self._provider.embed(unique_texts)
+        if len(vectors) != len(unique_texts):
+            raise ValueError("embedding provider returned a different number of vectors than texts")
+        by_text = dict(zip(unique_texts, vectors, strict=True))
+        return tuple((variant_id, text, by_text[text]) for variant_id, text in missing)
 
     def search(self, query: SearchQuery) -> Sequence[SearchHit]:
         vectors = self._provider.embed([query.text])

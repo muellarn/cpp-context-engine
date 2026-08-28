@@ -9,6 +9,7 @@ import operator
 import re
 import sqlite3
 import struct
+import threading
 import zlib
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
@@ -16,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from cpp_context_engine.analysis.interprocedural import solve_interprocedural
 from cpp_context_engine.models import (
@@ -47,6 +48,7 @@ from cpp_context_engine.models import (
     GraphDirection,
     GraphEdge,
     GraphRelation,
+    IndexProfile,
     InterproceduralFlow,
     InterproceduralFlowKind,
     MacroExpansionFrame,
@@ -67,9 +69,11 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 14
+VECTOR_ENCODING_RAW_F64LE_V1 = 0
+VECTOR_ENCODING_ZLIB_F64LE_V1 = 1
 DEFAULT_EMBEDDING_TEXT_CHARS = 32_000
-EMBEDDING_BATCH_SIZE = 128
+EMBEDDING_BATCH_SIZE = 512
 MAX_CFG_PAGE_SIZE = 10_000
 MAX_CALL_PAGE_SIZE = 10_000
 SUMMARY_PAYLOAD_ENCODING = "zlib-json-v1"
@@ -146,6 +150,48 @@ class TranslationUnitState:
     build_variant: str = DEFAULT_BUILD_VARIANT
     analysis_backend: str = "unknown"
     advanced_facts_complete: bool = False
+    index_profile: IndexProfile = IndexProfile.FULL
+    navigation_facts_complete: bool = False
+    cfg_facts_complete: bool = False
+    data_flow_facts_complete: bool = False
+    summary_facts_complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisCoverageState:
+    build_variant: str
+    translation_unit_id: str
+    analysis_backend: str
+    index_profile: IndexProfile
+    navigation_facts_complete: bool
+    cfg_facts_complete: bool
+    data_flow_facts_complete: bool
+    summary_facts_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedEmbeddingBatch:
+    capability: object
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedEmbeddingAttachment:
+    capability: object
+    records: tuple[tuple[str, str], ...]
+    total_records: int
+
+
+@dataclass(slots=True)
+class _TrustedEmbeddingState:
+    batch: _TrustedEmbeddingBatch
+    records: tuple[tuple[str, str], ...]
+    project_id: int
+    scope_names: tuple[str, ...]
+    model: str
+    configuration_id: str
+    status: str = "issued"
+    attachment: _TrustedEmbeddingAttachment | None = None
+    missing: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,12 +227,14 @@ class SQLiteStore:
         # mode safely supports this read-heavy connection when the thread guard is off.
         self._connection = sqlite3.connect(path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
-        self._connection.create_function(
-            "_cpp_context_cosine", 4, _sqlite_cosine, deterministic=True
-        )
+        self._vector_query_state = threading.local()
+        self._vector_search_lock = threading.RLock()
+        self._connection.create_function("_cpp_context_cosine", 3, self._sqlite_cosine)
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._defer_variant_fts = False
+        self._embedding_session_token: object | None = None
+        self._trusted_embedding_registry: dict[object, _TrustedEmbeddingState] | None = None
         self._migrate()
 
     def _classify_schema_indexes(
@@ -279,6 +327,21 @@ class SQLiteStore:
 
     def close(self) -> None:
         self._connection.close()
+
+    def _sqlite_cosine(
+        self, candidate_blob: bytes, candidate_encoding: int, candidate_magnitude: float
+    ) -> float:
+        try:
+            query_values, query_magnitude = self._vector_query_state.current
+        except AttributeError:
+            raise RuntimeError("vector query context is unavailable") from None
+        return _sqlite_cosine_candidate(
+            candidate_blob,
+            candidate_encoding,
+            candidate_magnitude,
+            query_values,
+            query_magnitude,
+        )
 
     def _migrate(self) -> None:
         current = self._connection.execute("PRAGMA user_version").fetchone()[0]
@@ -507,6 +570,280 @@ class SQLiteStore:
             self._migrate_v11_and_v12()
         elif current == 11:
             self._migrate_v12()
+        if current <= 12:
+            self._migrate_v13_and_v14()
+        elif current == 13:
+            self._migrate_v14()
+
+    def _migrate_v13_and_v14(self) -> None:
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._migrate_v13(manage_transaction=False)
+            self._migrate_v14(manage_transaction=False)
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _migrate_v13(self, *, manage_transaction: bool = True) -> None:
+        """Persist explicit build/TU profile and fact-family coverage."""
+
+        try:
+            if manage_transaction:
+                self._connection.execute("BEGIN IMMEDIATE")
+            build_columns = {
+                row["name"] for row in self._connection.execute("PRAGMA table_info(build_variants)")
+            }
+            if build_columns and "index_profile" not in build_columns:
+                self._connection.execute(
+                    "ALTER TABLE build_variants "
+                    "ADD COLUMN index_profile TEXT NOT NULL DEFAULT 'full'"
+                )
+            unit_columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(translation_units)")
+            }
+            additions = {
+                "index_profile": "TEXT NOT NULL DEFAULT 'full'",
+                "navigation_facts_complete": "INTEGER NOT NULL DEFAULT 0",
+                "cfg_facts_complete": "INTEGER NOT NULL DEFAULT 0",
+                "data_flow_facts_complete": "INTEGER NOT NULL DEFAULT 0",
+                "summary_facts_complete": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, declaration in additions.items():
+                if unit_columns and name not in unit_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE translation_units ADD COLUMN {name} {declaration}"
+                    )
+            if unit_columns:
+                self._connection.execute(
+                    """
+                    UPDATE translation_units
+                    SET navigation_facts_complete = advanced_facts_complete,
+                        cfg_facts_complete = advanced_facts_complete,
+                        data_flow_facts_complete = advanced_facts_complete,
+                        summary_facts_complete = advanced_facts_complete
+                    """
+                )
+            self._connection.execute("PRAGMA user_version = 13")
+        except BaseException:
+            if manage_transaction:
+                self._connection.rollback()
+            raise
+        else:
+            if manage_transaction:
+                self._connection.commit()
+
+    def _migrate_v14(self, *, manage_transaction: bool = True) -> None:
+        """Store canonical Float64 vectors using bounded adaptive compression."""
+
+        try:
+            if manage_transaction:
+                self._connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(embedding_vectors)")
+            }
+            if not columns:
+                self._connection.execute("PRAGMA user_version = 14")
+                if manage_transaction:
+                    self._connection.commit()
+                return
+            if "vector_encoding" in columns:
+                self._connection.execute("PRAGMA user_version = 14")
+                if manage_transaction:
+                    self._connection.commit()
+                return
+            self._connection.execute("PRAGMA defer_foreign_keys = ON")
+            self._connection.execute(
+                "ALTER TABLE embedding_vectors RENAME TO embedding_vectors_v13"
+            )
+            self._connection.execute(
+                "ALTER TABLE variant_embeddings RENAME TO variant_embeddings_v13"
+            )
+            self._embedding_migration_checkpoint("create")
+            _execute_script(
+                self._connection,
+                f"""
+                CREATE TABLE embedding_vectors (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    configuration_id TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    content_text TEXT NOT NULL,
+                    magnitude REAL NOT NULL,
+                    vector_encoding INTEGER NOT NULL,
+                    vector BLOB NOT NULL,
+                    PRIMARY KEY (
+                        project_id, model, configuration_id, dimensions, content_hash
+                    ),
+                    CHECK (dimensions > 0),
+                    CHECK (magnitude > 0),
+                    CHECK (vector_encoding IN (
+                        {VECTOR_ENCODING_RAW_F64LE_V1},
+                        {VECTOR_ENCODING_ZLIB_F64LE_V1}
+                    )),
+                    CHECK (typeof(vector) = 'blob'),
+                    CHECK (
+                        (vector_encoding = {VECTOR_ENCODING_RAW_F64LE_V1}
+                         AND length(vector) = dimensions * 8)
+                        OR
+                        (vector_encoding = {VECTOR_ENCODING_ZLIB_F64LE_V1}
+                         AND length(vector) > 0)
+                    )
+                );
+
+                CREATE TABLE variant_embeddings (
+                    project_id INTEGER NOT NULL,
+                    variant_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    configuration_id TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (project_id, variant_id, model, configuration_id),
+                    FOREIGN KEY (project_id, variant_id)
+                        REFERENCES symbol_variants(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (
+                        project_id, model, configuration_id, dimensions, content_hash
+                    ) REFERENCES embedding_vectors(
+                        project_id, model, configuration_id, dimensions, content_hash
+                    )
+                );
+                """,
+            )
+            source_vector_count = int(
+                self._connection.execute("SELECT count(*) FROM embedding_vectors_v13").fetchone()[0]
+            )
+            source_reference_count = int(
+                self._connection.execute("SELECT count(*) FROM variant_embeddings_v13").fetchone()[
+                    0
+                ]
+            )
+            source_digest = hashlib.sha256()
+            self._embedding_migration_checkpoint("copy")
+            cursor = self._connection.execute(
+                """
+                SELECT project_id, model, configuration_id, dimensions, content_hash,
+                       content_text, magnitude, vector
+                FROM embedding_vectors_v13
+                ORDER BY project_id, model, configuration_id, dimensions, content_hash
+                """
+            )
+            while rows := cursor.fetchmany(EMBEDDING_BATCH_SIZE):
+                encoded_rows = []
+                for row in rows:
+                    dimensions, magnitude, raw = _validate_legacy_embedding_vector(
+                        row["dimensions"],
+                        row["magnitude"],
+                        row["vector"],
+                        variant_id=row["content_hash"],
+                    )
+                    encoding, stored = _encode_vector_blob(raw)
+                    _update_embedding_migration_digest(source_digest, row, raw)
+                    encoded_rows.append(
+                        (
+                            row["project_id"],
+                            row["model"],
+                            row["configuration_id"],
+                            dimensions,
+                            row["content_hash"],
+                            row["content_text"],
+                            magnitude,
+                            encoding,
+                            stored,
+                        )
+                    )
+                self._connection.executemany(
+                    """
+                    INSERT INTO embedding_vectors(
+                        project_id, model, configuration_id, dimensions, content_hash,
+                        content_text, magnitude, vector_encoding, vector
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    encoded_rows,
+                )
+            if source_reference_count:
+                self._connection.execute(
+                    """
+                    INSERT INTO variant_embeddings(
+                        project_id, variant_id, model, configuration_id,
+                        dimensions, content_hash
+                    )
+                    SELECT project_id, variant_id, model, configuration_id,
+                           dimensions, content_hash
+                    FROM variant_embeddings_v13
+                    """
+                )
+            if (
+                self._connection.execute("SELECT count(*) FROM embedding_vectors").fetchone()[0]
+                != source_vector_count
+                or self._connection.execute("SELECT count(*) FROM variant_embeddings").fetchone()[0]
+                != source_reference_count
+            ):
+                raise RuntimeError("embedding migration row-count mismatch")
+            destination_digest = hashlib.sha256()
+            for row in self._connection.execute(
+                """
+                SELECT project_id, model, configuration_id, dimensions, content_hash,
+                       content_text, magnitude, vector_encoding, vector
+                FROM embedding_vectors
+                ORDER BY project_id, model, configuration_id, dimensions, content_hash
+                """
+            ):
+                raw = _decode_stored_vector(
+                    row["vector"], row["vector_encoding"], row["dimensions"]
+                )
+                _, _, validated = _validate_legacy_embedding_vector(
+                    row["dimensions"], row["magnitude"], raw, variant_id=row["content_hash"]
+                )
+                _update_embedding_migration_digest(destination_digest, row, validated)
+            if source_digest.digest() != destination_digest.digest():
+                raise RuntimeError("embedding migration canonical digest mismatch")
+            self._connection.execute("DROP TABLE variant_embeddings_v13")
+            self._connection.execute("DROP TABLE embedding_vectors_v13")
+            self._embedding_migration_checkpoint("index")
+            self._connection.execute(
+                """
+                CREATE INDEX variant_embeddings_search
+                ON variant_embeddings(
+                    project_id, model, configuration_id, dimensions, variant_id
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX variant_embeddings_content
+                ON variant_embeddings(
+                    project_id, model, configuration_id, dimensions, content_hash
+                )
+                """
+            )
+            embedding_fk_rows = []
+            for table in ("embedding_vectors", "variant_embeddings"):
+                embedding_fk_rows.extend(
+                    self._connection.execute(f"PRAGMA foreign_key_check({table})").fetchall()
+                )
+            if embedding_fk_rows:
+                raise RuntimeError(
+                    f"embedding migration foreign-key failure: {embedding_fk_rows[0]}"
+                )
+            self._embedding_migration_checkpoint("foreign-key")
+            if self._connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RuntimeError("embedding migration integrity failure")
+            self._embedding_migration_checkpoint("publication")
+            self._connection.execute("PRAGMA user_version = 14")
+        except BaseException:
+            if manage_transaction:
+                self._connection.rollback()
+            raise
+        else:
+            if manage_transaction:
+                self._connection.commit()
+
+    def _embedding_migration_checkpoint(self, _stage: str) -> None:
+        """Failure-injection hook for the atomic embedding table rebuild."""
 
     def _migrate_v11_and_v12(self) -> None:
         """Upgrade v10 through both dependent schema steps as one transaction."""
@@ -1744,6 +2081,7 @@ class SQLiteStore:
         *,
         current_translation_unit_ids: frozenset[str] | None = None,
         build_variant: BuildVariant | None = None,
+        index_profile: IndexProfile = IndexProfile.FULL,
     ) -> int:
         """Atomically replace changed units and optionally remove stale units."""
 
@@ -1758,6 +2096,7 @@ class SQLiteStore:
             current_translation_unit_ids=current_translation_unit_ids,
             changed_translation_unit_ids=frozenset(unit.id for unit in batch.translation_units),
             build_variant=selected_variant,
+            index_profile=index_profile,
         )
 
     def apply_ingestion_batches(
@@ -1768,6 +2107,7 @@ class SQLiteStore:
         current_translation_unit_ids: frozenset[str] | None = None,
         changed_translation_unit_ids: frozenset[str] | None = None,
         build_variant: BuildVariant | None = None,
+        index_profile: IndexProfile = IndexProfile.FULL,
     ) -> int:
         """Atomically stage and retire TU-sized batches before global finalization."""
 
@@ -1790,7 +2130,7 @@ class SQLiteStore:
                     deferred_indexes = self._drop_fresh_generation_indexes()
                     self._defer_variant_fts = True
                 project_id = self._ensure_project(root)
-                self._put_build_variant(project_id, selected_variant)
+                self._put_build_variant(project_id, selected_variant, index_profile)
                 existing: set[str] = set()
                 if current_translation_unit_ids is not None:
                     existing = {
@@ -1833,7 +2173,7 @@ class SQLiteStore:
                             project_id, selected_variant.name, batch_unit_ids
                         )
                         self._delete_translation_units(project_id, batch_unit_ids)
-                    self._stage_ingestion_batch(project_id, batch)
+                    self._stage_ingestion_batch(project_id, batch, index_profile)
                     # Release TU-local tuples before requesting the next batch;
                     # Python for-loops otherwise retain the previous loop value.
                     del batch
@@ -1920,7 +2260,9 @@ class SQLiteStore:
                 ((function_id,) for function_id in functions),
             )
 
-    def _stage_ingestion_batch(self, project_id: int, batch: IngestionBatch) -> None:
+    def _stage_ingestion_batch(
+        self, project_id: int, batch: IngestionBatch, index_profile: IndexProfile
+    ) -> None:
         for configuration in batch.build_configurations:
             self._connection.execute(
                 """
@@ -1947,13 +2289,37 @@ class SQLiteStore:
                 ),
             )
         for unit in batch.translation_units:
+            if unit.index_profile is not IndexProfile(index_profile):
+                raise ValueError("translation-unit profile does not match ingestion profile")
+            navigation_complete = (
+                unit.advanced_facts_complete
+                if unit.navigation_facts_complete is None
+                else unit.navigation_facts_complete
+            )
+            cfg_complete = (
+                unit.advanced_facts_complete
+                if unit.cfg_facts_complete is None
+                else unit.cfg_facts_complete
+            )
+            data_flow_complete = (
+                unit.advanced_facts_complete
+                if unit.data_flow_facts_complete is None
+                else unit.data_flow_facts_complete
+            )
+            summary_complete = (
+                unit.advanced_facts_complete
+                if unit.summary_facts_complete is None
+                else unit.summary_facts_complete
+            )
             self._connection.execute(
                 """
                 INSERT INTO translation_units(
                     project_id, id, build_configuration_id, source_path,
                     content_hash, diagnostics_json, build_variant,
-                    analysis_backend, advanced_facts_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    analysis_backend, advanced_facts_complete, index_profile,
+                    navigation_facts_complete, cfg_facts_complete,
+                    data_flow_facts_complete, summary_facts_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -1965,6 +2331,11 @@ class SQLiteStore:
                     unit.build_variant,
                     unit.analysis_backend,
                     int(unit.advanced_facts_complete),
+                    unit.index_profile.value,
+                    int(navigation_complete),
+                    int(cfg_complete),
+                    int(data_flow_complete),
+                    int(summary_complete),
                 ),
             )
             self._connection.executemany(
@@ -2039,18 +2410,21 @@ class SQLiteStore:
         while rows := cursor.fetchmany(500):
             self._refresh_symbols(project_id, {row[0] for row in rows})
 
-    def _put_build_variant(self, project_id: int, variant: BuildVariant) -> None:
+    def _put_build_variant(
+        self, project_id: int, variant: BuildVariant, index_profile: IndexProfile
+    ) -> None:
         self._connection.execute(
             """
             INSERT INTO build_variants(
                 project_id, name, compilation_database, target, platform,
-                metadata_json, reindex_required
-            ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                metadata_json, reindex_required, index_profile
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
             ON CONFLICT(project_id, name) DO UPDATE SET
                 compilation_database = excluded.compilation_database,
                 target = excluded.target,
                 platform = excluded.platform,
-                metadata_json = excluded.metadata_json
+                metadata_json = excluded.metadata_json,
+                index_profile = excluded.index_profile
             """,
             (
                 project_id,
@@ -2059,6 +2433,7 @@ class SQLiteStore:
                 variant.target,
                 variant.platform,
                 json.dumps(dict(variant.metadata), sort_keys=True),
+                IndexProfile(index_profile).value,
             ),
         )
 
@@ -2099,6 +2474,16 @@ class SQLiteStore:
                 (project_id,),
             )
         )
+
+    def build_index_profiles(self, project_root: Path | None = None) -> dict[str, IndexProfile]:
+        project_id = self._project_id(project_root)
+        return {
+            row["name"]: IndexProfile(row["index_profile"])
+            for row in self._connection.execute(
+                "SELECT name, index_profile FROM build_variants WHERE project_id = ? ORDER BY name",
+                (project_id,),
+            )
+        }
 
     def remove_build_variant(self, name: str, project_root: Path | None = None) -> bool:
         """Explicitly delete one build's facts while preserving every other variant."""
@@ -3700,7 +4085,9 @@ class SQLiteStore:
             f"""
             SELECT units.id, units.build_configuration_id, configs.command_hash,
                    units.content_hash, units.build_variant, units.analysis_backend,
-                   units.advanced_facts_complete
+                   units.advanced_facts_complete, units.index_profile,
+                   units.navigation_facts_complete, units.cfg_facts_complete,
+                   units.data_flow_facts_complete, units.summary_facts_complete
             FROM translation_units units
             JOIN build_configurations configs
               ON configs.project_id = units.project_id
@@ -3730,8 +4117,58 @@ class SQLiteStore:
                 build_variant=row["build_variant"],
                 analysis_backend=row["analysis_backend"],
                 advanced_facts_complete=bool(row["advanced_facts_complete"]),
+                index_profile=IndexProfile(row["index_profile"]),
+                navigation_facts_complete=bool(row["navigation_facts_complete"]),
+                cfg_facts_complete=bool(row["cfg_facts_complete"]),
+                data_flow_facts_complete=bool(row["data_flow_facts_complete"]),
+                summary_facts_complete=bool(row["summary_facts_complete"]),
             )
         return result
+
+    def analysis_coverage(
+        self,
+        symbol_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> tuple[AnalysisCoverageState, ...]:
+        """Return explicit TU coverage for every selected variant of one symbol."""
+
+        try:
+            project_id = self._project_id(project_root)
+        except KeyError:
+            return ()
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT DISTINCT units.build_variant, units.id, units.analysis_backend,
+                   units.index_profile, units.navigation_facts_complete,
+                   units.cfg_facts_complete, units.data_flow_facts_complete,
+                   units.summary_facts_complete
+            FROM symbol_variants variants
+            JOIN translation_units units
+              ON units.project_id = variants.project_id
+             AND units.id = variants.translation_unit_id
+            WHERE variants.project_id = ? AND variants.symbol_id = ?
+              AND variants.build_variant IN ({placeholders})
+            ORDER BY units.build_variant, units.id
+            """,
+            (project_id, symbol_id, *names),
+        ).fetchall()
+        return tuple(
+            AnalysisCoverageState(
+                build_variant=row["build_variant"],
+                translation_unit_id=row["id"],
+                analysis_backend=row["analysis_backend"],
+                index_profile=IndexProfile(row["index_profile"]),
+                navigation_facts_complete=bool(row["navigation_facts_complete"]),
+                cfg_facts_complete=bool(row["cfg_facts_complete"]),
+                data_flow_facts_complete=bool(row["data_flow_facts_complete"]),
+                summary_facts_complete=bool(row["summary_facts_complete"]),
+            )
+            for row in rows
+        )
 
     def get_symbol(
         self,
@@ -4999,14 +5436,29 @@ class SQLiteStore:
             raise RuntimeError("embedding write sessions cannot be nested")
         project_id = self._project_id(project_root)
         self._connection.execute("BEGIN IMMEDIATE")
+        session_token = object()
+        self._embedding_session_token = session_token
+        self._trusted_embedding_registry = {}
         try:
             yield
             self._delete_orphan_embedding_vectors(project_id)
+            self._commit_embedding_session()
         except BaseException:
-            self._connection.rollback()
+            try:
+                self._connection.rollback()
+            finally:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
             raise
-        else:
-            self._connection.commit()
+        finally:
+            if self._embedding_session_token is session_token:
+                self._embedding_session_token = None
+                self._trusted_embedding_registry = None
+
+    def _commit_embedding_session(self) -> None:
+        """Commit hook kept separate for atomic failure-injection coverage."""
+
+        self._connection.commit()
 
     def attach_existing_embeddings(
         self,
@@ -5019,13 +5471,36 @@ class SQLiteStore:
     ) -> tuple[tuple[str, str], ...]:
         """Attach content already in the vector pool and return content misses."""
 
+        return self._attach_existing_embeddings(
+            entries,
+            model,
+            project_root,
+            build_scope=build_scope,
+            configuration_id=configuration_id,
+            validate_variants=True,
+        )
+
+    def _attach_existing_embeddings(
+        self,
+        entries: Sequence[tuple[str, str]],
+        model: str,
+        project_root: Path | None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None,
+        configuration_id: str | None,
+        validate_variants: bool,
+    ) -> tuple[tuple[str, str], ...]:
+
         if not self._connection.in_transaction:
             raise RuntimeError("embedding attachment requires an embedding write session")
         if not entries:
             return ()
         project_id = self._project_id(project_root)
         configuration = configuration_id or model
-        self._validate_embedding_variants(project_id, (entry[0] for entry in entries), build_scope)
+        if validate_variants:
+            self._validate_embedding_variants(
+                project_id, (entry[0] for entry in entries), build_scope
+            )
         dimensions = self._embedding_configuration_dimensions(project_id, model, configuration)
         if not dimensions:
             return tuple(entries)
@@ -5095,6 +5570,26 @@ class SQLiteStore:
     ) -> None:
         """Validate and store one bounded content/vector batch in the active session."""
 
+        self._put_content_embeddings(
+            entries,
+            model,
+            project_root,
+            build_scope=build_scope,
+            configuration_id=configuration_id,
+            validate_variants=True,
+        )
+
+    def _put_content_embeddings(
+        self,
+        entries: Iterable[tuple[str, str, Sequence[float]]],
+        model: str,
+        project_root: Path | None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None,
+        configuration_id: str | None,
+        validate_variants: bool,
+    ) -> None:
+
         if not self._connection.in_transaction:
             raise RuntimeError("embedding writes require an embedding write session")
         selected = tuple(entries)
@@ -5102,7 +5597,10 @@ class SQLiteStore:
             return
         project_id = self._project_id(project_root)
         configuration = configuration_id or model
-        self._validate_embedding_variants(project_id, (entry[0] for entry in selected), build_scope)
+        if validate_variants:
+            self._validate_embedding_variants(
+                project_id, (entry[0] for entry in selected), build_scope
+            )
         expected_dimensions = self._embedding_configuration_dimensions(
             project_id, model, configuration
         )
@@ -5134,39 +5632,57 @@ class SQLiteStore:
             references.append(
                 (project_id, variant_id, model, configuration, len(normalized), content_hash)
             )
-        for content_hash, (text, dimensions, magnitude, encoded) in vectors.items():
-            existing = self._connection.execute(
-                """
-                SELECT content_text, vector FROM embedding_vectors
-                WHERE project_id = ? AND model = ? AND configuration_id = ?
-                  AND dimensions = ? AND content_hash = ?
-                """,
-                (project_id, model, configuration, dimensions, content_hash),
-            ).fetchone()
-            if existing is not None:
-                if existing["content_text"] != text:
-                    raise ValueError("embedding content hash collision")
-                if existing["vector"] != encoded:
-                    raise ValueError("equal embedding inputs produced different vectors")
-                continue
-            self._connection.execute(
+        vector_rows = tuple(
+            (
+                project_id,
+                model,
+                configuration,
+                dimensions,
+                content_hash,
+                text,
+                magnitude,
+                *_encode_vector_blob(encoded),
+            )
+            for content_hash, (text, dimensions, magnitude, encoded) in vectors.items()
+        )
+        for offset in range(0, len(vector_rows), 512):
+            self._connection.executemany(
                 """
                 INSERT INTO embedding_vectors(
                     project_id, model, configuration_id, dimensions, content_hash,
-                    content_text, magnitude, vector
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    content_text, magnitude, vector_encoding, vector
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    project_id, model, configuration_id, dimensions, content_hash
+                ) DO NOTHING
                 """,
-                (
-                    project_id,
-                    model,
-                    configuration,
-                    dimensions,
-                    content_hash,
-                    text,
-                    magnitude,
-                    encoded,
-                ),
+                vector_rows[offset : offset + 512],
             )
+        hashes = tuple(sorted(vectors))
+        validated: set[str] = set()
+        for offset in range(0, len(hashes), 500):
+            chunk = hashes[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self._connection.execute(
+                f"""
+                SELECT content_hash, content_text, vector_encoding, vector
+                FROM embedding_vectors
+                WHERE project_id = ? AND model = ? AND configuration_id = ?
+                  AND dimensions = ? AND content_hash IN ({placeholders})
+                """,
+                (project_id, model, configuration, expected, *chunk),
+            ):
+                text, _, _, encoded = vectors[row["content_hash"]]
+                if row["content_text"] != text:
+                    raise ValueError("embedding content hash collision")
+                if (
+                    _decode_stored_vector(row["vector"], row["vector_encoding"], expected)
+                    != encoded
+                ):
+                    raise ValueError("equal embedding inputs produced different vectors")
+                validated.add(row["content_hash"])
+        if len(validated) != len(vectors):
+            raise RuntimeError("failed to persist all embedding vectors")
         self._connection.executemany(
             """
             INSERT INTO variant_embeddings(
@@ -5343,6 +5859,169 @@ class SQLiteStore:
             yield batch
             last_variant = batch[-1]
 
+    def iter_missing_embedding_record_batches(
+        self,
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
+        batch_size: int = EMBEDDING_BATCH_SIZE,
+        max_text_chars: int = DEFAULT_EMBEDDING_TEXT_CHARS,
+    ) -> Iterator[_TrustedEmbeddingBatch]:
+        """Stream missing variant IDs and exact embedding inputs without symbol hydration."""
+
+        if (
+            not self._connection.in_transaction
+            or self._embedding_session_token is None
+            or self._trusted_embedding_registry is None
+        ):
+            raise RuntimeError("trusted embedding batches require an embedding write session")
+        if batch_size <= 0:
+            raise ValueError("embedding batch size must be positive")
+        if max_text_chars <= 0:
+            raise ValueError("max embedding text size must be positive")
+        project_id = self._project_id(project_root)
+        configuration = configuration_id or model
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        last_variant = ""
+        while True:
+            if self._trusted_embedding_registry:
+                raise RuntimeError("trusted embedding batch is still outstanding")
+            rows = self._connection.execute(
+                f"""
+                SELECT variants.id, variants.snapshot_json
+                FROM symbol_variants variants
+                LEFT JOIN variant_embeddings embeddings
+                  ON embeddings.project_id = variants.project_id
+                 AND embeddings.variant_id = variants.id
+                 AND embeddings.model = ?
+                 AND embeddings.configuration_id = ?
+                WHERE variants.project_id = ?
+                  AND variants.build_variant IN ({placeholders})
+                  AND variants.id > ?
+                  AND embeddings.variant_id IS NULL
+                ORDER BY variants.id
+                LIMIT ?
+                """,
+                (model, configuration, project_id, *names, last_variant, batch_size),
+            ).fetchall()
+            if not rows:
+                return
+            batch = tuple(
+                (
+                    row["id"],
+                    _embedding_text_from_snapshot(row["snapshot_json"], max_text_chars),
+                )
+                for row in rows
+            )
+            capability = object()
+            trusted_batch = _TrustedEmbeddingBatch(capability)
+            self._trusted_embedding_registry[capability] = _TrustedEmbeddingState(
+                batch=trusted_batch,
+                records=batch,
+                project_id=project_id,
+                scope_names=names,
+                model=model,
+                configuration_id=configuration,
+            )
+            yield trusted_batch
+            last_variant = batch[-1][0]
+
+    def _trusted_embedding_state(
+        self,
+        holder: _TrustedEmbeddingBatch | _TrustedEmbeddingAttachment,
+        model: str,
+        project_root: Path | None,
+        build_scope: BuildScope | tuple[str, ...] | None,
+        configuration_id: str | None,
+        expected_status: str,
+    ) -> _TrustedEmbeddingState:
+        project_id = self._project_id(project_root)
+        configuration = configuration_id or model
+        state = (
+            self._trusted_embedding_registry.get(holder.capability)
+            if self._trusted_embedding_registry is not None
+            else None
+        )
+        if (
+            not self._connection.in_transaction
+            or self._embedding_session_token is None
+            or state is None
+            or (expected_status == "issued" and state.batch is not holder)
+            or (expected_status == "attached" and state.attachment is not holder)
+            or state.project_id != project_id
+            or state.scope_names != self._scope_names(build_scope)
+            or state.model != model
+            or state.configuration_id != configuration
+            or state.status != expected_status
+        ):
+            raise RuntimeError("stale or foreign trusted embedding batch")
+        return state
+
+    def _attach_existing_embeddings_trusted(
+        self,
+        batch: _TrustedEmbeddingBatch,
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
+    ) -> _TrustedEmbeddingAttachment:
+        state = self._trusted_embedding_state(
+            batch, model, project_root, build_scope, configuration_id, "issued"
+        )
+        missing = self._attach_existing_embeddings(
+            state.records,
+            model,
+            project_root,
+            build_scope=build_scope,
+            configuration_id=configuration_id,
+            validate_variants=False,
+        )
+        attachment = _TrustedEmbeddingAttachment(batch.capability, missing, len(state.records))
+        state.missing = missing
+        state.attachment = attachment
+        state.status = "consumed" if not missing else "attached"
+        if not missing:
+            assert self._trusted_embedding_registry is not None
+            self._trusted_embedding_registry.pop(batch.capability)
+        return attachment
+
+    def _put_content_embeddings_trusted(
+        self,
+        attachment: _TrustedEmbeddingAttachment,
+        entries: Iterable[tuple[str, str, Sequence[float]]],
+        model: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        configuration_id: str | None = None,
+    ) -> None:
+        state = self._trusted_embedding_state(
+            attachment,
+            model,
+            project_root,
+            build_scope,
+            configuration_id,
+            "attached",
+        )
+        selected = tuple(entries)
+        if tuple((variant_id, text) for variant_id, text, _ in selected) != state.missing:
+            raise RuntimeError("trusted embedding entries do not match their source batch")
+        self._put_content_embeddings(
+            selected,
+            model,
+            project_root,
+            build_scope=build_scope,
+            configuration_id=configuration_id,
+            validate_variants=False,
+        )
+        state.status = "consumed"
+        assert self._trusted_embedding_registry is not None
+        self._trusted_embedding_registry.pop(attachment.capability)
+
     def embedding_count(
         self,
         model: str,
@@ -5395,14 +6074,15 @@ class SQLiteStore:
             raise ValueError("vector search limit must be greater than zero")
         query_vector = _validate_vector(vector)
         query_magnitude = math.sqrt(sum(value * value for value in query_vector))
-        project_id = self._project_id(project_root)
         configuration = configuration_id or model
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
-        dimensions = {
-            row[0]
-            for row in self._connection.execute(
-                f"""
+        with self._vector_search_lock:
+            project_id = self._project_id(project_root)
+            dimensions = {
+                row[0]
+                for row in self._connection.execute(
+                    f"""
                 SELECT DISTINCT vectors.dimensions FROM variant_embeddings embeddings
                 JOIN embedding_vectors vectors
                   ON vectors.project_id = embeddings.project_id
@@ -5417,20 +6097,22 @@ class SQLiteStore:
                   AND embeddings.configuration_id = ?
                   AND variants.build_variant IN ({placeholders})
                 """,
-                (project_id, model, configuration, *names),
-            )
-        }
-        if dimensions and dimensions != {len(query_vector)}:
-            raise ValueError(
-                f"query dimension {len(query_vector)} does not match model {model!r} "
-                f"dimension {next(iter(dimensions))}"
-            )
-        query_blob = struct.pack(f"<{len(query_vector)}d", *query_vector)
-        selected = self._connection.execute(
-            f"""
+                    (project_id, model, configuration, *names),
+                )
+            }
+            if dimensions and dimensions != {len(query_vector)}:
+                raise ValueError(
+                    f"query dimension {len(query_vector)} does not match model {model!r} "
+                    f"dimension {next(iter(dimensions))}"
+                )
+            previous_query = getattr(self._vector_query_state, "current", None)
+            self._vector_query_state.current = (query_vector, query_magnitude)
+            try:
+                selected = self._connection.execute(
+                    f"""
             SELECT variants.id, variants.build_variant,
                    _cpp_context_cosine(
-                       vectors.vector, vectors.magnitude, ?, ?
+                       vectors.vector, vectors.vector_encoding, vectors.magnitude
                    ) AS score
             FROM variant_embeddings embeddings
             JOIN embedding_vectors vectors
@@ -5449,22 +6131,25 @@ class SQLiteStore:
             ORDER BY score DESC, variants.build_variant, variants.id
             LIMIT ?
             """,
-            (
-                query_blob,
-                query_magnitude,
-                project_id,
-                model,
-                configuration,
-                len(query_vector),
-                *names,
-                limit,
-            ),
-        ).fetchall()
-        symbols = self.get_symbols(
-            (row["id"] for row in selected),
-            project_root,
-            build_scope=build_scope,
-        )
+                    (
+                        project_id,
+                        model,
+                        configuration,
+                        len(query_vector),
+                        *names,
+                        limit,
+                    ),
+                ).fetchall()
+            finally:
+                if previous_query is None:
+                    del self._vector_query_state.current
+                else:
+                    self._vector_query_state.current = previous_query
+            symbols = self.get_symbols(
+                (row["id"] for row in selected),
+                project_root,
+                build_scope=build_scope,
+            )
         return tuple(
             SearchHit(symbol, row["score"], f"vector:{model}")
             for row, symbol in zip(selected, symbols, strict=True)
@@ -5549,15 +6234,75 @@ def _decode_vector_blob(blob: bytes) -> tuple[float, ...]:
     return struct.unpack(f"<{len(blob) // 8}d", blob)
 
 
-def _sqlite_cosine(
+def _encode_vector_blob(raw: bytes) -> tuple[int, bytes]:
+    compressed = zlib.compress(raw, level=3)
+    if len(compressed) < len(raw):
+        return VECTOR_ENCODING_ZLIB_F64LE_V1, compressed
+    return VECTOR_ENCODING_RAW_F64LE_V1, raw
+
+
+def _update_embedding_migration_digest(digest: Any, row: sqlite3.Row, raw: bytes) -> None:
+    for value in (
+        row["project_id"],
+        row["model"],
+        row["configuration_id"],
+        row["dimensions"],
+        row["content_hash"],
+        row["content_text"],
+        row["magnitude"],
+    ):
+        encoded = str(value).encode("utf-8")
+        digest.update(struct.pack("<Q", len(encoded)))
+        digest.update(encoded)
+    digest.update(struct.pack("<Q", len(raw)))
+    digest.update(raw)
+
+
+def _decode_stored_vector(blob: bytes, encoding: int, dimensions: int) -> bytes:
+    expected = dimensions * 8
+    if dimensions <= 0 or expected <= 0:
+        raise RuntimeError("invalid stored embedding vector dimensions")
+    if encoding == VECTOR_ENCODING_RAW_F64LE_V1:
+        raw = bytes(blob)
+    elif encoding == VECTOR_ENCODING_ZLIB_F64LE_V1:
+        decoder = zlib.decompressobj()
+        try:
+            raw = decoder.decompress(blob, expected + 1)
+        except zlib.error:
+            raise RuntimeError("invalid compressed embedding vector") from None
+        if (
+            len(raw) != expected
+            or not decoder.eof
+            or decoder.unconsumed_tail
+            or decoder.unused_data
+        ):
+            raise RuntimeError("invalid compressed embedding vector")
+    else:
+        raise RuntimeError("unknown embedding vector encoding")
+    if len(raw) != expected:
+        raise RuntimeError("invalid stored embedding vector length")
+    return raw
+
+
+def _sqlite_cosine_candidate(
     candidate_blob: bytes,
+    candidate_encoding: int,
     candidate_magnitude: float,
-    query_blob: bytes,
+    query_values: Sequence[float],
     query_magnitude: float,
 ) -> float:
-    return sum(
-        map(operator.mul, _decode_vector_blob(candidate_blob), _decode_vector_blob(query_blob))
-    ) / (candidate_magnitude * query_magnitude)
+    candidate_raw = _decode_stored_vector(candidate_blob, candidate_encoding, len(query_values))
+    candidate_values = _decode_vector_blob(candidate_raw)
+    calculated_magnitude = math.sqrt(sum(value * value for value in candidate_values))
+    if (
+        not math.isfinite(calculated_magnitude)
+        or not math.isfinite(candidate_magnitude)
+        or candidate_magnitude <= 0.0
+        or candidate_magnitude != calculated_magnitude
+    ):
+        raise RuntimeError("invalid stored embedding vector magnitude")
+    dot = sum(map(operator.mul, candidate_values, query_values))
+    return dot / (candidate_magnitude * query_magnitude)
 
 
 def _cfg_limit(limit: int) -> int:

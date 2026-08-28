@@ -29,7 +29,13 @@ from cpp_context_engine.api import (
     QueryRequest,
 )
 from cpp_context_engine.config import AppConfig
-from cpp_context_engine.models import CodeSymbol, GraphDirection, GraphEdge, GraphRelation
+from cpp_context_engine.models import (
+    CodeSymbol,
+    GraphDirection,
+    GraphEdge,
+    GraphRelation,
+    IndexProfile,
+)
 from cpp_context_engine.runtime import (
     Runtime,
     build_runtime,
@@ -267,15 +273,22 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         ),
         annotations=indexing_write,
     )
-    async def index_project(ctx: Context[ProjectServerState]) -> IndexProjectResult:
+    async def index_project(
+        ctx: Context[ProjectServerState],
+        profile: IndexProfile | None = None,
+    ) -> IndexProjectResult:
         state = _state(ctx)
 
         def operation() -> IndexProjectResult:
+            selected_config = replace(
+                state.config, index_profile=profile or state.config.index_profile
+            )
             previous, state.runtime = state.runtime, None
             if previous is not None:
                 previous.close()
-            result = run_project_index(state.config)
-            state.runtime = build_runtime(state.config)
+            result = run_project_index(selected_config)
+            state.config = selected_config
+            state.runtime = build_runtime(selected_config)
             indexing = result.indexing
             return IndexProjectResult(
                 indexed_translation_units=indexing.indexed_translation_units,
@@ -289,6 +302,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                 analysis_backend=result.analysis_backend,
                 advanced_facts_complete=result.advanced_facts_complete,
                 analyzer_capabilities=list(result.analyzer_capabilities),
+                index_profile=result.index_profile,
             )
 
         return await _call_tool(

@@ -60,7 +60,7 @@ const std::vector<std::string> kCapabilities = {
     "uses_type",          "callsites_v1",     "dispatch_targets_v1",
     "macro_expansion_stack", "template_relationships_v1",
     "intraprocedural_dataflow_v1", "points_to_v1", "function_summaries_v1",
-    "interprocedural_bindings_v1", "gzip_jsonl_v1"};
+    "interprocedural_bindings_v1", "gzip_jsonl_v1", "analysis_profiles_v1"};
 
 class OutputWriter {
 public:
@@ -162,7 +162,16 @@ std::optional<std::string> requiredString(const llvm::json::Object &object,
 
 class FactSink {
 public:
+  explicit FactSink(bool navigationOnly = false) : navigationOnly_(navigationOnly) {}
+
   void add(std::string sortKey, llvm::json::Object fact) {
+    if (navigationOnly_) {
+      const auto kind = fact.getString("fact");
+      if (!kind || (*kind != "file" && *kind != "include" && *kind != "symbol" &&
+                    *kind != "occurrence" && *kind != "edge" && *kind != "callsite_v1" &&
+                    *kind != "call_target_v1" && *kind != "callsite_resolution_v1"))
+        return;
+    }
     if (!sortKeys_.insert(std::move(sortKey)).second)
       return;
     fact["type"] = "fact";
@@ -179,6 +188,7 @@ public:
   }
 
 private:
+  bool navigationOnly_;
   std::unordered_set<std::string> sortKeys_;
 };
 
@@ -623,9 +633,9 @@ private:
 class Collector final : public clang::RecursiveASTVisitor<Collector> {
 public:
   Collector(clang::ASTContext &context, FactSink &sink, SourceFacts &source,
-            const std::vector<MacroExpansionRecord> &macroExpansions)
+            const std::vector<MacroExpansionRecord> &macroExpansions, bool navigationOnly)
       : context_(context), sink_(sink), source_(source),
-        macroExpansions_(macroExpansions) {}
+        macroExpansions_(macroExpansions), navigationOnly_(navigationOnly) {}
 
   SourceFacts &sourceFacts() { return source_; }
 
@@ -1083,6 +1093,11 @@ private:
     auto blockKey = [&](const clang::CFGBlock &block) {
       return graphKey + ":block:" + std::to_string(block.getBlockID());
     };
+
+    if (navigationOnly_) {
+      emitDataFlow(function, *cfg, graphKey);
+      return;
+    }
 
     llvm::SmallPtrSet<const clang::CFGBlock *, 16> tryBlocks;
     for (const auto *block : cfg->try_blocks())
@@ -1949,6 +1964,8 @@ private:
                                         llvm::StringRef reason, const std::string &sourceAccess,
                                         const std::string &targetAccess,
                                         const clang::Stmt *statement) {
+      if (navigationOnly_)
+        return;
       const std::string key = analysisKey + ":evidence:" + relation.str() + ":" +
                               sourceAccess + ":" + targetAccess;
       if (!emittedEvidence.insert(key).second)
@@ -1971,6 +1988,8 @@ private:
                                        llvm::StringRef reason, const std::string &sourceLocation,
                                        const std::string &targetLocation,
                                        const clang::Stmt *statement) {
+      if (navigationOnly_)
+        return;
       const std::string key = analysisKey + ":evidence:" + relation.str() + ":" +
                               sourceLocation + ":" + targetLocation;
       if (!emittedEvidence.insert(key).second)
@@ -2129,6 +2148,9 @@ private:
                    {"evidence_span", std::move(*source_.span(range, false))}});
       }
     }
+
+    if (navigationOnly_)
+      return;
 
     const auto functionKind = symbolKind(function).value_or("function");
     const auto functionKey = source_.declKey(function, functionKind);
@@ -2752,14 +2774,15 @@ private:
   FactSink &sink_;
   SourceFacts &source_;
   const std::vector<MacroExpansionRecord> &macroExpansions_;
+  bool navigationOnly_;
   std::unordered_set<std::string> emittedSymbolFacts_;
 };
 
 class Consumer final : public clang::ASTConsumer {
 public:
   Consumer(clang::ASTContext &context, FactSink &sink, SourceFacts &source,
-           const std::vector<MacroExpansionRecord> &macroExpansions)
-      : collector_(context, sink, source, macroExpansions) {}
+           const std::vector<MacroExpansionRecord> &macroExpansions, bool navigationOnly)
+      : collector_(context, sink, source, macroExpansions, navigationOnly) {}
   void HandleTranslationUnit(clang::ASTContext &context) override {
     collector_.TraverseDecl(context.getTranslationUnitDecl());
   }
@@ -2770,7 +2793,8 @@ private:
 
 class Action final : public clang::ASTFrontendAction {
 public:
-  Action(FactSink &sink, std::filesystem::path root) : sink_(sink), root_(std::move(root)) {}
+  Action(FactSink &sink, std::filesystem::path root, bool navigationOnly)
+      : sink_(sink), root_(std::move(root)), navigationOnly_(navigationOnly) {}
 
   bool BeginSourceFileAction(clang::CompilerInstance &compiler) override {
     source_ = std::make_unique<SourceFacts>(compiler.getSourceManager(), compiler.getLangOpts(),
@@ -2783,7 +2807,7 @@ public:
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &compiler, llvm::StringRef) override {
     return std::make_unique<Consumer>(compiler.getASTContext(), sink_, *source_,
-                                      macroExpansions_);
+                                      macroExpansions_, navigationOnly_);
   }
 
 private:
@@ -2791,19 +2815,21 @@ private:
   std::filesystem::path root_;
   std::unique_ptr<SourceFacts> source_;
   std::vector<MacroExpansionRecord> macroExpansions_;
+  bool navigationOnly_;
 };
 
 class ActionFactory final : public clang::tooling::FrontendActionFactory {
 public:
-  ActionFactory(FactSink &sink, std::filesystem::path root)
-      : sink_(sink), root_(std::move(root)) {}
+  ActionFactory(FactSink &sink, std::filesystem::path root, bool navigationOnly)
+      : sink_(sink), root_(std::move(root)), navigationOnly_(navigationOnly) {}
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<Action>(sink_, root_);
+    return std::make_unique<Action>(sink_, root_, navigationOnly_);
   }
 
 private:
   FactSink &sink_;
   std::filesystem::path root_;
+  bool navigationOnly_;
 };
 
 bool handleHello(const llvm::json::Object &request) {
@@ -2836,8 +2862,13 @@ bool handleAnalyze(const llvm::json::Object &request) {
   auto source = requiredString(request, "source_path");
   auto directory = requiredString(request, "directory");
   const auto *argumentsValue = request.getArray("arguments");
+  const auto profile = request.getString("profile");
   if (!requestId || !root || !source || !directory || !argumentsValue) {
     emitError("invalid_request", "analyze requires bounded project and compiler inputs");
+    return false;
+  }
+  if (profile && *profile != "full" && *profile != "navigation") {
+    emitError("invalid_request", "profile must be full or navigation");
     return false;
   }
   std::vector<std::string> arguments;
@@ -2850,11 +2881,12 @@ bool handleAnalyze(const llvm::json::Object &request) {
     arguments.push_back(argument->str());
   }
   emit({{"type", "begin"}, {"request_id", *requestId}});
-  FactSink sink;
+  const bool navigationOnly = profile && *profile == "navigation";
+  FactSink sink(navigationOnly);
   clang::tooling::FixedCompilationDatabase database(*directory, arguments);
   std::vector<std::string> sources{*source};
   clang::tooling::ClangTool tool(database, sources);
-  ActionFactory factory(sink, *root);
+  ActionFactory factory(sink, *root, navigationOnly);
   const int result = tool.run(&factory);
   if (result != 0) {
     emitError("analysis_failed", "Clang rejected the translation unit");

@@ -342,8 +342,8 @@ def test_v6_migration_is_atomic_and_marks_old_native_rows_incomplete(
 
     monkeypatch.setattr(sqlite_module, "_execute_script", original)
     with SQLiteStore(database) as store:
-        assert SCHEMA_VERSION == 12
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+        assert SCHEMA_VERSION == 14
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
         assert (
             store._connection.execute(  # noqa: SLF001
                 "SELECT advanced_facts_complete FROM translation_units"

@@ -9,6 +9,10 @@ pytest -m native
 TMPDIR=/tmp LIBCLANG_PATH=/usr/lib/llvm-18/lib pytest
 ```
 
+The complete suite is accepted only when one isolated run finishes in at most
+3:00 minutes with zero skips. A duration above 180 seconds is a failure, not a
+reason to relabel a smaller subset as the full suite.
+
 Native tests use a session-local fixture cache. Its key includes the analyzer
 binary and protocol, the complete fixture and compilation-database contents,
 the normalized build configuration, relevant environment, resource limits, and
