@@ -57,6 +57,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "analyzer_project"
 PARITY_FIXTURE = Path(__file__).parent / "fixtures" / "cpp_project"
 CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
 IMPLICIT_FIXTURE = Path(__file__).parent / "fixtures" / "implicit_project"
+TEMPLATE_DATAFLOW_FIXTURE = Path(__file__).parent / "fixtures" / "template_dataflow_project"
 pytestmark = pytest.mark.native
 
 
@@ -1012,6 +1013,174 @@ def _cached_batch(
 def _cfg_for(batch, qualified_name: str):
     symbol = next(symbol for symbol in batch.symbols if symbol.qualified_name == qualified_name)
     return next(graph for graph in batch.cfg_graphs if graph.function_symbol_id == symbol.id)
+
+
+def _normalized_fact_multiset(facts):
+    return Counter(json.dumps(fact, sort_keys=True, separators=(",", ":")) for fact in facts)
+
+
+def _solution_hashes(batch):
+    return {
+        summary.function_symbol_id: summary.solution_hash for summary in batch.function_summaries
+    }
+
+
+def _semantic_analysis_rows(store):
+    tables = (
+        "cfg_graphs",
+        "cfg_blocks",
+        "cfg_elements",
+        "cfg_edges",
+        "callsites",
+        "call_targets",
+        "data_flow_analyses",
+        "memory_locations",
+        "data_accesses",
+        "data_flow_evidence",
+        "function_summaries",
+        "summary_effects",
+        "summary_return_origins",
+        "call_argument_bindings",
+        "call_result_bindings",
+        "interprocedural_flows",
+    )
+    return {
+        table: tuple(
+            tuple(row)
+            for row in store._connection.execute(  # noqa: SLF001
+                f"SELECT * FROM {table} ORDER BY id"  # noqa: S608 - fixed test table names
+            )
+        )
+        for table in tables
+    }
+
+
+def test_template_specialization_facts_are_exactly_deterministic_across_processes(
+    tmp_path: Path,
+) -> None:
+    configuration = CompilationDatabase.load(
+        TEMPLATE_DATAFLOW_FIXTURE / "compile_commands.json"
+    ).configurations[0]
+    runs = [
+        tuple(
+            fresh_native_client(analyzer_binary(), timeout_seconds=30).analyze(
+                TEMPLATE_DATAFLOW_FIXTURE, configuration
+            )
+        )
+        for _ in range(4)
+    ]
+    normalized = [_normalized_fact_multiset(facts) for facts in runs]
+    assert all(facts == normalized[0] for facts in normalized[1:])
+
+    batches = [
+        NativeClangIngestor._merge_batches(  # noqa: SLF001 - exact raw-to-domain regression
+            (_FactBatchBuilder(TEMPLATE_DATAFLOW_FIXTURE.resolve(), configuration).build(facts),)
+        )
+        for facts in runs
+    ]
+    assert all(batch == batches[0] for batch in batches[1:])
+    assert all(_solution_hashes(batch) == _solution_hashes(batches[0]) for batch in batches[1:])
+    assert all(_solution_hashes(batches[0]).values())
+
+    database_rows = []
+    for index, batch in enumerate(batches[:2]):
+        database = tmp_path / f"index-{index}.db"
+        with SQLiteStore(database, project_root=TEMPLATE_DATAFLOW_FIXTURE) as store:
+            store.apply_ingestion(TEMPLATE_DATAFLOW_FIXTURE, batch)
+            database_rows.append(_semantic_analysis_rows(store))
+    assert database_rows[0] == database_rows[1]
+
+
+def test_indirect_target_keeps_an_indexed_redeclaration_after_an_external_declaration(
+    tmp_path: Path,
+) -> None:
+    external_header = tmp_path / "external.hpp"
+    external_header.write_text("int external_target(int);\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text(
+        '#include "../external.hpp"\n'
+        "int external_target(int);\n"
+        "int call_external(int value) {\n"
+        "  auto target = &external_target;\n"
+        "  return target(value);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    database = project / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(project),
+                    "file": str(source),
+                    "arguments": ["clang++", "-std=c++20", "-c", str(source)],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configuration = CompilationDatabase.load(database).configurations[0]
+    facts = fresh_native_client(analyzer_binary(), timeout_seconds=30).analyze(
+        project, configuration
+    )
+    target_key = next(
+        fact["key"]
+        for fact in facts
+        if fact.get("fact") == "symbol" and fact.get("qualified_name") == "external_target"
+    )
+
+    assert any(
+        target_key in fact.get("pointee_keys", ())
+        for fact in facts
+        if fact.get("fact") == "data_access_v1"
+    )
+    assert any(
+        fact.get("target_key") == target_key
+        for fact in facts
+        if fact.get("fact") == "call_target_v1"
+    )
+    _FactBatchBuilder(project.resolve(), configuration).build(facts)
+
+
+def test_nested_call_leaf_accesses_are_not_suppressed_by_fallback_order(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "main.cpp"
+    source.write_text(
+        "struct result { void visit(); };\n"
+        "struct context { result arg(int); };\n"
+        "struct handler {\n"
+        "  context ctx;\n"
+        "  void run(int id) { ctx.arg(id).visit(); }\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    database = tmp_path / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "file": str(source),
+                    "arguments": ["clang++", "-std=c++20", "-c", str(source)],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configuration = CompilationDatabase.load(database).configurations[0]
+    facts = fresh_native_client(analyzer_binary(), timeout_seconds=30).analyze(
+        tmp_path, configuration
+    )
+    accesses = {
+        fact.get("expression")
+        for fact in facts
+        if fact.get("fact") == "data_access_v1" and fact.get("kind") == "read"
+    }
+
+    assert {"ctx", "ctx.arg"} <= accesses
 
 
 @pytest.fixture(scope="module")
