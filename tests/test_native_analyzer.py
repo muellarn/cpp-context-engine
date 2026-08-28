@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shutil
@@ -8,8 +9,10 @@ import stat
 import subprocess
 import threading
 import time
+import weakref
 import zlib
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -207,6 +210,22 @@ def test_fact_registry_enforces_and_releases_shared_spool_limits() -> None:
         bounded.add({"fact": "symbol", "key": "too-large"})
 
 
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_spool_registries": 0},
+        {"max_spool_bytes": 0},
+        {"max_spool_fds": 0},
+    ],
+)
+def test_native_pipeline_rejects_explicit_zero_spool_limits(limits: dict[str, int]) -> None:
+    class EmptyClient:
+        max_decoded_bytes = 1024
+
+    with pytest.raises(ValueError, match="limits must be positive"):
+        NativeClangIngestor(EmptyClient(), **limits)  # type: ignore[arg-type]
+
+
 def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path: Path) -> None:
     active = 0
     maximum_active = 0
@@ -368,6 +387,61 @@ def test_native_pipeline_bounds_converted_batches_retained_by_writer(
     time.sleep(0.05)
 
     assert sorted(built) == [0, 1]
+    batches.close()
+
+
+def test_native_pipeline_does_not_retain_every_completed_analysis_future(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    analyzer_futures: list[weakref.ReferenceType[object]] = []
+
+    class TrackingExecutor:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._delegate = ThreadPoolExecutor(*args, **kwargs)  # type: ignore[arg-type]
+            self._track = kwargs.get("thread_name_prefix") == "cpp-context-analyzer"
+
+        def submit(self, *args: object, **kwargs: object) -> object:
+            future = self._delegate.submit(*args, **kwargs)  # type: ignore[arg-type]
+            if self._track:
+                analyzer_futures.append(weakref.ref(future))
+            return future
+
+        def shutdown(self, *args: object, **kwargs: object) -> None:
+            self._delegate.shutdown(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("cpp_context_engine.ingestion.native.ThreadPoolExecutor", TrackingExecutor)
+
+    class EmptyClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, _configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            return []
+
+    configurations = []
+    for index in range(80):
+        source = tmp_path / f"future-{index}.cpp"
+        source.write_text(f"int future_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    batches = NativeClangIngestor(  # type: ignore[arg-type]
+        EmptyClient(), max_workers=2, max_spool_registries=4
+    ).iter_configuration_batches(tmp_path, configurations)
+    for _index in range(40):
+        next(batches)
+    gc.collect()
+
+    assert sum(reference() is not None for reference in analyzer_futures) <= 4
     batches.close()
 
 

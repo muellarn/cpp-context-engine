@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from cpp_context_engine.cli import main
 
 
@@ -26,6 +28,22 @@ def test_doctor_json_reports_supported_runtime(capsys, tmp_path, monkeypatch) ->
     assert report["python_supported"] is True
     assert report["project_root"] == str(tmp_path)
     assert "embedding_provider" in report
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--analyzer-max-spool-registries",
+        "--analyzer-max-spool-bytes",
+        "--analyzer-max-spool-files",
+        "--analyzer-max-domain-batches",
+    ],
+)
+def test_cli_rejects_zero_pipeline_limits(option, capsys, tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", option, "0"]) == 2
+    assert "must be positive" in capsys.readouterr().err
 
 
 def test_search_without_an_index_has_actionable_error(capsys, tmp_path, monkeypatch) -> None:

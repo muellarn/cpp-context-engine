@@ -715,10 +715,12 @@ class NativeClangIngestor:
         max_spool_fds: int | None = None,
         max_domain_batches: int = 2,
     ) -> None:
-        registry_limit = max_spool_registries or max_workers * 2
+        registry_limit = max_workers * 2 if max_spool_registries is None else max_spool_registries
         decoded_limit = int(getattr(client, "max_decoded_bytes", DEFAULT_MAX_DECODED_BYTES))
-        spool_byte_limit = max_spool_bytes or registry_limit * decoded_limit
-        spool_fd_limit = max_spool_fds or registry_limit * MAX_FACT_KINDS
+        spool_byte_limit = (
+            registry_limit * decoded_limit if max_spool_bytes is None else max_spool_bytes
+        )
+        spool_fd_limit = registry_limit * MAX_FACT_KINDS if max_spool_fds is None else max_spool_fds
         if (
             min(
                 max_workers,
@@ -821,7 +823,6 @@ class NativeClangIngestor:
         )
         condition = threading.Condition()
         analysis_futures: dict[Future[_FactRegistry], int] = {}
-        all_analysis_futures: list[Future[_FactRegistry]] = []
         pending_registries: dict[int, _FactRegistry] = {}
         conversion_futures: dict[int, Future[IngestionBatch]] = {}
         conversion_registries: dict[int, _FactRegistry] = {}
@@ -905,7 +906,6 @@ class NativeClangIngestor:
                             next_configuration += 1
                             analyzed = analyzer_executor.submit(analyze, selected[index])
                             analysis_futures[analyzed] = index
-                            all_analysis_futures.append(analyzed)
                             held_registries += 1
                             analyzed.add_done_callback(wake)
 
@@ -970,7 +970,7 @@ class NativeClangIngestor:
                 registry.close()
             for registry in conversion_registries.values():
                 registry.close()
-            for future in all_analysis_futures:
+            for future in analysis_futures:
                 if future.done() and not future.cancelled() and future.exception() is None:
                     future.result().close()
 

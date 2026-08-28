@@ -218,14 +218,18 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         or base.analyzer_max_stderr_bytes,
         analyzer_max_workers=getattr(args, "analyzer_max_workers", None)
         or base.analyzer_max_workers,
-        analyzer_max_spool_registries=getattr(args, "analyzer_max_spool_registries", None)
-        or base.analyzer_max_spool_registries,
-        analyzer_max_spool_bytes=getattr(args, "analyzer_max_spool_bytes", None)
-        or base.analyzer_max_spool_bytes,
-        analyzer_max_spool_files=getattr(args, "analyzer_max_spool_files", None)
-        or base.analyzer_max_spool_files,
-        analyzer_max_domain_batches=getattr(args, "analyzer_max_domain_batches", None)
-        or base.analyzer_max_domain_batches,
+        analyzer_max_spool_registries=_argument_or_default(
+            args, "analyzer_max_spool_registries", base.analyzer_max_spool_registries
+        ),
+        analyzer_max_spool_bytes=_argument_or_default(
+            args, "analyzer_max_spool_bytes", base.analyzer_max_spool_bytes
+        ),
+        analyzer_max_spool_files=_argument_or_default(
+            args, "analyzer_max_spool_files", base.analyzer_max_spool_files
+        ),
+        analyzer_max_domain_batches=_argument_or_default(
+            args, "analyzer_max_domain_batches", base.analyzer_max_domain_batches
+        ),
         embedding_provider=getattr(args, "embedding_provider", None) or base.embedding_provider,
         embedding_base_url=getattr(args, "embedding_base_url", None) or base.embedding_base_url,
         embedding_model=getattr(args, "embedding_model", None) or base.embedding_model,
@@ -236,6 +240,11 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         serve_host=getattr(args, "host", None) or base.serve_host,
         serve_port=getattr(args, "port", None) or base.serve_port,
     )
+
+
+def _argument_or_default(args: argparse.Namespace, name: str, default: Any) -> Any:
+    value = getattr(args, name, None)
+    return default if value is None else value
 
 
 def _parse_build_variants(values: Sequence[str]) -> tuple[BuildVariant, ...]:
