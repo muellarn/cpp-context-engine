@@ -2564,41 +2564,41 @@ private:
     emitFile(*path);
     auto key = source_.declKey(decl, kind);
     auto symbolFactKey = "symbol:" + key + (isDefinition(decl) ? ":0" : ":1");
-    if (!emittedSymbolFacts_.insert(symbolFactKey).second)
-      return key;
-    const auto [startOffset, endOffset] = source_.offsets(decl->getSourceRange());
-    llvm::json::Object metadata{{"is_definition", isDefinition(decl)},
-                                {"analysis_backend", "clang-libtooling"},
-                                {"advanced_facts_complete", true},
-                                {"start_offset", startOffset},
-                                {"end_offset_exclusive", endOffset}};
-    auto templateInfo = templateMetadata(decl);
-    for (auto &entry : templateInfo)
-      metadata[entry.first] = std::move(entry.second);
-    if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
-      if (method->getParent() && method->getParent()->isLambda() &&
-          method->getOverloadedOperator() == clang::OO_Call) {
-        metadata["is_lambda_call_operator"] = true;
-        metadata["stable_lambda_key"] = key;
+    if (emittedSymbolFacts_.insert(symbolFactKey).second) {
+      const auto [startOffset, endOffset] = source_.offsets(decl->getSourceRange());
+      llvm::json::Object metadata{{"is_definition", isDefinition(decl)},
+                                  {"analysis_backend", "clang-libtooling"},
+                                  {"advanced_facts_complete", true},
+                                  {"start_offset", startOffset},
+                                  {"end_offset_exclusive", endOffset}};
+      auto templateInfo = templateMetadata(decl);
+      for (auto &entry : templateInfo)
+        metadata[entry.first] = std::move(entry.second);
+      if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+        if (method->getParent() && method->getParent()->isLambda() &&
+            method->getOverloadedOperator() == clang::OO_Call) {
+          metadata["is_lambda_call_operator"] = true;
+          metadata["stable_lambda_key"] = key;
+        }
       }
+      std::string signature;
+      llvm::raw_string_ostream signatureStream(signature);
+      decl->print(signatureStream, context_.getPrintingPolicy());
+      signatureStream.flush();
+      std::string documentation;
+      if (const auto *comment = context_.getRawCommentForDeclNoCache(decl))
+        documentation = comment->getRawText(context_.getSourceManager()).str();
+      llvm::json::Object fact{{"fact", "symbol"},
+                              {"key", key},
+                              {"qualified_name", qualifiedName(decl, kind)},
+                              {"kind", kind.str()},
+                              {"span", std::move(*span)},
+                              {"signature", signature},
+                              {"documentation", documentation},
+                              {"source_text", source_.source(decl->getSourceRange())},
+                              {"metadata", std::move(metadata)}};
+      sink_.add(std::move(symbolFactKey), std::move(fact));
     }
-    std::string signature;
-    llvm::raw_string_ostream signatureStream(signature);
-    decl->print(signatureStream, context_.getPrintingPolicy());
-    signatureStream.flush();
-    std::string documentation;
-    if (const auto *comment = context_.getRawCommentForDeclNoCache(decl))
-      documentation = comment->getRawText(context_.getSourceManager()).str();
-    llvm::json::Object fact{{"fact", "symbol"},
-                            {"key", key},
-                            {"qualified_name", qualifiedName(decl, kind)},
-                            {"kind", kind.str()},
-                            {"span", std::move(*span)},
-                            {"signature", signature},
-                            {"documentation", documentation},
-                            {"source_text", source_.source(decl->getSourceRange())},
-                            {"metadata", std::move(metadata)}};
-    sink_.add(std::move(symbolFactKey), std::move(fact));
     llvm::StringRef occurrenceKind = isDefinition(decl) ? "definition" : "declaration";
     auto occurrencePath = source_.path(decl->getLocation(), false).value_or(*path);
     auto occurrenceSpan = source_.span(decl->getSourceRange());
