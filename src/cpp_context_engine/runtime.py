@@ -184,13 +184,10 @@ def index_project(config: AppConfig) -> IndexOperationResult:
             project_root=config.project_root,
             build_scope=scope,
         )
-        missing = store.missing_embedding_variant_ids(
-            provider.model_id, config.project_root, build_scope=scope
-        )
-        vector_search.index(missing)
+        embedded_symbols = vector_search.index_missing()
         return IndexOperationResult(
             indexing,
-            len(missing),
+            embedded_symbols,
             provider.model_id,
             analysis_backend,
             advanced_complete,

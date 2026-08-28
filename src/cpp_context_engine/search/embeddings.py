@@ -36,6 +36,10 @@ class DeterministicLocalEmbeddingProvider:
     def model_id(self) -> str:
         return f"local-feature-hash-v1-{self.dimensions}"
 
+    @property
+    def configuration_id(self) -> str:
+        return self.model_id
+
     def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
         return tuple(self._embed_one(text) for text in texts)
 
@@ -77,6 +81,19 @@ class OpenAICompatibleEmbeddingProvider:
     @property
     def model_id(self) -> str:
         return f"openai-compatible:{self.model}"
+
+    @property
+    def configuration_id(self) -> str:
+        identity = json.dumps(
+            {
+                "provider": "openai-compatible-v1",
+                "endpoint": self._endpoint_url(),
+                "model": self.model,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"openai-compatible-config:{hashlib.sha256(identity.encode()).hexdigest()}"
 
     def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
         vectors: list[tuple[float, ...]] = []

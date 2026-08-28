@@ -164,6 +164,14 @@ The endpoint receives bounded symbol text through `POST /embeddings`. Requests
 have explicit timeouts and no hidden retries. API keys are excluded from object
 representations, CLI output, and sanitized errors.
 
+Embedding vectors are content-addressed by the exact bounded text, provider/model
+configuration, and vector dimension. Build-specific symbol variants keep separate
+references but share one bit-identical vector when those inputs match. Generation,
+validation, persistence, and missing-vector discovery run in bounded batches; a
+failed batch rolls back the complete embedding update. Schema-v10 local vectors
+are migrated into this shared pool. Legacy hosted vectors are regenerated once
+because older databases did not retain the endpoint identity needed for safe reuse.
+
 ### Ask questions and serve the API
 
 `ask` uses an OpenAI-compatible chat-completions endpoint. The model receives only

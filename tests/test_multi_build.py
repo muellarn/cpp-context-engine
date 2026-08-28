@@ -76,6 +76,22 @@ def test_two_opposing_builds_coexist_filter_union_reindex_and_remove(tmp_path: P
         )
         assert {hit.symbol.build_variant for hit in union} == {"alpha", "beta"}
         assert all(hit.symbol.variant_id for hit in union)
+        selected = {hit.symbol.build_variant: hit.symbol for hit in union}
+        for name in ("alpha", "beta"):
+            store.put_embedding(
+                selected[name].variant_id,
+                "fixture",
+                [1.0, 1.0],
+                build_scope=BuildScope.single(name),
+            )
+        alpha_vectors = store.search_vector(
+            [1.0, 1.0], model="fixture", build_scope=BuildScope.single("alpha")
+        )
+        beta_vectors = store.search_vector(
+            [1.0, 1.0], model="fixture", build_scope=BuildScope.single("beta")
+        )
+        assert {hit.symbol.build_variant for hit in alpha_vectors} == {"alpha"}
+        assert {hit.symbol.build_variant for hit in beta_vectors} == {"beta"}
 
         repeated = next(
             hit.symbol
@@ -110,6 +126,8 @@ def test_two_opposing_builds_coexist_filter_union_reindex_and_remove(tmp_path: P
         assert store.remove_build_variant("alpha")
         assert not store.search(SearchQuery("alpha_only"), build_scope=BuildScope.single("alpha"))
         assert store.search(SearchQuery("beta_only"), build_scope=BuildScope.single("beta"))
+        assert store.embedding_count("fixture") == 1
+        assert store.embedding_vector_count("fixture") == 1
 
 
 @pytest.mark.clang
