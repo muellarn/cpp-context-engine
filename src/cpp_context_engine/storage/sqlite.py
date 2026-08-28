@@ -1365,8 +1365,11 @@ class SQLiteStore:
                     _ordered_summary_groups(effects),
                     _ordered_summary_groups(origins),
                 )
-            self._connection.execute("DELETE FROM summary_effects WHERE is_local = 0")
-            self._connection.execute("DELETE FROM summary_return_origins WHERE is_local = 0")
+            if projects:
+                # SQLite resolves every foreign-key target even for an empty DELETE;
+                # partial legacy schemas with no propagated rows need no cleanup.
+                self._connection.execute("DELETE FROM summary_effects WHERE is_local = 0")
+                self._connection.execute("DELETE FROM summary_return_origins WHERE is_local = 0")
             self._connection.execute("PRAGMA user_version = 11")
         except BaseException:
             self._connection.rollback()
@@ -4001,17 +4004,29 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in build_variants)
         row = self._connection.execute(
             f"""
-            SELECT payloads.* FROM summary_solution_payloads payloads
+            SELECT payloads.encoding, payloads.effect_count, payloads.origin_count,
+                   payloads.uncompressed_bytes, payloads.payload_hash,
+                   length(payloads.payload) AS compressed_bytes,
+                   CASE WHEN length(payloads.payload) <= ?
+                        THEN payloads.payload END AS payload
+            FROM summary_solution_payloads payloads
             JOIN function_summaries summaries
               ON summaries.project_id = payloads.project_id
              AND summaries.id = payloads.summary_id
             WHERE payloads.project_id = ? AND payloads.summary_id = ?
               AND summaries.build_variant IN ({placeholders})
             """,
-            (project_id, summary_id, *build_variants),
+            (
+                MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES,
+                project_id,
+                summary_id,
+                *build_variants,
+            ),
         ).fetchone()
         if row is None:
             return (), ()
+        if row["compressed_bytes"] > MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES:
+            raise SummaryPayloadError("summary payload compressed-size limit exceeded")
         return _decode_summary_payload(
             summary_id,
             encoding=row["encoding"],

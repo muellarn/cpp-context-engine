@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
+import zlib
 from pathlib import Path
 
 import pytest
@@ -301,6 +303,60 @@ def test_payload_codec_is_deterministic_and_rejects_malformed_or_oversized_data(
             payload=encoded[4],
         )
 
+    monkeypatch.setattr(sqlite_module, "MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES", encoded[2] + 1024)
+    with pytest.raises(SummaryPayloadError, match="unsupported"):
+        _decode_summary_payload(
+            summary_id,
+            encoding="unknown",
+            effect_count=encoded[0],
+            origin_count=encoded[1],
+            uncompressed_bytes=encoded[2],
+            payload_hash=encoded[3],
+            payload=encoded[4],
+        )
+    with pytest.raises(SummaryPayloadError, match="malformed"):
+        _decode_summary_payload(
+            summary_id,
+            encoding=SUMMARY_PAYLOAD_ENCODING,
+            effect_count=encoded[0],
+            origin_count=encoded[1],
+            uncompressed_bytes=encoded[2],
+            payload_hash=encoded[3],
+            payload=encoded[4][:-1],
+        )
+    with pytest.raises(SummaryPayloadError, match="hash"):
+        _decode_summary_payload(
+            summary_id,
+            encoding=SUMMARY_PAYLOAD_ENCODING,
+            effect_count=encoded[0],
+            origin_count=encoded[1],
+            uncompressed_bytes=encoded[2],
+            payload_hash="0" * 64,
+            payload=encoded[4],
+        )
+    with pytest.raises(SummaryPayloadError, match="record counts"):
+        _decode_summary_payload(
+            summary_id,
+            encoding=SUMMARY_PAYLOAD_ENCODING,
+            effect_count=encoded[0] + 1,
+            origin_count=encoded[1],
+            uncompressed_bytes=encoded[2],
+            payload_hash=encoded[3],
+            payload=encoded[4],
+        )
+
+    invalid_raw = json.dumps([{}, []], separators=(",", ":")).encode()
+    with pytest.raises(SummaryPayloadError, match="record groups"):
+        _decode_summary_payload(
+            summary_id,
+            encoding=SUMMARY_PAYLOAD_ENCODING,
+            effect_count=0,
+            origin_count=0,
+            uncompressed_bytes=len(invalid_raw),
+            payload_hash=hashlib.sha256(invalid_raw).hexdigest(),
+            payload=zlib.compress(invalid_raw),
+        )
+
 
 def test_corrupt_payload_fails_safely_through_public_api(tmp_path: Path, solved_batch) -> None:
     with SQLiteStore(tmp_path / "index.db", project_root=FIXTURE) as store:
@@ -314,6 +370,32 @@ def test_corrupt_payload_fails_safely_through_public_api(tmp_path: Path, solved_
         )
         with pytest.raises(SummaryPayloadError, match="compression stream"):
             store.summary_effects(row["summary_id"], limit=10_000)
+
+
+def test_public_api_rejects_oversized_payload_before_materializing_blob(
+    tmp_path: Path, solved_batch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cpp_context_engine.storage.sqlite as sqlite_module
+
+    with SQLiteStore(tmp_path / "index.db", project_root=FIXTURE) as store:
+        store.apply_ingestion(FIXTURE, solved_batch)
+        summary_id = store._connection.execute(  # noqa: SLF001
+            "SELECT summary_id FROM summary_solution_payloads ORDER BY summary_id LIMIT 1"
+        ).fetchone()[0]
+        store._connection.execute(  # noqa: SLF001
+            "UPDATE summary_solution_payloads SET payload = zeroblob(64) WHERE summary_id = ?",
+            (summary_id,),
+        )
+        monkeypatch.setattr(sqlite_module, "MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES", 32)
+
+        def reject_large_blobs(cursor: sqlite3.Cursor, values: tuple[object, ...]) -> sqlite3.Row:
+            if any(isinstance(value, bytes) and len(value) > 32 for value in values):
+                raise AssertionError("oversized BLOB reached the Python process")
+            return sqlite3.Row(cursor, values)
+
+        store._connection.row_factory = reject_large_blobs  # noqa: SLF001
+        with pytest.raises(SummaryPayloadError, match="compressed-size limit"):
+            store.summary_effects(summary_id, limit=10_000)
 
 
 def test_v10_migration_compacts_existing_rows_without_changing_results(
