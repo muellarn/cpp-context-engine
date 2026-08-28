@@ -30,11 +30,25 @@ _RELEVANT_ENVIRONMENT = {
     "CPLUS_INCLUDE_PATH",
     "CXX",
     "C_INCLUDE_PATH",
+    "COMPILER_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "GCC_EXEC_PREFIX",
+    "LANG",
+    "LANGUAGE",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBCLANG_LIBRARY_FILE",
+    "LIBCLANG_PATH",
     "LIBRARY_PATH",
+    "LC_ALL",
     "MACOSX_DEPLOYMENT_TARGET",
     "PATH",
     "SDKROOT",
     "SYSROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
 }
 
 
@@ -60,8 +74,43 @@ def _environment_identity() -> dict[str, str]:
     return {
         key: value
         for key, value in sorted(os.environ.items())
-        if key in _RELEVANT_ENVIRONMENT or key.startswith("CPP_CONTEXT_")
+        if key in _RELEVANT_ENVIRONMENT or key.startswith("CPP_CONTEXT_") or key.startswith("LC_")
     }
+
+
+def _client_identity(client: NativeAnalyzerClient) -> dict[str, int | float | bool]:
+    return {
+        name: getattr(client, name)
+        for name in (
+            "timeout_seconds",
+            "max_input_bytes",
+            "max_output_bytes",
+            "max_decoded_bytes",
+            "max_record_bytes",
+            "max_stderr_bytes",
+            "prefer_compression",
+        )
+    }
+
+
+def _relocate_argument(value: str, original_root: Path, staged_root: Path) -> str:
+    """Replace an absolute project prefix, including when embedded in a compiler flag."""
+
+    pairs = {
+        (str(original_root), str(staged_root)),
+        (original_root.as_posix(), staged_root.as_posix()),
+    }
+    relocated = value
+    for original, staged in pairs:
+        offset = 0
+        while (index := relocated.find(original, offset)) >= 0:
+            end = index + len(original)
+            if end == len(relocated) or relocated[end] in "/\\":
+                relocated = relocated[:index] + staged + relocated[end:]
+                offset = index + len(staged)
+            else:
+                offset = end
+    return relocated
 
 
 class NativeFixtureCache:
@@ -107,18 +156,6 @@ class NativeFixtureCache:
     ) -> str:
         root = project_root.resolve(strict=True)
         binary = client.binary.resolve(strict=True)
-        client_identity = {
-            name: getattr(client, name)
-            for name in (
-                "timeout_seconds",
-                "max_input_bytes",
-                "max_output_bytes",
-                "max_decoded_bytes",
-                "max_record_bytes",
-                "max_stderr_bytes",
-                "prefer_compression",
-            )
-        }
         configuration_identity = {
             key: str(value) if isinstance(value, Path) else value
             for key, value in asdict(configuration).items()
@@ -130,7 +167,7 @@ class NativeFixtureCache:
                 "version": PROTOCOL_VERSION,
                 "clang_major": REQUIRED_CLANG_MAJOR,
             },
-            "client": client_identity,
+            "client": _client_identity(client),
             "configuration": configuration_identity,
             "environment": _environment_identity(),
             "project": {"path": str(root), "sha256": _project_digest(root)},
@@ -147,7 +184,8 @@ class NativeFixtureCache:
                 "version": PROTOCOL_VERSION,
                 "clang_major": REQUIRED_CLANG_MAJOR,
             },
-            "transport": client.prefer_compression,
+            "client": _client_identity(client),
+            "environment": _environment_identity(),
         }
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
         return "probe-" + hashlib.sha256(encoded).hexdigest()
@@ -169,13 +207,8 @@ class NativeFixtureCache:
         if staged_root == root:
             return root, configuration
 
-        original_prefix = str(root)
-        staged_prefix = str(staged_root)
-
         def relocate(value: str) -> str:
-            if value == original_prefix or value.startswith(original_prefix + os.sep):
-                return staged_prefix + value[len(original_prefix) :]
-            return value
+            return _relocate_argument(value, root, staged_root)
 
         output = configuration.output
         if output is not None:

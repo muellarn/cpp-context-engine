@@ -207,7 +207,7 @@ def test_call_ids_provenance_storage_bounds_and_incremental_cleanup(tmp_path: Pa
     extra = BuildVariant("extra", project / "compile_commands_extra.json")
     database = tmp_path / "index.db"
     with SQLiteStore(database, project_root=project) as store:
-        indexer = ProjectIndexer(_ingestor(), store)
+        indexer = ProjectIndexer(_fresh_ingestor(), store)
         indexer.index(project, default.compilation_database, build_variant=default)
         indexer.index(project, extra.compilation_database, build_variant=extra)
         default_sites = store.callsites(build_scope=BuildScope.single("default"), limit=1)
@@ -275,7 +275,7 @@ def test_incremental_override_change_refreshes_unchanged_callsite_targets(tmp_pa
     database = tmp_path / "index.db"
     variant = BuildVariant("default", compile_commands)
     with SQLiteStore(database, project_root=project) as store:
-        indexer = ProjectIndexer(_ingestor(), store)
+        indexer = ProjectIndexer(_fresh_ingestor(), store)
         first = indexer.index(project, compile_commands, build_variant=variant)
         assert first.indexed_translation_units == 2
 

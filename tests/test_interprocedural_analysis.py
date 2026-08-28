@@ -574,7 +574,7 @@ def test_build_variants_are_isolated_and_sqlite_refresh_is_targeted(tmp_path: Pa
     database = tmp_path / "index.db"
 
     with SQLiteStore(database, project_root=project) as store:
-        indexer = ProjectIndexer(NativeClangIngestor(_client()), store)
+        indexer = ProjectIndexer(NativeClangIngestor(_fresh_client()), store)
         default_result = indexer.index(project, default.compilation_database, build_variant=default)
         alt_result = indexer.index(
             project, alternative.compilation_database, build_variant=alternative

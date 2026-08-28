@@ -335,7 +335,7 @@ def test_sqlite_v7_round_trip_multi_build_and_incremental_cleanup(tmp_path: Path
     database = tmp_path / "index.db"
 
     with SQLiteStore(database, project_root=project) as store:
-        indexer = ProjectIndexer(NativeClangIngestor(_client()), store)
+        indexer = ProjectIndexer(NativeClangIngestor(_fresh_client()), store)
         default_result = indexer.index(project, default.compilation_database, build_variant=default)
         alternative_result = indexer.index(
             project, alternative.compilation_database, build_variant=alternative

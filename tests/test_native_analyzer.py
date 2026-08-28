@@ -193,6 +193,49 @@ def test_fact_builder_and_native_cache_cover_all_semantic_inputs(
             )
             != baseline
         )
+        probe_baseline = cache.probe_key(NativeAnalyzerClient(binary))
+        for client_kwargs in (
+            {"timeout_seconds": 76},
+            {"max_input_bytes": 1_048_577},
+            {"max_output_bytes": 67_108_865},
+            {"max_decoded_bytes": 268_435_457},
+            {"max_record_bytes": 16_777_217},
+            {"max_stderr_bytes": 262_145},
+        ):
+            limited = NativeAnalyzerClient(binary, **client_kwargs)
+            assert cache.probe_key(limited) != probe_baseline
+            assert cache.analysis_key(limited, tmp_path, configuration) != baseline
+
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/review-clang-runtime")
+        environment_client = NativeAnalyzerClient(binary)
+        assert cache.probe_key(environment_client) != probe_baseline
+        assert cache.analysis_key(environment_client, tmp_path, configuration) != baseline
+    finally:
+        cache.close()
+
+
+def test_native_cache_remaps_embedded_project_paths() -> None:
+    root = FIXTURE.resolve()
+    configuration = CompilationDatabase.load(root / "compile_commands.json").configurations[0]
+    include = root / "include"
+    sysroot = root / "sdk"
+    cache = NativeFixtureCache()
+    try:
+        staged_root, staged = cache.stage(
+            root,
+            replace(
+                configuration,
+                arguments=(
+                    *configuration.arguments,
+                    f"-I{include}",
+                    f"--sysroot={sysroot}",
+                ),
+            ),
+        )
+        assert staged_root != root
+        assert f"-I{staged_root / 'include'}" in staged.arguments
+        assert f"--sysroot={staged_root / 'sdk'}" in staged.arguments
+        assert all(str(root) not in argument for argument in staged.arguments)
     finally:
         cache.close()
 
@@ -220,6 +263,39 @@ def test_fact_registry_bounds_and_cached_consumers_are_isolated(tmp_path: Path) 
     assert calls == cache.loads == 1
     assert second == {"values": ["original"]}
     assert artifact.stat().st_mode & stat.S_IWUSR == 0
+
+    concurrent_started = threading.Event()
+    release_concurrent = threading.Event()
+    concurrent_calls = 0
+    concurrent_results: list[dict[str, list[str]]] = []
+
+    def create_concurrently() -> dict[str, list[str]]:
+        nonlocal concurrent_calls
+        concurrent_calls += 1
+        concurrent_started.set()
+        assert release_concurrent.wait(timeout=2)
+        return {"values": ["shared-source"]}
+
+    workers = [
+        threading.Thread(
+            target=lambda: concurrent_results.append(
+                cache.load("concurrent-identity", create_concurrently)
+            )
+        )
+        for _ in range(2)
+    ]
+    workers[0].start()
+    assert concurrent_started.wait(timeout=2)
+    workers[1].start()
+    release_concurrent.set()
+    for concurrent_worker in workers:
+        concurrent_worker.join(timeout=2)
+        assert not concurrent_worker.is_alive()
+    assert concurrent_calls == 1
+    assert concurrent_results[0] == concurrent_results[1]
+    assert concurrent_results[0] is not concurrent_results[1]
+    concurrent_results[0]["values"].append("private-mutation")
+    assert concurrent_results[1] == {"values": ["shared-source"]}
 
     source = tmp_path / "cached.cpp"
     source.write_text("int cached;\n", encoding="utf-8")
