@@ -8,6 +8,7 @@ import zlib
 from pathlib import Path
 
 import pytest
+from analyzer_discovery import analyzer_binary
 
 from cpp_context_engine.ingestion import NativeAnalyzerClient, NativeClangIngestor
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
@@ -23,19 +24,13 @@ from cpp_context_engine.storage.sqlite import (
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "interprocedural_project"
-
-
-def _binary() -> Path:
-    candidate = (
-        Path(__file__).parents[1] / "build" / "clang-analyzer" / "cpp-context-clang-analyzer"
-    )
-    if not candidate.is_file():
-        pytest.skip("Clang analyzer companion has not been built")
-    return candidate.resolve()
+pytestmark = pytest.mark.native
 
 
 def _ingestor() -> NativeClangIngestor:
-    return NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=90), max_workers=2)
+    return NativeClangIngestor(
+        NativeAnalyzerClient(analyzer_binary(), timeout_seconds=90), max_workers=2
+    )
 
 
 @pytest.fixture(scope="module")

@@ -21,6 +21,15 @@ Determinism tests still perform two independent analyses. Cancellation, timeout,
 process-group cleanup, malformed streams, output limits, incomplete streams,
 stdio MCP, and mutable incremental-index fixtures do not reuse semantic results.
 
+Every native test module discovers the companion through one shared helper. Set
+`CPP_CONTEXT_TEST_ANALYZER` to select an explicit binary; otherwise the helper
+uses `build/clang-analyzer/cpp-context-clang-analyzer`. The selected path must be
+a regular executable file whose handshake advertises protocol version 5, Clang
+18, and all required capabilities. A missing, non-executable, or incompatible
+binary is a suite-configuration error rather than a test skip. This keeps a
+misconfigured native run visible and guarantees that a successful run has zero
+skips.
+
 ## Ryzen 5 1600 / WSL measurement
 
 Measured on 2026-08-28 with Clang 18, a Release companion, `TMPDIR=/tmp`, no
