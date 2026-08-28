@@ -318,6 +318,7 @@ def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP TABLE summary_solution_payloads;
         DROP TABLE interprocedural_flows;
         DROP TABLE call_result_bindings;
         DROP TABLE call_argument_bindings;
