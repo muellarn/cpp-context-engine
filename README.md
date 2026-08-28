@@ -308,12 +308,35 @@ flag so they do not accidentally appear in shell history or process listings.
 ## Development
 
 ```bash
-python -m pip install -e '.[dev,clang,api,mcp]'
+python -m pip install -e '.[all,dev]'
 ruff format --check .
 ruff check .
 pytest
 python -m compileall -q src tests
 ```
+
+For quick iteration, run the focused Python tests without either real Clang
+backend. The native command retains companion semantics, transport, cancellation,
+timeout, malformed-stream, and determinism coverage. Run the full command before
+merging changes that cross those boundaries:
+
+```bash
+# Fast focused tests
+pytest -m 'not native and not clang'
+
+# Native companion integration tests
+pytest -m native
+
+# Complete local suite (Clang 18, no skipped tests expected)
+TMPDIR=/tmp LIBCLANG_PATH=/usr/lib/llvm-18/lib pytest
+```
+
+Immutable native fixture facts are content-keyed and reused only within one test
+session. Analyzer/protocol, fixture and compilation-database contents, relevant
+environment and client transport/limits form the identity. Process-lifetime and
+determinism checks deliberately launch fresh companions.
+The local timing method and current Ryzen 5 1600/WSL measurements are recorded in
+[Test-suite performance](docs/testing.md).
 
 Without installing, use `PYTHONPATH=src python -m cpp_context_engine --help`.
 Pytest capture can be disabled with `pytest -s` on environments whose temporary

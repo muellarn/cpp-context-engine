@@ -60,6 +60,7 @@ addopts = "-q"
 testpaths = ["tests"]
 markers = [
   "clang: requires the optional clang bindings and a compatible libclang",
+  "native: exercises the native Clang companion and its process protocol",
 ]
 
 [tool.ruff]

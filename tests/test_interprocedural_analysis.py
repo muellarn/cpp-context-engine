@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
+from native_cache import cached_native_client, fresh_native_client
 
 from cpp_context_engine.analysis.interprocedural import (
     InterproceduralLimits,
@@ -13,7 +15,6 @@ from cpp_context_engine.analysis.interprocedural import (
 )
 from cpp_context_engine.ingestion import (
     AnalyzerProtocolError,
-    NativeAnalyzerClient,
     NativeClangIngestor,
 )
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
@@ -40,23 +41,37 @@ from cpp_context_engine.storage import SQLiteStore
 from cpp_context_engine.storage.sqlite import SCHEMA_VERSION
 
 FIXTURE = Path(__file__).parent / "fixtures" / "interprocedural_project"
+pytestmark = pytest.mark.native
 
 
 def _binary() -> Path:
+    configured = os.getenv("CPP_CONTEXT_TEST_ANALYZER")
     candidate = (
-        Path(__file__).parents[1] / "build" / "clang-analyzer" / ("cpp-context-clang-analyzer")
+        Path(configured)
+        if configured
+        else Path(__file__).parents[1] / "build" / "clang-analyzer" / "cpp-context-clang-analyzer"
     )
     if not candidate.is_file():
         pytest.skip("Clang analyzer companion has not been built")
     return candidate.resolve()
 
 
-def _client() -> NativeAnalyzerClient:
-    return NativeAnalyzerClient(_binary(), timeout_seconds=90)
+def _client():
+    return cached_native_client(_binary(), timeout_seconds=90)
+
+
+def _fresh_client():
+    return fresh_native_client(_binary(), timeout_seconds=90)
 
 
 def _batch(*, database: str = "compile_commands.json", variant: str = "default"):
     return NativeClangIngestor(_client()).ingest(FIXTURE, FIXTURE / database, build_variant=variant)
+
+
+def _fresh_batch(*, database: str = "compile_commands.json", variant: str = "default"):
+    return NativeClangIngestor(_fresh_client()).ingest(
+        FIXTURE, FIXTURE / database, build_variant=variant
+    )
 
 
 def _summary(batch, name: str):
@@ -514,8 +529,8 @@ def test_recursion_external_calls_and_virtual_targets_never_overclaim() -> None:
 
 
 def test_scc_and_effect_caps_terminate_deterministically() -> None:
-    first = _batch()
-    second = _batch()
+    first = _fresh_batch()
+    second = _fresh_batch()
     assert first.function_summaries == second.function_summaries
     assert first.summary_effects == second.summary_effects
     assert first.interprocedural_flows == second.interprocedural_flows

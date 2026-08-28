@@ -14,6 +14,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from native_cache import (
+    CachedNativeAnalyzerClient,
+    NativeFixtureCache,
+    cached_native_client,
+    fresh_native_client,
+    staged_fixture,
+)
 
 from cpp_context_engine.cli import main
 from cpp_context_engine.ingestion import (
@@ -25,7 +32,12 @@ from cpp_context_engine.ingestion import (
 from cpp_context_engine.ingestion.clang import ClangIngestor, ClangUnavailableError
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
-from cpp_context_engine.ingestion.native import MAX_FACT_KINDS, _FactBatchBuilder, _FactRegistry
+from cpp_context_engine.ingestion.native import (
+    MAX_FACT_KINDS,
+    AnalyzerInfo,
+    _FactBatchBuilder,
+    _FactRegistry,
+)
 from cpp_context_engine.models import (
     BuildConfiguration,
     BuildScope,
@@ -40,6 +52,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "analyzer_project"
 PARITY_FIXTURE = Path(__file__).parent / "fixtures" / "cpp_project"
 CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
 IMPLICIT_FIXTURE = Path(__file__).parent / "fixtures" / "implicit_project"
+pytestmark = pytest.mark.native
 
 
 def _binary() -> Path:
@@ -127,7 +140,9 @@ else:
     )
 
 
-def test_fact_builder_caches_validated_project_paths(tmp_path: Path) -> None:
+def test_fact_builder_and_native_cache_cover_all_semantic_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = tmp_path / "source.cpp"
     source.write_text("int value = 1;\n", encoding="utf-8")
     configuration = BuildConfiguration(
@@ -144,14 +159,111 @@ def test_fact_builder_caches_validated_project_paths(tmp_path: Path) -> None:
 
     assert first is second
 
+    binary = _script(tmp_path, "")
+    cache = NativeFixtureCache()
+    try:
+        client = NativeAnalyzerClient(binary)
+        baseline = cache.analysis_key(client, tmp_path, configuration)
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        assert cache.analysis_key(NativeAnalyzerClient(binary), tmp_path, configuration) != baseline
+        binary.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        source.write_text("int changed = 1;\n", encoding="utf-8")
+        assert cache.analysis_key(NativeAnalyzerClient(binary), tmp_path, configuration) != baseline
+        source.write_text("int value = 1;\n", encoding="utf-8")
+        original_cache_identity = os.getenv("CPP_CONTEXT_TEST_CACHE_IDENTITY")
+        monkeypatch.setenv(
+            "CPP_CONTEXT_TEST_CACHE_IDENTITY", f"{original_cache_identity}-changed-for-key-test"
+        )
+        assert cache.analysis_key(NativeAnalyzerClient(binary), tmp_path, configuration) != baseline
+        if original_cache_identity is None:
+            monkeypatch.delenv("CPP_CONTEXT_TEST_CACHE_IDENTITY")
+        else:
+            monkeypatch.setenv("CPP_CONTEXT_TEST_CACHE_IDENTITY", original_cache_identity)
+        assert (
+            cache.analysis_key(
+                NativeAnalyzerClient(binary, prefer_compression=False), tmp_path, configuration
+            )
+            != baseline
+        )
+        assert (
+            cache.analysis_key(
+                NativeAnalyzerClient(binary),
+                tmp_path,
+                replace(configuration, command_hash="changed"),
+            )
+            != baseline
+        )
+    finally:
+        cache.close()
 
-def test_fact_registry_bounds_distinct_fact_kinds() -> None:
+
+def test_fact_registry_bounds_and_cached_consumers_are_isolated(tmp_path: Path) -> None:
     with _FactRegistry() as facts:
         for index in range(MAX_FACT_KINDS):
             facts.add({"fact": f"kind-{index}"})
 
         with pytest.raises(AnalyzerLimitError, match="fact-kind registry limit"):
             facts.add({"fact": "one-kind-too-many"})
+
+    cache = NativeFixtureCache()
+    calls = 0
+
+    def create() -> dict[str, list[str]]:
+        nonlocal calls
+        calls += 1
+        return {"values": ["original"]}
+
+    first = cache.load("identity", create)
+    first["values"].append("mutation")
+    second = cache.load("identity", create)
+    artifact = cache.directory / "identity.pickle"
+    assert calls == cache.loads == 1
+    assert second == {"values": ["original"]}
+    assert artifact.stat().st_mode & stat.S_IWUSR == 0
+
+    source = tmp_path / "cached.cpp"
+    source.write_text("int cached;\n", encoding="utf-8")
+    configuration = BuildConfiguration(
+        id="cached",
+        source_path=source,
+        directory=tmp_path,
+        arguments=("clang++", "-c", str(source)),
+        command_hash="cached",
+    )
+
+    class CountingClient(NativeAnalyzerClient):
+        analyses = 0
+
+        def probe(self, *, refresh: bool = False) -> AnalyzerInfo:
+            return AnalyzerInfo("test", 5, "test", 18, frozenset())
+
+        def analyze_stream(
+            self,
+            _project_root: Path,
+            _configuration: BuildConfiguration,
+            on_fact,
+            *,
+            cancelled=None,
+        ) -> None:
+            self.analyses += 1
+            on_fact({"fact": "test", "payload": ["original"]})
+
+    client = CountingClient(_script(tmp_path, ""))
+    cached = CachedNativeAnalyzerClient(cache, client)
+    result: list[tuple] = []
+    worker = threading.Thread(target=lambda: result.append(cached.analyze(tmp_path, configuration)))
+    worker.daemon = True
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive(), "cached analysis recursively reacquired its own key lock"
+    result[0][0]["payload"].append("mutation")
+    repeated = cached.analyze(tmp_path, configuration)
+    assert client.analyses == 1
+    assert repeated[0]["payload"] == ["original"]
+
+    directory = cache.directory
+    cache.close()
+    assert not directory.exists()
 
 
 def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path: Path) -> None:
@@ -437,8 +549,8 @@ def test_real_companion_finalizes_gzip_when_rejecting_request() -> None:
 
 
 def test_native_plain_and_gzip_create_identical_deterministic_batches() -> None:
-    gzip_client = NativeAnalyzerClient(_binary(), timeout_seconds=30)
-    plain_client = NativeAnalyzerClient(_binary(), timeout_seconds=30, prefer_compression=False)
+    gzip_client = fresh_native_client(_binary(), timeout_seconds=30)
+    plain_client = fresh_native_client(_binary(), timeout_seconds=30, prefer_compression=False)
 
     gzip_batch = NativeClangIngestor(gzip_client).ingest(FIXTURE, FIXTURE / "compile_commands.json")
     plain_batch = NativeClangIngestor(plain_client).ingest(
@@ -453,12 +565,9 @@ def test_implicit_lambda_copy_has_no_orphan_symbol_references() -> None:
     configuration = CompilationDatabase.load(
         IMPLICIT_FIXTURE / "compile_commands.json"
     ).configurations[0]
-    facts = NativeAnalyzerClient(_binary(), timeout_seconds=30).analyze(
-        IMPLICIT_FIXTURE, configuration
-    )
-    repeated = NativeAnalyzerClient(_binary(), timeout_seconds=30).analyze(
-        IMPLICIT_FIXTURE, configuration
-    )
+    client = fresh_native_client(_binary(), timeout_seconds=30)
+    facts = client.analyze(IMPLICIT_FIXTURE, configuration)
+    repeated = client.analyze(IMPLICIT_FIXTURE, configuration)
     endpoint_keys = {fact["key"] for fact in facts if fact.get("fact") in {"file", "symbol"}}
     unknown_references = {
         key
@@ -476,7 +585,7 @@ def test_implicit_lambda_copy_has_no_orphan_symbol_references() -> None:
 
 def test_reopened_namespace_preserves_each_definition_occurrence() -> None:
     configuration = CompilationDatabase.load(FIXTURE / "compile_commands.json").configurations[0]
-    facts = NativeAnalyzerClient(_binary(), timeout_seconds=30).analyze(FIXTURE, configuration)
+    facts = cached_native_client(_binary(), timeout_seconds=30).analyze(FIXTURE, configuration)
 
     namespace_paths = {
         Path(fact["span"]["path"]).relative_to(FIXTURE.resolve()).as_posix()
@@ -501,9 +610,7 @@ def test_reopened_namespace_preserves_each_definition_occurrence() -> None:
 
 
 def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
-    batch = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
-        FIXTURE, FIXTURE / "compile_commands.json"
-    )
+    batch = _cached_batch(FIXTURE)
     relations = {edge.relation for edge in batch.edges}
 
     assert {
@@ -561,8 +668,19 @@ def test_real_ast_macro_template_lambda_and_relationship_facts() -> None:
 
 
 def _cfg_batch(*, database: str = "compile_commands.json", variant: str = "default"):
-    return NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
+    return NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=30)).ingest(
         CFG_FIXTURE, CFG_FIXTURE / database, build_variant=variant
+    )
+
+
+def _cached_batch(
+    fixture: Path,
+    *,
+    database: str = "compile_commands.json",
+    variant: str = "default",
+):
+    return NativeClangIngestor(cached_native_client(_binary(), timeout_seconds=30)).ingest(
+        fixture, fixture / database, build_variant=variant
     )
 
 
@@ -571,8 +689,15 @@ def _cfg_for(batch, qualified_name: str):
     return next(graph for graph in batch.cfg_graphs if graph.function_symbol_id == symbol.id)
 
 
+@pytest.fixture(scope="module")
+def deterministic_cfg_batches():
+    """Two genuinely fresh analyses shared by the CFG determinism assertions."""
+
+    return _cfg_batch(), _cfg_batch()
+
+
 def test_real_cfg_snapshot_covers_control_flow_macro_and_lifetime_facts() -> None:
-    batch = _cfg_batch()
+    batch = _cached_batch(CFG_FIXTURE)
     snapshot = {}
     for graph in batch.cfg_graphs:
         symbol = next(symbol for symbol in batch.symbols if symbol.id == graph.function_symbol_id)
@@ -665,9 +790,10 @@ def test_real_cfg_snapshot_covers_control_flow_macro_and_lifetime_facts() -> Non
     )
 
 
-def test_cfg_macro_expression_ranges_are_ordered_and_keep_expansion_evidence() -> None:
-    first = _cfg_batch()
-    second = _cfg_batch()
+def test_cfg_macro_expression_ranges_are_ordered_and_keep_expansion_evidence(
+    deterministic_cfg_batches,
+) -> None:
+    first, second = deterministic_cfg_batches
     graph = _cfg_for(first, "cfg_fixture::local_object_macro_ranges")
     elements = [element for element in first.cfg_elements if element.graph_id == graph.id]
     target_text = {
@@ -697,7 +823,7 @@ def test_cfg_macro_expression_ranges_are_ordered_and_keep_expansion_evidence() -
 def test_mixed_macro_spelling_range_keeps_callsite_with_expansion_evidence(
     tmp_path: Path,
 ) -> None:
-    batch = _cfg_batch()
+    batch = _cached_batch(CFG_FIXTURE)
     owner = next(
         symbol
         for symbol in batch.symbols
@@ -715,9 +841,10 @@ def test_mixed_macro_spelling_range_keeps_callsite_with_expansion_evidence(
         assert store.get_callsite(callsites[0].id) == callsites[0]
 
 
-def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(tmp_path: Path) -> None:
-    first = _cfg_batch()
-    second = _cfg_batch()
+def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(
+    tmp_path: Path, deterministic_cfg_batches
+) -> None:
+    first, second = deterministic_cfg_batches
     for attribute in ("cfg_graphs", "cfg_blocks", "cfg_elements", "cfg_edges"):
         assert [item.id for item in getattr(first, attribute)] == [
             item.id for item in getattr(second, attribute)
@@ -743,7 +870,7 @@ def test_cfg_ids_are_deterministic_and_sqlite_reads_are_bounded(tmp_path: Path) 
 
 
 def test_cfg_adapter_rejects_cross_graph_block_references() -> None:
-    client = NativeAnalyzerClient(_binary(), timeout_seconds=30)
+    client = cached_native_client(_binary(), timeout_seconds=30)
     configuration = CompilationDatabase.load(CFG_FIXTURE / "compile_commands.json").configurations[
         0
     ]
@@ -759,8 +886,10 @@ def test_cfg_adapter_rejects_cross_graph_block_references() -> None:
 
 
 def test_cfg_exception_edges_follow_build_configuration_and_build_scope(tmp_path: Path) -> None:
-    enabled = _cfg_batch(variant="exceptions")
-    disabled = _cfg_batch(database="compile_commands_no_eh.json", variant="no-exceptions")
+    enabled = _cached_batch(CFG_FIXTURE, variant="exceptions")
+    disabled = _cached_batch(
+        CFG_FIXTURE, database="compile_commands_no_eh.json", variant="no-exceptions"
+    )
     enabled_graph = _cfg_for(enabled, "cfg_fixture::exception_flow")
     disabled_graph = _cfg_for(disabled, "cfg_fixture::exception_flow")
     assert enabled_graph.build_options["add_eh_edges"] is True
@@ -856,12 +985,13 @@ def test_cfg_reindex_replaces_only_changed_tu_and_rolls_back_atomically(tmp_path
 
 @pytest.mark.clang
 def test_companion_preserves_baseline_canonical_ids_and_relation_parity() -> None:
+    fixture = staged_fixture(PARITY_FIXTURE)
     try:
-        baseline = ClangIngestor().ingest(PARITY_FIXTURE, PARITY_FIXTURE / "compile_commands.json")
+        baseline = ClangIngestor().ingest(fixture, fixture / "compile_commands.json")
     except ClangUnavailableError as error:
         pytest.skip(str(error))
-    native = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
-        PARITY_FIXTURE, PARITY_FIXTURE / "compile_commands.json"
+    native = NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=30)).ingest(
+        fixture, fixture / "compile_commands.json"
     )
     names = {"demo::Base", "demo::Derived", "demo::Derived::compute", "demo::helper", "run"}
     baseline_ids = {
@@ -886,13 +1016,14 @@ def test_switching_from_baseline_to_companion_forces_reindex(tmp_path: Path) -> 
         baseline = ClangIngestor()
     except ClangUnavailableError as error:
         pytest.skip(str(error))
-    database = PARITY_FIXTURE / "compile_commands.json"
-    with SQLiteStore(tmp_path / "index.db", project_root=PARITY_FIXTURE) as store:
-        first = ProjectIndexer(baseline, store).index(PARITY_FIXTURE, database)
+    fixture = staged_fixture(PARITY_FIXTURE)
+    database = fixture / "compile_commands.json"
+    with SQLiteStore(tmp_path / "index.db", project_root=fixture) as store:
+        first = ProjectIndexer(baseline, store).index(fixture, database)
         upgraded = ProjectIndexer(
-            NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)), store
-        ).index(PARITY_FIXTURE, database)
-        states = store.translation_unit_states(PARITY_FIXTURE)
+            NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=30)), store
+        ).index(fixture, database)
+        states = store.translation_unit_states(fixture)
 
     assert first.indexed_translation_units == 2
     assert upgraded.indexed_translation_units == 2
@@ -1177,9 +1308,7 @@ pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))
 
 
 def test_sqlite_round_trips_macro_provenance(tmp_path: Path) -> None:
-    batch = NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=30)).ingest(
-        FIXTURE, FIXTURE / "compile_commands.json"
-    )
+    batch = _cached_batch(FIXTURE)
     macro = next(symbol for symbol in batch.symbols if symbol.qualified_name == "APPLY_TWICE")
     with SQLiteStore(tmp_path / "index.db", project_root=FIXTURE) as store:
         store.apply_ingestion(FIXTURE, batch)
@@ -1228,13 +1357,14 @@ def test_doctor_checks_real_companion(capsys: pytest.CaptureFixture[str]) -> Non
 def test_cli_index_reports_companion_coverage(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    fixture = staged_fixture(FIXTURE)
     assert (
         main(
             [
                 "index",
-                str(FIXTURE),
+                str(fixture),
                 "--compile-commands",
-                str(FIXTURE / "compile_commands.json"),
+                str(fixture / "compile_commands.json"),
                 "--clang-analyzer",
                 str(_binary()),
                 "--db",
