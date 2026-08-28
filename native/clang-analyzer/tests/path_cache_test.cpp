@@ -16,7 +16,7 @@ void require(bool condition) {
 }
 
 void testCachesSuccessAndFallbackByExactRawPath() {
-  std::map<std::string, unsigned> calls;
+  std::map<Path::string_type, unsigned> calls;
   cpp_context::CanonicalPathCache cache(
       [&calls](const Path &path, std::error_code &error) {
         ++calls[path.native()];
@@ -30,15 +30,15 @@ void testCachesSuccessAndFallbackByExactRawPath() {
 
   require(cache.canonical("source.cpp") == Path("/canonical/source.cpp"));
   require(cache.canonical("source.cpp") == Path("/canonical/source.cpp"));
-  require(calls["source.cpp"] == 1);
+  require(calls[Path("source.cpp").native()] == 1);
 
   require(cache.canonical("missing/../broken") == Path("broken"));
   require(cache.canonical("missing/../broken") == Path("broken"));
-  require(calls["missing/../broken"] == 1);
+  require(calls[Path("missing/../broken").native()] == 1);
 
   require(cache.canonical("./source.cpp") == Path("/canonical/./source.cpp"));
-  require(calls["./source.cpp"] == 1);
-  require(calls["source.cpp"] == 1);
+  require(calls[Path("./source.cpp").native()] == 1);
+  require(calls[Path("source.cpp").native()] == 1);
 }
 
 void testCanonicalizesRelativeAndSymlinkPaths() {
