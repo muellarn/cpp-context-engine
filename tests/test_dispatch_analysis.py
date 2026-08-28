@@ -7,8 +7,9 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from native_cache import cached_native_client, fresh_native_client
 
-from cpp_context_engine.ingestion import NativeAnalyzerClient, NativeClangIngestor
+from cpp_context_engine.ingestion import NativeClangIngestor
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
 from cpp_context_engine.models import (
     BuildScope,
@@ -21,6 +22,7 @@ from cpp_context_engine.storage import SQLiteStore
 from cpp_context_engine.storage.sqlite import SCHEMA_VERSION
 
 FIXTURE = Path(__file__).parent / "fixtures" / "dispatch_project"
+pytestmark = pytest.mark.native
 
 
 def _binary() -> Path:
@@ -36,11 +38,21 @@ def _binary() -> Path:
 
 
 def _ingestor() -> NativeClangIngestor:
-    return NativeClangIngestor(NativeAnalyzerClient(_binary(), timeout_seconds=90))
+    return NativeClangIngestor(  # type: ignore[arg-type]
+        cached_native_client(_binary(), timeout_seconds=90)
+    )
+
+
+def _fresh_ingestor() -> NativeClangIngestor:
+    return NativeClangIngestor(fresh_native_client(_binary(), timeout_seconds=90))
 
 
 def _batch(*, database: str = "compile_commands.json", variant: str = "default"):
     return _ingestor().ingest(FIXTURE, FIXTURE / database, build_variant=variant)
+
+
+def _fresh_batch(*, database: str = "compile_commands.json", variant: str = "default"):
+    return _fresh_ingestor().ingest(FIXTURE, FIXTURE / database, build_variant=variant)
 
 
 def _symbol_names(batch) -> dict[str, str]:
@@ -171,8 +183,8 @@ def test_callable_template_macro_duplicate_and_dependent_forms() -> None:
 
 
 def test_call_ids_provenance_storage_bounds_and_incremental_cleanup(tmp_path: Path) -> None:
-    first = _batch()
-    second = _batch()
+    first = _fresh_batch()
+    second = _fresh_batch()
     assert [site.id for site in first.callsites] == [site.id for site in second.callsites]
     assert [target.id for target in first.call_targets] == [
         target.id for target in second.call_targets
@@ -195,7 +207,7 @@ def test_call_ids_provenance_storage_bounds_and_incremental_cleanup(tmp_path: Pa
     extra = BuildVariant("extra", project / "compile_commands_extra.json")
     database = tmp_path / "index.db"
     with SQLiteStore(database, project_root=project) as store:
-        indexer = ProjectIndexer(_ingestor(), store)
+        indexer = ProjectIndexer(_fresh_ingestor(), store)
         indexer.index(project, default.compilation_database, build_variant=default)
         indexer.index(project, extra.compilation_database, build_variant=extra)
         default_sites = store.callsites(build_scope=BuildScope.single("default"), limit=1)
@@ -263,7 +275,7 @@ def test_incremental_override_change_refreshes_unchanged_callsite_targets(tmp_pa
     database = tmp_path / "index.db"
     variant = BuildVariant("default", compile_commands)
     with SQLiteStore(database, project_root=project) as store:
-        indexer = ProjectIndexer(_ingestor(), store)
+        indexer = ProjectIndexer(_fresh_ingestor(), store)
         first = indexer.index(project, compile_commands, build_variant=variant)
         assert first.indexed_translation_units == 2
 
