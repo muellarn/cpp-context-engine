@@ -41,6 +41,8 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "path_cache.h"
+
 namespace {
 
 static_assert(CLANG_VERSION_MAJOR == 18, "cpp-context-clang-analyzer requires Clang 18");
@@ -192,12 +194,10 @@ public:
   SourceFacts(clang::SourceManager &sourceManager, const clang::LangOptions &langOptions,
               std::filesystem::path projectRoot)
       : sourceManager_(sourceManager), langOptions_(langOptions),
-        projectRoot_(canonical(std::move(projectRoot))) {}
+        projectRoot_(pathCache_.canonical(projectRoot)) {}
 
-  static std::filesystem::path canonical(std::filesystem::path path) {
-    std::error_code error;
-    auto result = std::filesystem::weakly_canonical(path, error);
-    return error ? path.lexically_normal() : result;
+  std::filesystem::path canonicalPath(const std::filesystem::path &path) const {
+    return pathCache_.canonical(path);
   }
 
   std::optional<std::filesystem::path> path(clang::SourceLocation location,
@@ -209,11 +209,11 @@ public:
     auto filename = sourceManager_.getFilename(resolved);
     if (filename.empty())
       return std::nullopt;
-    return canonical(filename.str());
+    return canonicalPath(filename.str());
   }
 
   bool isProjectPath(const std::filesystem::path &candidate) const {
-    auto relative = canonical(candidate).lexically_relative(projectRoot_);
+    auto relative = canonicalPath(candidate).lexically_relative(projectRoot_);
     return !relative.empty() && *relative.begin() != "..";
   }
 
@@ -222,7 +222,7 @@ public:
     auto candidate = path(location, spelling);
     if (!candidate || !isProjectPath(*candidate))
       return std::nullopt;
-    return canonical(*candidate).lexically_relative(projectRoot_).generic_string();
+    return canonicalPath(*candidate).lexically_relative(projectRoot_).generic_string();
   }
 
   std::optional<llvm::json::Object> span(clang::SourceRange range,
@@ -267,7 +267,7 @@ public:
     if (!isOrderedFileRange(begin, end))
       return std::nullopt;
     return llvm::json::Object{
-        {"path", canonical(*candidate).string()},
+        {"path", canonicalPath(*candidate).string()},
         {"start_line", static_cast<std::int64_t>(sourceManager_.getSpellingLineNumber(begin))},
         {"start_column",
          static_cast<std::int64_t>(sourceManager_.getSpellingColumnNumber(begin))},
@@ -346,7 +346,7 @@ public:
   }
 
   std::string fileKey(const std::filesystem::path &path) const {
-    return "file:" + canonical(path).lexically_relative(projectRoot_).generic_string();
+    return "file:" + canonicalPath(path).lexically_relative(projectRoot_).generic_string();
   }
 
   std::string declKey(const clang::NamedDecl *decl, llvm::StringRef kind) const {
@@ -425,6 +425,7 @@ private:
 
   clang::SourceManager &sourceManager_;
   const clang::LangOptions &langOptions_;
+  cpp_context::CanonicalPathCache pathCache_;
   std::filesystem::path projectRoot_;
 };
 
@@ -523,7 +524,7 @@ public:
     if (auto span = source_.span(filenameRange.getAsRange()))
       fact["span"] = std::move(*span);
     if (file) {
-      auto target = SourceFacts::canonical(std::filesystem::path(file->getName().str()));
+      auto target = source_.canonicalPath(std::filesystem::path(file->getName().str()));
       if (source_.isProjectPath(target)) {
         fact["target_key"] = source_.fileKey(target);
         fact["resolved_path"] = target.string();
@@ -603,10 +604,9 @@ private:
 
 class Collector final : public clang::RecursiveASTVisitor<Collector> {
 public:
-  Collector(clang::ASTContext &context, FactSink &sink, std::filesystem::path projectRoot,
+  Collector(clang::ASTContext &context, FactSink &sink, SourceFacts &source,
             const std::vector<MacroExpansionRecord> &macroExpansions)
-      : context_(context), sink_(sink),
-        source_(context.getSourceManager(), context.getLangOpts(), std::move(projectRoot)),
+      : context_(context), sink_(sink), source_(source),
         macroExpansions_(macroExpansions) {}
 
   SourceFacts &sourceFacts() { return source_; }
@@ -2710,16 +2710,16 @@ private:
 
   clang::ASTContext &context_;
   FactSink &sink_;
-  SourceFacts source_;
+  SourceFacts &source_;
   const std::vector<MacroExpansionRecord> &macroExpansions_;
   std::unordered_set<std::string> emittedSymbolFacts_;
 };
 
 class Consumer final : public clang::ASTConsumer {
 public:
-  Consumer(clang::ASTContext &context, FactSink &sink, const std::filesystem::path &root,
+  Consumer(clang::ASTContext &context, FactSink &sink, SourceFacts &source,
            const std::vector<MacroExpansionRecord> &macroExpansions)
-      : collector_(context, sink, root, macroExpansions) {}
+      : collector_(context, sink, source, macroExpansions) {}
   void HandleTranslationUnit(clang::ASTContext &context) override {
     collector_.TraverseDecl(context.getTranslationUnitDecl());
   }
@@ -2742,7 +2742,7 @@ public:
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &compiler, llvm::StringRef) override {
-    return std::make_unique<Consumer>(compiler.getASTContext(), sink_, root_,
+    return std::make_unique<Consumer>(compiler.getASTContext(), sink_, *source_,
                                       macroExpansions_);
   }
 

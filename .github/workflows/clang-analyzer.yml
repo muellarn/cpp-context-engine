@@ -30,7 +30,10 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
           -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang
-      - run: cmake --build build/clang-analyzer --config Release --parallel 2
+      - name: Build and test companion
+        run: |
+          cmake --build build/clang-analyzer --config Release --parallel 2
+          ctest --test-dir build/clang-analyzer --output-on-failure
       - name: Verify native protocol, CFG, and dispatch fixtures
         env:
           CPP_CONTEXT_TEST_ANALYZER: ${{ github.workspace }}/build/clang-analyzer/cpp-context-clang-analyzer
