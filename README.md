@@ -292,6 +292,10 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_ANALYZER_MAX_RECORD_BYTES` | maximum decoded JSONL record bytes | `16777216` |
 | `CPP_CONTEXT_ANALYZER_MAX_STDERR_BYTES` | maximum diagnostic bytes | `262144` |
 | `CPP_CONTEXT_ANALYZER_MAX_WORKERS` | maximum concurrent companion processes | `1` |
+| `CPP_CONTEXT_ANALYZER_MAX_SPOOL_REGISTRIES` | maximum analyzed/converting/queued TUs | `2 × workers` |
+| `CPP_CONTEXT_ANALYZER_MAX_SPOOL_BYTES` | maximum compact fact-spool bytes | `registries × decoded bytes` |
+| `CPP_CONTEXT_ANALYZER_MAX_SPOOL_FILES` | maximum fact-spool file descriptors | `registries × 64` |
+| `CPP_CONTEXT_ANALYZER_MAX_DOMAIN_BATCHES` | maximum converted TU batches awaiting SQLite | `2` |
 | `CPP_CONTEXT_MAX_TOKENS` | default packed context budget | `16000` |
 | `CPP_CONTEXT_RETRIEVAL_LIMIT` | candidates per search backend | `20` |
 | `CPP_CONTEXT_EMBEDDING_PROVIDER` | `local` or `openai` | `local` |

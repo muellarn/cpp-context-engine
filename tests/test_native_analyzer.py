@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shutil
@@ -8,8 +9,10 @@ import stat
 import subprocess
 import threading
 import time
+import weakref
 import zlib
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,7 +28,12 @@ from cpp_context_engine.ingestion import (
 from cpp_context_engine.ingestion.clang import ClangIngestor, ClangUnavailableError
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
-from cpp_context_engine.ingestion.native import MAX_FACT_KINDS, _FactBatchBuilder, _FactRegistry
+from cpp_context_engine.ingestion.native import (
+    MAX_FACT_KINDS,
+    _FactBatchBuilder,
+    _FactRegistry,
+    _ResourceBudget,
+)
 from cpp_context_engine.models import (
     BuildConfiguration,
     BuildScope,
@@ -154,6 +162,70 @@ def test_fact_registry_bounds_distinct_fact_kinds() -> None:
             facts.add({"fact": "one-kind-too-many"})
 
 
+def test_fact_registry_does_not_decode_validated_facts_as_json_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoded = 0
+    original_loads = json.loads
+
+    def counted_loads(value: object, *args: object, **kwargs: object) -> object:
+        nonlocal decoded
+        decoded += 1
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr("cpp_context_engine.ingestion.native.json.loads", counted_loads)
+    fact = {"type": "fact", "fact": "symbol", "key": "usr:test", "nested": [1, True]}
+
+    with _FactRegistry() as facts:
+        facts.add(fact)
+        assert list(facts.records("symbol")) == [fact]
+
+    assert decoded == 0
+
+
+def test_fact_registry_enforces_and_releases_shared_spool_limits() -> None:
+    byte_budget = _ResourceBudget(4096, "byte budget")
+    fd_budget = _ResourceBudget(1, "file budget")
+    facts = _FactRegistry(
+        max_bytes=4096,
+        max_record_bytes=4096,
+        byte_budget=byte_budget,
+        fd_budget=fd_budget,
+    )
+
+    facts.add({"fact": "symbol", "key": "usr:test"})
+    assert byte_budget.used > 0
+    assert fd_budget.used == 1
+    with pytest.raises(AnalyzerLimitError, match="file budget"):
+        facts.add({"fact": "edge", "key": "edge:test"})
+
+    facts.close()
+    assert byte_budget.used == 0
+    assert fd_budget.used == 0
+
+    with (
+        _FactRegistry(max_bytes=8, max_record_bytes=4096) as bounded,
+        pytest.raises(AnalyzerLimitError, match="registry spool limit"),
+    ):
+        bounded.add({"fact": "symbol", "key": "too-large"})
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_spool_registries": 0},
+        {"max_spool_bytes": 0},
+        {"max_spool_fds": 0},
+    ],
+)
+def test_native_pipeline_rejects_explicit_zero_spool_limits(limits: dict[str, int]) -> None:
+    class EmptyClient:
+        max_decoded_bytes = 1024
+
+    with pytest.raises(ValueError, match="limits must be positive"):
+        NativeClangIngestor(EmptyClient(), **limits)  # type: ignore[arg-type]
+
+
 def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path: Path) -> None:
     active = 0
     maximum_active = 0
@@ -208,9 +280,13 @@ def test_native_configurations_are_analyzed_concurrently_in_input_order(tmp_path
     ]
 
 
-def test_native_configuration_batches_bound_the_completed_reorder_window(tmp_path: Path) -> None:
+def test_native_configuration_batches_refill_on_completion_with_a_bounded_window(
+    tmp_path: Path,
+) -> None:
     started: list[int] = []
-    second_completed = threading.Event()
+    third_started = threading.Event()
+    release_first = threading.Event()
+    lock = threading.Lock()
 
     class OutOfOrderClient:
         def probe(self) -> object:
@@ -220,11 +296,13 @@ def test_native_configuration_batches_bound_the_completed_reorder_window(tmp_pat
             self, _root: Path, configuration: BuildConfiguration
         ) -> list[dict[str, object]]:
             index = int(configuration.id.removeprefix("build-"))
-            started.append(index)
+            with lock:
+                started.append(index)
             if index == 0:
-                assert second_completed.wait(timeout=2)
-            elif index == 1:
-                second_completed.set()
+                assert third_started.wait(timeout=2)
+                release_first.set()
+            elif index == 2:
+                third_started.set()
             return []
 
     configurations = []
@@ -242,17 +320,199 @@ def test_native_configuration_batches_bound_the_completed_reorder_window(tmp_pat
         )
 
     batches = NativeClangIngestor(  # type: ignore[arg-type]
-        OutOfOrderClient(), max_workers=2
+        OutOfOrderClient(), max_workers=2, max_spool_registries=3
     ).iter_configuration_batches(tmp_path, configurations)
     first = next(batches)
 
+    assert release_first.is_set()
     assert [unit.build_configuration_id for unit in first.translation_units] == ["build-0"]
-    # A completed later item must not cause unbounded refill while the next ordered
-    # batch is still retained by the consumer.
-    assert sorted(started) == [0, 1]
+    assert 2 in started
+    # The slow ordered item plus completed/refilled work must never exceed the
+    # configured registry window while the consumer retains the first batch.
+    assert len(started) <= 3
     assert [batch.translation_units[0].build_configuration_id for batch in batches] == [
         f"build-{index}" for index in range(1, 8)
     ]
+
+
+def test_native_pipeline_bounds_converted_batches_retained_by_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built: list[int] = []
+    built_two = threading.Event()
+    lock = threading.Lock()
+    original_build = _FactBatchBuilder.build
+
+    def counted_build(builder: _FactBatchBuilder, facts: object) -> object:
+        result = original_build(builder, facts)  # type: ignore[arg-type]
+        with lock:
+            built.append(int(builder.configuration.id.removeprefix("build-")))
+            if len(built) == 2:
+                built_two.set()
+        return result
+
+    monkeypatch.setattr(_FactBatchBuilder, "build", counted_build)
+
+    class EmptyClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, _configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            return []
+
+    configurations = []
+    for index in range(6):
+        source = tmp_path / f"domain-{index}.cpp"
+        source.write_text(f"int domain_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    batches = NativeClangIngestor(  # type: ignore[arg-type]
+        EmptyClient(),
+        max_workers=2,
+        max_spool_registries=4,
+        max_domain_batches=2,
+    ).iter_configuration_batches(tmp_path, configurations)
+    next(batches)
+    assert built_two.wait(timeout=2)
+    time.sleep(0.05)
+
+    assert sorted(built) == [0, 1]
+    batches.close()
+
+
+def test_native_pipeline_does_not_retain_every_completed_analysis_future(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    analyzer_futures: list[weakref.ReferenceType[object]] = []
+
+    class TrackingExecutor:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._delegate = ThreadPoolExecutor(*args, **kwargs)  # type: ignore[arg-type]
+            self._track = kwargs.get("thread_name_prefix") == "cpp-context-analyzer"
+
+        def submit(self, *args: object, **kwargs: object) -> object:
+            future = self._delegate.submit(*args, **kwargs)  # type: ignore[arg-type]
+            if self._track:
+                analyzer_futures.append(weakref.ref(future))
+            return future
+
+        def shutdown(self, *args: object, **kwargs: object) -> None:
+            self._delegate.shutdown(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("cpp_context_engine.ingestion.native.ThreadPoolExecutor", TrackingExecutor)
+
+    class EmptyClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, _configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            return []
+
+    configurations = []
+    for index in range(80):
+        source = tmp_path / f"future-{index}.cpp"
+        source.write_text(f"int future_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    batches = NativeClangIngestor(  # type: ignore[arg-type]
+        EmptyClient(), max_workers=2, max_spool_registries=4
+    ).iter_configuration_batches(tmp_path, configurations)
+    for _index in range(40):
+        next(batches)
+    gc.collect()
+
+    assert sum(reference() is not None for reference in analyzer_futures) <= 4
+    batches.close()
+
+
+def test_native_pipeline_does_not_convert_past_a_missing_ordered_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_first = threading.Event()
+    later_analyzed = threading.Event()
+    later_converted = threading.Event()
+    finished = threading.Event()
+    outcomes: list[object] = []
+    original_build = _FactBatchBuilder.build
+
+    def observe_build(builder: _FactBatchBuilder, facts: object) -> object:
+        if builder.configuration.id == "build-1":
+            later_converted.set()
+        return original_build(builder, facts)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_FactBatchBuilder, "build", observe_build)
+
+    class OrderedClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            if configuration.id == "build-0":
+                assert release_first.wait(timeout=5)
+            else:
+                later_analyzed.set()
+            return []
+
+    configurations = []
+    for index in range(2):
+        source = tmp_path / f"ordered-conversion-{index}.cpp"
+        source.write_text(f"int ordered_conversion_{index} = {index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                id=f"build-{index}",
+                source_path=source,
+                directory=tmp_path,
+                arguments=("clang++", str(source)),
+                command_hash=f"hash-{index}",
+            )
+        )
+
+    batches = NativeClangIngestor(  # type: ignore[arg-type]
+        OrderedClient(), max_workers=2, max_domain_batches=2
+    ).iter_configuration_batches(tmp_path, configurations)
+
+    def consume_first() -> None:
+        try:
+            outcomes.append(next(batches))
+        except BaseException as error:  # pragma: no cover - surfaced below
+            outcomes.append(error)
+        finally:
+            finished.set()
+
+    consumer = threading.Thread(target=consume_first)
+    consumer.start()
+    assert later_analyzed.wait(timeout=2)
+    overtook = later_converted.wait(timeout=1)
+    release_first.set()
+    assert finished.wait(timeout=5)
+    consumer.join(timeout=1)
+    batches.close()
+
+    assert not overtook
+    assert len(outcomes) == 1
+    assert not isinstance(outcomes[0], BaseException)
 
 
 def test_closing_native_configuration_batches_cancels_pending_workers(tmp_path: Path) -> None:
