@@ -1435,9 +1435,7 @@ class SQLiteStore:
                         existing["magnitude"] != row["magnitude"]
                         or existing["vector"] != row["vector"]
                     ):
-                        raise RuntimeError(
-                            "equal legacy embedding inputs have different vectors"
-                        )
+                        raise RuntimeError("equal legacy embedding inputs have different vectors")
                     self._connection.execute(
                         """
                         INSERT OR IGNORE INTO embedding_vectors(

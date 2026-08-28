@@ -576,9 +576,12 @@ def test_v10_direct_upgrade_rolls_back_v11_when_v12_fails(
     connection = sqlite3.connect(database)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE name = 'summary_solution_payloads'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'summary_solution_payloads'"
+            ).fetchone()
+            is None
+        )
         assert connection.execute(
             "SELECT count(*) FROM summary_effects WHERE is_local = 0"
         ).fetchone()[0]
