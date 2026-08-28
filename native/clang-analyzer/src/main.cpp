@@ -1709,9 +1709,13 @@ private:
     // AlwaysAdd puts leaf expressions in the CFG. Reads not owned by a definition,
     // return, condition, or call still need an explicit fact, but covered leaves must
     // not be duplicated.
+    const auto explicitlyHandledExpressions = handledExpressions;
     for (const auto &[statement, anchor] : statementAnchors) {
       const auto *expression = llvm::dyn_cast<clang::Expr>(statement);
-      if (!expression || handledExpressions.count(expression->IgnoreParenImpCasts()))
+      // Fallback reads can contain other independently anchored CFG leaves. They must
+      // not suppress those leaves merely because their stable anchor comes later.
+      if (!expression ||
+          explicitlyHandledExpressions.count(expression->IgnoreParenImpCasts()))
         continue;
       if (llvm::isa<clang::DeclRefExpr, clang::MemberExpr>(expression) ||
           (llvm::isa<clang::UnaryOperator>(expression) &&

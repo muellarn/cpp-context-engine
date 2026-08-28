@@ -1144,6 +1144,45 @@ def test_indirect_target_keeps_an_indexed_redeclaration_after_an_external_declar
     _FactBatchBuilder(project.resolve(), configuration).build(facts)
 
 
+def test_nested_call_leaf_accesses_are_not_suppressed_by_fallback_order(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "main.cpp"
+    source.write_text(
+        "struct result { void visit(); };\n"
+        "struct context { result arg(int); };\n"
+        "struct handler {\n"
+        "  context ctx;\n"
+        "  void run(int id) { ctx.arg(id).visit(); }\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    database = tmp_path / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "file": str(source),
+                    "arguments": ["clang++", "-std=c++20", "-c", str(source)],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configuration = CompilationDatabase.load(database).configurations[0]
+    facts = fresh_native_client(analyzer_binary(), timeout_seconds=30).analyze(
+        tmp_path, configuration
+    )
+    accesses = {
+        fact.get("expression")
+        for fact in facts
+        if fact.get("fact") == "data_access_v1" and fact.get("kind") == "read"
+    }
+
+    assert {"ctx", "ctx.arg"} <= accesses
+
+
 @pytest.fixture(scope="module")
 def deterministic_cfg_batches():
     """Two genuinely fresh analyses shared by the CFG determinism assertions."""
