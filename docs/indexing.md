@@ -64,17 +64,24 @@ remain plain JSONL. A new client requests gzip only after a plain probe advertis
 it; a new client talking to an old companion therefore remains plain. The native
 sink suppresses duplicate sort keys before serialization and emits first-seen
 facts incrementally through a bounded gzip level-1 writer. The Python adapter
-decompresses and parses fragmented records incrementally into disk-backed
-fact-kind registries. Cross-reference validation and domain construction happen
-only after a matching successful `complete`, so malformed, cancelled, timed-out,
-or limit-exhausted responses cannot produce a durable partial batch.
+decompresses and parses fragmented records incrementally into compact,
+length-framed, disk-backed fact-kind registries. Those registries reuse already
+validated objects instead of decoding every fact from JSON a second time.
+Analyzer capacity is refilled as soon as a process completes; bounded conversion
+batches overlap in compilation-database admission order, and SQLite publication
+keeps that order. Cross-reference validation and domain construction happen only after a
+matching successful `complete`, so malformed, cancelled, timed-out, or
+limit-exhausted responses cannot produce a durable partial batch.
 
 Compressed wire bytes, decoded bytes, one decoded record, stderr, and wall time
 have independent hard limits. Exhaustion is an indexing error; relational facts
 are never truncated. Companion processes run in a killable process group and are
 joined on cancellation or failure. `CPP_CONTEXT_ANALYZER_MAX_WORKERS` is a hard
 concurrency bound and defaults conservatively to one because per-TU memory varies
-widely. The [large-TU benchmark](benchmarks/large-tu.md) documents the local KiCad
+widely. Completed registries, spool bytes, spool files, and converted domain
+batches have separate hard bounds. Their environment variables are documented in
+the README; omitted spool limits are derived from the worker and decoded-byte
+limits. The [large-TU benchmark](benchmarks/large-tu.md) documents the local KiCad
 Clipper reproduction; it is deliberately not a CI workload.
 
 ### Callsites and C++ dispatch
@@ -278,7 +285,9 @@ and translation-unit replacement. Schema v10 removes the redundant symbol snapsh
 from translation-unit membership rows; canonical symbols continue to be derived
 from the versioned build/TU `symbol_variants` snapshots.
 
-Schema v11 separates variant-to-vector references from a project-local,
+Schema v11 stores propagated interprocedural effects and return origins as bounded,
+deterministic compressed payloads while retaining relational local facts and the
+existing query API. Schema v12 separates variant-to-vector references from a project-local,
 content-addressed vector pool. Its key includes the public model, the complete
 non-secret provider configuration identity, dimension, and SHA-256 of the exact
 bounded embedding text; the text is retained to detect a hash collision. Equal
@@ -286,7 +295,7 @@ inputs across translation units or named builds therefore share one vector while
 search and stale cleanup remain variant- and build-scoped. Missing IDs, symbol
 loads, provider calls, validation, and writes are processed in fixed-size batches
 inside one transaction, followed by deterministic orphan-vector collection.
-Legacy hosted vectors are invalidated during migration because schema v10 did not
+Legacy hosted vectors are invalidated during the v12 migration because schema v11 did not
 persist their endpoint identity; local vectors retain their exact search behavior.
 
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings

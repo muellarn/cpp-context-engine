@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 from collections import Counter
 from pathlib import Path
 
 import pytest
+from native_cache import cached_native_client, fresh_native_client
 
 from cpp_context_engine.ingestion import (
     AnalyzerProtocolError,
-    NativeAnalyzerClient,
     NativeClangIngestor,
 )
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
@@ -28,23 +29,37 @@ from cpp_context_engine.storage import SQLiteStore
 from cpp_context_engine.storage.sqlite import SCHEMA_VERSION
 
 FIXTURE = Path(__file__).parent / "fixtures" / "dataflow_project"
+pytestmark = pytest.mark.native
 
 
 def _binary() -> Path:
+    configured = os.getenv("CPP_CONTEXT_TEST_ANALYZER")
     candidate = (
-        Path(__file__).parents[1] / "build" / "clang-analyzer" / ("cpp-context-clang-analyzer")
+        Path(configured)
+        if configured
+        else Path(__file__).parents[1] / "build" / "clang-analyzer" / "cpp-context-clang-analyzer"
     )
     if not candidate.is_file():
         pytest.skip("Clang analyzer companion has not been built")
     return candidate.resolve()
 
 
-def _client() -> NativeAnalyzerClient:
-    return NativeAnalyzerClient(_binary(), timeout_seconds=90)
+def _client():
+    return cached_native_client(_binary(), timeout_seconds=90)
+
+
+def _fresh_client():
+    return fresh_native_client(_binary(), timeout_seconds=90)
 
 
 def _batch(*, database: str = "compile_commands.json", variant: str = "default"):
     return NativeClangIngestor(_client()).ingest(FIXTURE, FIXTURE / database, build_variant=variant)
+
+
+def _fresh_batch(*, database: str = "compile_commands.json", variant: str = "default"):
+    return NativeClangIngestor(_fresh_client()).ingest(
+        FIXTURE, FIXTURE / database, build_variant=variant
+    )
 
 
 def _names(batch) -> dict[str, str]:
@@ -242,8 +257,8 @@ def test_partial_definition_and_const_pointer_aliases_do_not_overclaim() -> None
 
 
 def test_conservative_cases_and_budget_metadata_are_explicit_and_deterministic() -> None:
-    first = _batch()
-    second = _batch()
+    first = _fresh_batch()
+    second = _fresh_batch()
     for attribute in (
         "data_flow_analyses",
         "memory_locations",
@@ -320,7 +335,7 @@ def test_sqlite_v7_round_trip_multi_build_and_incremental_cleanup(tmp_path: Path
     database = tmp_path / "index.db"
 
     with SQLiteStore(database, project_root=project) as store:
-        indexer = ProjectIndexer(NativeClangIngestor(_client()), store)
+        indexer = ProjectIndexer(NativeClangIngestor(_fresh_client()), store)
         default_result = indexer.index(project, default.compilation_database, build_variant=default)
         alternative_result = indexer.index(
             project, alternative.compilation_database, build_variant=alternative
@@ -418,8 +433,8 @@ def test_v7_migration_is_atomic_and_forces_old_native_reindex(
 
     monkeypatch.setattr(sqlite_module, "_execute_script", original)
     with SQLiteStore(database) as store:
-        assert SCHEMA_VERSION == 11
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 11  # noqa: SLF001
+        assert SCHEMA_VERSION == 12
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
         assert (
             store._connection.execute(  # noqa: SLF001
                 "SELECT advanced_facts_complete FROM translation_units"
@@ -437,6 +452,7 @@ def test_v7_failure_after_v6_leaves_database_at_v6(
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP TABLE summary_solution_payloads;
         DROP TABLE interprocedural_flows;
         DROP TABLE call_result_bindings;
         DROP TABLE call_argument_bindings;

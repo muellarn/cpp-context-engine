@@ -571,7 +571,7 @@ def test_batched_embedding_failure_rolls_back_all_new_vectors_and_references(
         )
 
 
-def test_v11_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: Path) -> None:
+def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
     database = tmp_path / "index.db"
@@ -625,7 +625,7 @@ def test_v11_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     legacy.close()
 
     with SQLiteStore(database, project_root=root) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 11  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
         assert store.embedding_count("fixture") == 2
         assert store.embedding_vector_count("fixture") == 1
         assert store.embedding_count("openai-compatible:legacy") == 0
@@ -634,6 +634,26 @@ def test_v11_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
 
     assert [hit.symbol.variant_id for hit in hits] == sorted(variants)
     assert {hit.symbol.id for hit in hits} == {"symbol-alpha", "symbol-alpha-copy"}
+    assert all(hit.score == pytest.approx(1.0) for hit in hits)
+
+
+def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
+    database = tmp_path / "minimal-v11.db"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA user_version = 11")
+    connection.commit()
+    connection.close()
+
+    with SQLiteStore(database) as store:
+        tables = {
+            row[0]
+            for row in store._connection.execute(  # noqa: SLF001 - migration boundary
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 12  # noqa: SLF001
+
+    assert {"embedding_vectors", "variant_embeddings"} <= tables
 
 
 def test_bulk_symbol_lookup_preserves_order_duplicates_and_missing(tmp_path: Path) -> None:

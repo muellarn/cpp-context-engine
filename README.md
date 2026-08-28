@@ -168,7 +168,7 @@ Embedding vectors are content-addressed by the exact bounded text, provider/mode
 configuration, and vector dimension. Build-specific symbol variants keep separate
 references but share one bit-identical vector when those inputs match. Generation,
 validation, persistence, and missing-vector discovery run in bounded batches; a
-failed batch rolls back the complete embedding update. Schema-v10 local vectors
+failed batch rolls back the complete embedding update. Schema-v11 local vectors
 are migrated into this shared pool. Legacy hosted vectors are regenerated once
 because older databases did not retain the endpoint identity needed for safe reuse.
 
@@ -300,6 +300,10 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_ANALYZER_MAX_RECORD_BYTES` | maximum decoded JSONL record bytes | `16777216` |
 | `CPP_CONTEXT_ANALYZER_MAX_STDERR_BYTES` | maximum diagnostic bytes | `262144` |
 | `CPP_CONTEXT_ANALYZER_MAX_WORKERS` | maximum concurrent companion processes | `1` |
+| `CPP_CONTEXT_ANALYZER_MAX_SPOOL_REGISTRIES` | maximum analyzed/converting/queued TUs | `2 × workers` |
+| `CPP_CONTEXT_ANALYZER_MAX_SPOOL_BYTES` | maximum compact fact-spool bytes | `registries × decoded bytes` |
+| `CPP_CONTEXT_ANALYZER_MAX_SPOOL_FILES` | maximum fact-spool file descriptors | `registries × 64` |
+| `CPP_CONTEXT_ANALYZER_MAX_DOMAIN_BATCHES` | maximum converted TU batches awaiting SQLite | `2` |
 | `CPP_CONTEXT_MAX_TOKENS` | default packed context budget | `16000` |
 | `CPP_CONTEXT_RETRIEVAL_LIMIT` | candidates per search backend | `20` |
 | `CPP_CONTEXT_EMBEDDING_PROVIDER` | `local` or `openai` | `local` |
@@ -316,12 +320,35 @@ flag so they do not accidentally appear in shell history or process listings.
 ## Development
 
 ```bash
-python -m pip install -e '.[dev,clang,api,mcp]'
+python -m pip install -e '.[all,dev]'
 ruff format --check .
 ruff check .
 pytest
 python -m compileall -q src tests
 ```
+
+For quick iteration, run the focused Python tests without either real Clang
+backend. The native command retains companion semantics, transport, cancellation,
+timeout, malformed-stream, and determinism coverage. Run the full command before
+merging changes that cross those boundaries:
+
+```bash
+# Fast focused tests
+pytest -m 'not native and not clang'
+
+# Native companion integration tests
+pytest -m native
+
+# Complete local suite (Clang 18, no skipped tests expected)
+TMPDIR=/tmp LIBCLANG_PATH=/usr/lib/llvm-18/lib pytest
+```
+
+Immutable native fixture facts are content-keyed and reused only within one test
+session. Analyzer/protocol, fixture and compilation-database contents, relevant
+environment and client transport/limits form the identity. Process-lifetime and
+determinism checks deliberately launch fresh companions.
+The local timing method and current Ryzen 5 1600/WSL measurements are recorded in
+[Test-suite performance](docs/testing.md).
 
 Without installing, use `PYTHONPATH=src python -m cpp_context_engine --help`.
 Pytest capture can be disabled with `pytest -s` on environments whose temporary
