@@ -28,6 +28,10 @@ class AppConfig:
     analyzer_max_record_bytes: int = 16_777_216
     analyzer_max_stderr_bytes: int = 262_144
     analyzer_max_workers: int = 1
+    analyzer_max_spool_registries: int | None = None
+    analyzer_max_spool_bytes: int | None = None
+    analyzer_max_spool_files: int | None = None
+    analyzer_max_domain_batches: int = 2
     max_context_tokens: int = 16_000
     retrieval_limit: int = 20
     embedding_provider: str = "local"
@@ -104,10 +108,20 @@ class AppConfig:
                 self.analyzer_max_record_bytes,
                 self.analyzer_max_stderr_bytes,
                 self.analyzer_max_workers,
+                self.analyzer_max_domain_batches,
             )
             <= 0
         ):
             raise ValueError("analyzer timeout and byte limits must be positive")
+        if any(
+            limit is not None and limit <= 0
+            for limit in (
+                self.analyzer_max_spool_registries,
+                self.analyzer_max_spool_bytes,
+                self.analyzer_max_spool_files,
+            )
+        ):
+            raise ValueError("analyzer spool limits must be positive")
 
     @classmethod
     def from_environment(cls, *, cwd: Path | None = None) -> AppConfig:
@@ -142,6 +156,12 @@ class AppConfig:
                 "CPP_CONTEXT_ANALYZER_MAX_STDERR_BYTES", 262_144
             ),
             analyzer_max_workers=_positive_int("CPP_CONTEXT_ANALYZER_MAX_WORKERS", 1),
+            analyzer_max_spool_registries=_optional_positive_int(
+                "CPP_CONTEXT_ANALYZER_MAX_SPOOL_REGISTRIES"
+            ),
+            analyzer_max_spool_bytes=_optional_positive_int("CPP_CONTEXT_ANALYZER_MAX_SPOOL_BYTES"),
+            analyzer_max_spool_files=_optional_positive_int("CPP_CONTEXT_ANALYZER_MAX_SPOOL_FILES"),
+            analyzer_max_domain_batches=_positive_int("CPP_CONTEXT_ANALYZER_MAX_DOMAIN_BATCHES", 2),
             max_context_tokens=_positive_int("CPP_CONTEXT_MAX_TOKENS", 16_000),
             retrieval_limit=_positive_int("CPP_CONTEXT_RETRIEVAL_LIMIT", 20),
             embedding_provider=os.getenv("CPP_CONTEXT_EMBEDDING_PROVIDER", "local").casefold(),
@@ -184,6 +204,19 @@ def _positive_float(name: str, default: float) -> float:
         value = default if raw_value is None else float(raw_value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
+def _optional_positive_int(name: str) -> int | None:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
     return value

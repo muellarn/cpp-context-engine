@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import marshal
 import os
 import signal
+import struct
 import subprocess
 import tempfile
 import threading
 import time
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from io import BufferedRandom
@@ -101,6 +103,7 @@ DEFAULT_MAX_RECORD_BYTES = 16 * 1_048_576
 DEFAULT_MAX_STDERR_BYTES = 256 * 1024
 GZIP_TRANSPORT = "gzip_jsonl_v1"
 MAX_FACT_KINDS = 64
+_FRAME_HEADER = struct.Struct(">I")
 
 
 class AnalyzerUnavailableError(RuntimeError):
@@ -202,14 +205,70 @@ class _JsonlStreamDecoder:
             self._on_record(record)
 
 
-class _FactRegistry:
-    """Disk-backed fact-kind registries exposed only after successful completion."""
+class _ResourceBudget:
+    """Thread-safe hard bound shared by all registries in one ingestion pipeline."""
 
-    def __init__(self) -> None:
+    def __init__(self, limit: int, message: str) -> None:
+        if limit <= 0:
+            raise ValueError("registry resource limits must be positive")
+        self.limit = limit
+        self._message = message
+        self._used = 0
+        self._lock = threading.Lock()
+
+    @property
+    def used(self) -> int:
+        with self._lock:
+            return self._used
+
+    def acquire(self, amount: int = 1) -> None:
+        with self._lock:
+            if self._used + amount > self.limit:
+                raise AnalyzerLimitError(self._message)
+            self._used += amount
+
+    def release(self, amount: int = 1) -> None:
+        with self._lock:
+            self._used -= amount
+            if self._used < 0:  # pragma: no cover - internal invariant
+                raise RuntimeError("registry resource budget underflow")
+
+
+class _FactRegistry:
+    """Bounded compact fact-kind spools exposed only after successful analysis."""
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int = DEFAULT_MAX_DECODED_BYTES,
+        max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
+        byte_budget: _ResourceBudget | None = None,
+        fd_budget: _ResourceBudget | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> None:
+        if min(max_bytes, max_record_bytes) <= 0:
+            raise ValueError("registry byte limits must be positive")
         self._directory = "/tmp" if os.name != "nt" and Path("/tmp").is_dir() else None
         self._files: dict[str, BufferedRandom] = {}
+        self._max_bytes = max_bytes
+        self._max_record_bytes = max_record_bytes
+        self._byte_budget = byte_budget or _ResourceBudget(
+            max_bytes, "analyzer pipeline exceeded the spool byte limit"
+        )
+        self._fd_budget = fd_budget or _ResourceBudget(
+            MAX_FACT_KINDS, "analyzer pipeline exceeded the spool file limit"
+        )
+        self._cancelled = cancelled
+        self._bytes = 0
+        self._closed = False
+
+    @property
+    def byte_count(self) -> int:
+        return self._bytes
 
     def add(self, fact: Mapping[str, Any]) -> None:
+        if self._closed:
+            raise RuntimeError("fact registry is closed")
         fact_kind = fact.get("fact")
         if not isinstance(fact_kind, str) or not fact_kind:
             raise AnalyzerProtocolError("analyzer fact has no valid kind")
@@ -219,13 +278,32 @@ class _FactRegistry:
             # descriptors long before the decoded-byte limit is reached.
             if len(self._files) >= MAX_FACT_KINDS:
                 raise AnalyzerLimitError("analyzer exceeded the fact-kind registry limit")
-            destination = tempfile.TemporaryFile(  # noqa: SIM115 - registry owns lifetime
-                mode="w+b", dir=self._directory
-            )
+            self._fd_budget.acquire()
+            try:
+                destination = tempfile.TemporaryFile(  # noqa: SIM115 - registry owns lifetime
+                    mode="w+b", dir=self._directory
+                )
+            except BaseException:
+                self._fd_budget.release()
+                raise
             self._files[fact_kind] = destination
-        destination.write(
-            json.dumps(fact, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
-        )
+        try:
+            payload = marshal.dumps(dict(fact), 4)
+        except (TypeError, ValueError) as error:
+            raise AnalyzerProtocolError("analyzer fact contains unsupported values") from error
+        if len(payload) > self._max_record_bytes:
+            raise AnalyzerLimitError("analyzer exceeded the record limit")
+        frame_bytes = _FRAME_HEADER.size + len(payload)
+        if self._bytes + frame_bytes > self._max_bytes:
+            raise AnalyzerLimitError("analyzer exceeded the registry spool limit")
+        self._byte_budget.acquire(frame_bytes)
+        try:
+            destination.write(_FRAME_HEADER.pack(len(payload)))
+            destination.write(payload)
+        except BaseException:
+            self._byte_budget.release(frame_bytes)
+            raise
+        self._bytes += frame_bytes
 
     def __iter__(self) -> Iterator[Mapping[str, Any]]:
         for fact_kind in sorted(self._files):
@@ -236,16 +314,35 @@ class _FactRegistry:
         if source is None:
             return
         source.seek(0)
-        while line := source.readline():
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise AnalyzerProtocolError("analyzer JSONL records must be objects")
+        while header := source.read(_FRAME_HEADER.size):
+            if self._cancelled is not None and self._cancelled.is_set():
+                raise AnalyzerLimitError("analyzer analysis was cancelled")
+            if len(header) != _FRAME_HEADER.size:
+                raise AnalyzerProtocolError("fact registry has a truncated frame header")
+            (size,) = _FRAME_HEADER.unpack(header)
+            if size == 0 or size > self._max_record_bytes:
+                raise AnalyzerProtocolError("fact registry has an invalid frame length")
+            payload = source.read(size)
+            if len(payload) != size:
+                raise AnalyzerProtocolError("fact registry has a truncated frame")
+            try:
+                record = marshal.loads(payload)
+            except (EOFError, TypeError, ValueError) as error:
+                raise AnalyzerProtocolError("fact registry contains an invalid frame") from error
+            if not isinstance(record, dict) or record.get("fact") != fact_kind:
+                raise AnalyzerProtocolError("fact registry contains an invalid fact record")
             yield record
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         for source in self._files.values():
             source.close()
+            self._fd_budget.release()
         self._files.clear()
+        self._byte_budget.release(self._bytes)
+        self._bytes = 0
 
     def __enter__(self) -> _FactRegistry:
         return self
@@ -605,22 +702,44 @@ class NativeAnalyzerClient:
         return records
 
 
-def _raise_completed_failure(futures: Iterable[Future[IngestionBatch]]) -> None:
-    """Surface a failed out-of-order worker before waiting on an earlier TU."""
-
-    for future in futures:
-        if future.done() and not future.cancelled() and future.exception() is not None:
-            future.result()
-
-
 class NativeClangIngestor:
     """Convert complete companion facts into the existing durable domain model."""
 
-    def __init__(self, client: NativeAnalyzerClient, *, max_workers: int = 1) -> None:
-        if max_workers <= 0:
-            raise ValueError("native analyzer worker bound must be positive")
+    def __init__(
+        self,
+        client: NativeAnalyzerClient,
+        *,
+        max_workers: int = 1,
+        max_spool_registries: int | None = None,
+        max_spool_bytes: int | None = None,
+        max_spool_fds: int | None = None,
+        max_domain_batches: int = 2,
+    ) -> None:
+        registry_limit = max_workers * 2 if max_spool_registries is None else max_spool_registries
+        decoded_limit = int(getattr(client, "max_decoded_bytes", DEFAULT_MAX_DECODED_BYTES))
+        spool_byte_limit = (
+            registry_limit * decoded_limit if max_spool_bytes is None else max_spool_bytes
+        )
+        spool_fd_limit = registry_limit * MAX_FACT_KINDS if max_spool_fds is None else max_spool_fds
+        if (
+            min(
+                max_workers,
+                registry_limit,
+                spool_byte_limit,
+                spool_fd_limit,
+                max_domain_batches,
+            )
+            <= 0
+        ):
+            raise ValueError("native analyzer pipeline limits must be positive")
+        if registry_limit < max_workers:
+            raise ValueError("registry bound must cover every analyzer worker")
         self.client = client
         self.max_workers = max_workers
+        self.max_spool_registries = registry_limit
+        self.max_spool_bytes = spool_byte_limit
+        self.max_spool_fds = spool_fd_limit
+        self.max_domain_batches = min(max_domain_batches, registry_limit)
 
     analysis_backend = "clang-libtooling"
     advanced_facts_complete = True
@@ -648,62 +767,212 @@ class NativeClangIngestor:
     def iter_configuration_batches(
         self, project_root: Path, configurations: Iterable[BuildConfiguration]
     ) -> Iterator[IngestionBatch]:
-        """Yield TU batches in input order with a bounded parallel reorder window."""
+        """Pipeline analysis and conversion while publishing TU batches in input order."""
 
         root = project_root.resolve(strict=False)
         self.client.probe()
         selected = tuple(configurations)
-        cancelled = threading.Event()
-
-        def analyze(configuration: BuildConfiguration) -> IngestionBatch:
-            builder = _FactBatchBuilder(root, configuration)
-            analyze_stream = getattr(self.client, "analyze_stream", None)
-            if analyze_stream is None:
-                return builder.build(self.client.analyze(root, configuration))
-            with _FactRegistry() as facts:
-                analyze_stream(root, configuration, facts.add, cancelled=cancelled)
-                return builder.build(facts)
-
-        # Each configuration is a separate companion process. Submit only one fixed
-        # window and refill it after the next ordered batch has been consumed. This
-        # prevents a slow early TU from retaining an unbounded tail of completed TUs.
-        worker_count = min(self.max_workers, max(1, len(selected)))
         if not selected:
             return
-        executor = ThreadPoolExecutor(max_workers=worker_count)
-        futures: dict[int, Future[IngestionBatch]] = {
-            index: executor.submit(analyze, configuration)
-            for index, configuration in enumerate(selected[:worker_count])
-        }
-        next_configuration = worker_count
+        cancelled = threading.Event()
+        spool_bytes = _ResourceBudget(
+            self.max_spool_bytes, "analyzer pipeline exceeded the spool byte limit"
+        )
+        spool_fds = _ResourceBudget(
+            self.max_spool_fds, "analyzer pipeline exceeded the spool file limit"
+        )
+        record_limit = int(getattr(self.client, "max_record_bytes", DEFAULT_MAX_RECORD_BYTES))
+        # Protocol decoded bytes are already bounded before facts reach this
+        # adapter. The compact framing adds four bytes per fact, so only the
+        # independent global spool budget may bound its ephemeral representation.
+        registry_byte_limit = self.max_spool_bytes
+
+        def analyze(configuration: BuildConfiguration) -> _FactRegistry:
+            facts = _FactRegistry(
+                max_bytes=registry_byte_limit,
+                max_record_bytes=record_limit,
+                byte_budget=spool_bytes,
+                fd_budget=spool_fds,
+                cancelled=cancelled,
+            )
+            analyze_stream = getattr(self.client, "analyze_stream", None)
+            try:
+                if analyze_stream is None:
+                    for fact in self.client.analyze(root, configuration):
+                        facts.add(fact)
+                else:
+                    analyze_stream(root, configuration, facts.add, cancelled=cancelled)
+                return facts
+            except BaseException:
+                facts.close()
+                raise
+
+        def convert(index: int, facts: _FactRegistry) -> IngestionBatch:
+            try:
+                return _FactBatchBuilder(root, selected[index]).build(facts)
+            finally:
+                facts.close()
+
+        worker_count = min(self.max_workers, max(1, len(selected)))
+        converter_count = min(self.max_domain_batches, len(selected))
+        analyzer_executor = ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="cpp-context-analyzer"
+        )
+        converter_executor = ThreadPoolExecutor(
+            max_workers=converter_count, thread_name_prefix="cpp-context-converter"
+        )
+        condition = threading.Condition()
+        analysis_futures: dict[Future[_FactRegistry], int] = {}
+        pending_registries: dict[int, _FactRegistry] = {}
+        conversion_futures: dict[int, Future[IngestionBatch]] = {}
+        conversion_registries: dict[int, _FactRegistry] = {}
+        next_configuration = 0
+        next_conversion = 0
+        held_registries = 0
+        stopped = False
+        failure: BaseException | None = None
+        completion_revision = 0
+
+        def wake(_future: Future[object]) -> None:
+            nonlocal completion_revision
+            with condition:
+                completion_revision += 1
+                condition.notify_all()
+
+        def coordinate() -> None:
+            nonlocal failure, held_registries, next_configuration, next_conversion, stopped
+            try:
+                with condition:
+                    while True:
+                        observed_revision = completion_revision
+                        if stopped:
+                            return
+
+                        completed_analysis = sorted(
+                            (
+                                (index, future)
+                                for future, index in analysis_futures.items()
+                                if future.done()
+                            ),
+                            key=lambda item: item[0],
+                        )
+                        completed_failures: list[tuple[int, BaseException]] = []
+                        for index, future in completed_analysis:
+                            analysis_futures.pop(future)
+                            if future.cancelled():
+                                continue
+                            error = future.exception()
+                            if error is not None:
+                                completed_failures.append((index, error))
+                            else:
+                                pending_registries[index] = future.result()
+
+                        for index, future in sorted(conversion_futures.items()):
+                            if future.done() and not future.cancelled():
+                                error = future.exception()
+                                if error is not None:
+                                    completed_failures.append((index, error))
+
+                        if completed_failures:
+                            # Select the earliest CDB item among failures observed in
+                            # the same completion interval, then preserve that cause.
+                            failure = min(completed_failures, key=lambda item: item[0])[1]
+                            cancelled.set()
+                            for future in analysis_futures:
+                                future.cancel()
+                            for future in conversion_futures.values():
+                                future.cancel()
+                            condition.notify_all()
+                            return
+
+                        while (
+                            next_conversion in pending_registries
+                            and len(conversion_futures) < self.max_domain_batches
+                        ):
+                            index = next_conversion
+                            next_conversion += 1
+                            registry = pending_registries.pop(index)
+                            conversion_registries[index] = registry
+                            converted = converter_executor.submit(convert, index, registry)
+                            conversion_futures[index] = converted
+                            converted.add_done_callback(wake)
+
+                        while (
+                            next_configuration < len(selected)
+                            and len(analysis_futures) < worker_count
+                            and held_registries < self.max_spool_registries
+                        ):
+                            index = next_configuration
+                            next_configuration += 1
+                            analyzed = analyzer_executor.submit(analyze, selected[index])
+                            analysis_futures[analyzed] = index
+                            held_registries += 1
+                            analyzed.add_done_callback(wake)
+
+                        analyses_finished = (
+                            next_configuration == len(selected) and not analysis_futures
+                        )
+                        conversions_finished = not pending_registries and all(
+                            future.done() for future in conversion_futures.values()
+                        )
+                        if analyses_finished and conversions_finished:
+                            return
+                        # A tiny worker can complete while it is being registered
+                        # above. Its synchronous callback cannot wake a wait that
+                        # has not started yet, so re-scan instead of losing it.
+                        if completion_revision == observed_revision:
+                            condition.wait()
+            except BaseException as error:  # pragma: no cover - defensive scheduler boundary
+                with condition:
+                    if failure is None:
+                        failure = error
+                    cancelled.set()
+                    condition.notify_all()
+
+        coordinator = threading.Thread(target=coordinate, name="cpp-context-pipeline", daemon=True)
+        coordinator.start()
         try:
             for index in range(len(selected)):
-                current = futures[index]
-                watched = set(futures.values())
-                while not current.done():
-                    completed, _pending = wait(watched, return_when=FIRST_COMPLETED)
-                    # Dict insertion order selects the earliest input failure if
-                    # several workers fail in the same completion interval.
-                    _raise_completed_failure(futures.values())
-                    watched.difference_update(completed)
-                _raise_completed_failure(futures.values())
-                batch = futures.pop(index).result()
+                with condition:
+                    while True:
+                        if failure is not None:
+                            raise failure
+                        current = conversion_futures.get(index)
+                        if current is not None and current.done():
+                            batch = current.result()
+                            break
+                        condition.wait()
                 try:
                     yield batch
                 finally:
-                    # A suspended generator otherwise keeps this completed batch
-                    # alive while waiting for the following analyzer process.
+                    with condition:
+                        conversion_futures.pop(index, None)
+                        conversion_registries.pop(index, None)
+                        held_registries -= 1
+                        condition.notify_all()
                     del batch
-                if next_configuration < len(selected):
-                    futures[next_configuration] = executor.submit(
-                        analyze, selected[next_configuration]
-                    )
-                    next_configuration += 1
         finally:
-            cancelled.set()
-            for future in futures.values():
-                future.cancel()
-            executor.shutdown(wait=True, cancel_futures=True)
+            with condition:
+                stopped = True
+                cancelled.set()
+                for future in analysis_futures:
+                    future.cancel()
+                for future in conversion_futures.values():
+                    future.cancel()
+                condition.notify_all()
+            coordinator.join()
+            analyzer_executor.shutdown(wait=True, cancel_futures=True)
+            converter_executor.shutdown(wait=True, cancel_futures=True)
+            # A future can complete between the coordinator stopping and executor
+            # shutdown. Close every registry idempotently so all byte/FD budgets
+            # and unnamed temporary files are released on every exit path.
+            for registry in pending_registries.values():
+                registry.close()
+            for registry in conversion_registries.values():
+                registry.close()
+            for future in analysis_futures:
+                if future.done() and not future.cancelled() and future.exception() is None:
+                    future.result().close()
 
     @staticmethod
     def _merge_batches(batches: Sequence[IngestionBatch]) -> IngestionBatch:

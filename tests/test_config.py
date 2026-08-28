@@ -33,6 +33,10 @@ def test_environment_loads_native_analyzer_and_limits(tmp_path, monkeypatch) -> 
     monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_DECODED_BYTES", "8192")
     monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_RECORD_BYTES", "2048")
     monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_WORKERS", "3")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_SPOOL_REGISTRIES", "7")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_SPOOL_BYTES", "65536")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_SPOOL_FILES", "128")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_DOMAIN_BATCHES", "2")
 
     config = AppConfig.from_environment(cwd=tmp_path)
 
@@ -42,6 +46,10 @@ def test_environment_loads_native_analyzer_and_limits(tmp_path, monkeypatch) -> 
     assert config.analyzer_max_decoded_bytes == 8192
     assert config.analyzer_max_record_bytes == 2048
     assert config.analyzer_max_workers == 3
+    assert config.analyzer_max_spool_registries == 7
+    assert config.analyzer_max_spool_bytes == 65536
+    assert config.analyzer_max_spool_files == 128
+    assert config.analyzer_max_domain_batches == 2
 
 
 def test_environment_loads_provider_configuration_without_exposing_secrets(
