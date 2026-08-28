@@ -118,6 +118,7 @@ def _fake_index(config: AppConfig) -> IndexOperationResult:
         ),
         embedded_symbols=0,
         embedding_model="fixture-local",
+        index_profile=config.index_profile,
     )
 
 
@@ -156,7 +157,11 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
                 "callees",
                 "ask_code",
             }
-            assert tools["index_project"].input_schema["properties"] == {}
+            profile_schema = tools["index_project"].input_schema["properties"]["profile"]
+            assert "$ref" in json.dumps(profile_schema)
+            rendered_profile_schema = json.dumps(tools["index_project"].input_schema)
+            assert "full" in rendered_profile_schema
+            assert "navigation" in rendered_profile_schema
             for tool in tools.values():
                 assert tool.output_schema is not None
                 assert tool.annotations is not None
@@ -172,10 +177,11 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
             assert str(tmp_path) not in missing.content[0].text
             assert "index_project" in missing.content[0].text
 
-            indexed = await client.call_tool("index_project", {})
+            indexed = await client.call_tool("index_project", {"profile": "navigation"})
             assert not indexed.is_error
             assert indexed.structured_content is not None
             assert indexed.structured_content["indexed_symbols"] == 2
+            assert indexed.structured_content["index_profile"] == "navigation"
 
             searched = await client.call_tool(
                 "search_code",

@@ -58,6 +58,25 @@ handshake must include `function_cfg_v1`; `cpp-context doctor` exposes that as
 The `intraprocedural_dataflow_v1` and `points_to_v1` capabilities similarly
 produce `data_flow_facts_available=true`.
 
+### Index profiles and coverage
+
+`full` remains the default profile and retains all existing facts. The explicit
+`navigation` profile is negotiated through the optional `analysis_profiles_v1`
+capability without changing protocol version 5. Full requests omit the profile
+field and therefore remain compatible with older companions; navigation fails
+before analysis if the companion does not advertise profile support.
+
+Navigation emits only project/build/TU and dependency state, files/includes,
+symbols, occurrences, semantic edges, callsites, call targets, and the inputs
+used for the unchanged embedding/search path. It emits no CFG, data-flow,
+summary, binding, or interprocedural-flow facts. Schema v13 records the selected
+profile on each build and translation unit plus independent navigation, CFG,
+data-flow, and summary coverage flags. A profile transition reindexes affected
+translation units in the normal atomic replacement transaction, so a failed
+transition preserves the prior generation and a successful transition cannot
+leave stale deep rows visible. Deep API and MCP queries inspect this coverage and
+return a structured unavailable result when the selected build scope is not deep.
+
 The handshake advertises optional `gzip_jsonl_v1` transport support without
 changing protocol version 5, fact schemas, or stable IDs. Probes and old clients
 remain plain JSONL. A new client requests gzip only after a plain probe advertised
@@ -297,6 +316,18 @@ loads, provider calls, validation, and writes are processed in fixed-size batche
 inside one transaction, followed by deterministic orphan-vector collection.
 Legacy hosted vectors are invalidated during the v12 migration because schema v11 did not
 persist their endpoint identity; local vectors retain their exact search behavior.
+
+Schema v13 adds explicit build/TU profile and fact-family coverage. Legacy native
+rows are migrated as `full` only where their prior advanced-completeness marker
+proved deep coverage; other rows remain explicitly incomplete.
+
+Schema v14 stores each canonical little-endian Float64 embedding either raw or,
+when it is strictly smaller, with deterministic zlib level-3 compression. Search
+decodes to the same canonical bytes, so cosine scores and tie ordering do not
+change. Migration validates every bounded vector and reference atomically. SQLite
+does not return freed pages to the filesystem automatically; to reclaim physical
+space in an existing migrated database, stop all users, make a verified backup,
+and run an explicit `VACUUM`. Fresh databases need no compaction step.
 
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by content, model/configuration identity, and dimension. `SQLiteVectorSearch` accepts any provider

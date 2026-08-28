@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from cpp_context_engine.config import AppConfig
+from cpp_context_engine.models import IndexProfile
 
 
 def test_environment_configuration_uses_project_local_index(tmp_path, monkeypatch) -> None:
@@ -16,6 +17,15 @@ def test_environment_configuration_uses_project_local_index(tmp_path, monkeypatc
     assert config.database_path == tmp_path / ".cpp-context" / "index.db"
     assert config.compilation_database == tmp_path / "build" / "compile_commands.json"
     assert config.embedding_provider == "local"
+    assert config.index_profile is IndexProfile.FULL
+
+
+def test_environment_selects_navigation_profile_explicitly(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CPP_CONTEXT_INDEX_PROFILE", "navigation")
+
+    config = AppConfig.from_environment(cwd=tmp_path)
+
+    assert config.index_profile is IndexProfile.NAVIGATION
 
 
 def test_environment_configuration_rejects_non_positive_limit(tmp_path, monkeypatch) -> None:

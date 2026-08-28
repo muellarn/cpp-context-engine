@@ -78,7 +78,7 @@ def _environment_identity() -> dict[str, str]:
     }
 
 
-def _client_identity(client: NativeAnalyzerClient) -> dict[str, int | float | bool]:
+def _client_identity(client: NativeAnalyzerClient) -> dict[str, int | float | bool | str]:
     return {
         name: getattr(client, name)
         for name in (
@@ -90,7 +90,7 @@ def _client_identity(client: NativeAnalyzerClient) -> dict[str, int | float | bo
             "max_stderr_bytes",
             "prefer_compression",
         )
-    }
+    } | {"profile": client.profile.value}
 
 
 def _relocate_argument(value: str, original_root: Path, staged_root: Path) -> str:

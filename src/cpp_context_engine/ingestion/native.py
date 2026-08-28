@@ -52,6 +52,7 @@ from cpp_context_engine.models import (
     FunctionSummary,
     GraphEdge,
     GraphRelation,
+    IndexProfile,
     MacroExpansionFrame,
     MemoryLocation,
     MemoryLocationKind,
@@ -102,6 +103,7 @@ DEFAULT_MAX_DECODED_BYTES = 256 * 1_048_576
 DEFAULT_MAX_RECORD_BYTES = 16 * 1_048_576
 DEFAULT_MAX_STDERR_BYTES = 256 * 1024
 GZIP_TRANSPORT = "gzip_jsonl_v1"
+PROFILE_CAPABILITY = "analysis_profiles_v1"
 MAX_FACT_KINDS = 64
 _FRAME_HEADER = struct.Struct(">I")
 
@@ -393,6 +395,7 @@ class NativeAnalyzerClient:
         max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
         max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
         prefer_compression: bool = True,
+        profile: IndexProfile = IndexProfile.FULL,
     ) -> None:
         self.binary = binary.expanduser().resolve(strict=False)
         if (
@@ -414,6 +417,7 @@ class NativeAnalyzerClient:
         self.max_record_bytes = max_record_bytes
         self.max_stderr_bytes = max_stderr_bytes
         self.prefer_compression = prefer_compression
+        self.profile = IndexProfile(profile)
         self._info: AnalyzerInfo | None = None
 
     def probe(self, *, refresh: bool = False) -> AnalyzerInfo:
@@ -475,6 +479,8 @@ class NativeAnalyzerClient:
         """Validate one response while forwarding facts without retaining raw output."""
 
         info = self.probe()
+        if self.profile is IndexProfile.NAVIGATION and PROFILE_CAPABILITY not in info.capabilities:
+            raise AnalyzerProtocolError("analyzer does not support the navigation profile")
         unit_id = translation_unit_id(configuration)
         transport = (
             GZIP_TRANSPORT
@@ -489,6 +495,9 @@ class NativeAnalyzerClient:
             "directory": str(configuration.directory),
             "arguments": list(libclang_arguments(configuration)),
         }
+        # Omit the default so existing protocol-v5 companions keep accepting full requests.
+        if self.profile is IndexProfile.NAVIGATION:
+            request["profile"] = self.profile.value
         state = "hello"
 
         def accept(record: dict[str, Any]) -> None:
@@ -714,6 +723,7 @@ class NativeClangIngestor:
         max_spool_bytes: int | None = None,
         max_spool_fds: int | None = None,
         max_domain_batches: int = 2,
+        profile: IndexProfile = IndexProfile.FULL,
     ) -> None:
         registry_limit = max_workers * 2 if max_spool_registries is None else max_spool_registries
         decoded_limit = int(getattr(client, "max_decoded_bytes", DEFAULT_MAX_DECODED_BYTES))
@@ -734,15 +744,20 @@ class NativeClangIngestor:
             raise ValueError("native analyzer pipeline limits must be positive")
         if registry_limit < max_workers:
             raise ValueError("registry bound must cover every analyzer worker")
+        selected_profile = IndexProfile(profile)
+        client_profile = IndexProfile(getattr(client, "profile", selected_profile))
+        if client_profile is not selected_profile:
+            raise ValueError("native analyzer client and ingestor profiles must match")
         self.client = client
         self.max_workers = max_workers
         self.max_spool_registries = registry_limit
         self.max_spool_bytes = spool_byte_limit
         self.max_spool_fds = spool_fd_limit
         self.max_domain_batches = min(max_domain_batches, registry_limit)
+        self.profile = selected_profile
+        self.advanced_facts_complete = self.profile is IndexProfile.FULL
 
     analysis_backend = "clang-libtooling"
-    advanced_facts_complete = True
 
     @property
     def analyzer_info(self) -> AnalyzerInfo:
@@ -762,7 +777,7 @@ class NativeClangIngestor:
         self, project_root: Path, configurations: Iterable[BuildConfiguration]
     ) -> IngestionBatch:
         batches = list(self.iter_configuration_batches(project_root, configurations))
-        return self._merge_batches(batches)
+        return self._merge_batches(batches, profile=self.profile)
 
     def iter_configuration_batches(
         self, project_root: Path, configurations: Iterable[BuildConfiguration]
@@ -809,7 +824,7 @@ class NativeClangIngestor:
 
         def convert(index: int, facts: _FactRegistry) -> IngestionBatch:
             try:
-                return _FactBatchBuilder(root, selected[index]).build(facts)
+                return _FactBatchBuilder(root, selected[index], self.profile).build(facts)
             finally:
                 facts.close()
 
@@ -975,7 +990,9 @@ class NativeClangIngestor:
                     future.result().close()
 
     @staticmethod
-    def _merge_batches(batches: Sequence[IngestionBatch]) -> IngestionBatch:
+    def _merge_batches(
+        batches: Sequence[IngestionBatch], *, profile: IndexProfile = IndexProfile.FULL
+    ) -> IngestionBatch:
         callsites = tuple(site for batch in batches for site in batch.callsites)
         call_targets = tuple(target for batch in batches for target in batch.call_targets)
         all_edges = tuple(edge for batch in batches for edge in batch.edges)
@@ -1018,6 +1035,8 @@ class NativeClangIngestor:
                 binding for batch in batches for binding in batch.call_result_bindings
             ),
         )
+        if profile is IndexProfile.NAVIGATION:
+            return inputs
         solution = solve_interprocedural(
             inputs.function_summaries,
             inputs.summary_effects,
@@ -1037,9 +1056,15 @@ class NativeClangIngestor:
 
 
 class _FactBatchBuilder:
-    def __init__(self, root: Path, configuration: BuildConfiguration) -> None:
+    def __init__(
+        self,
+        root: Path,
+        configuration: BuildConfiguration,
+        profile: IndexProfile = IndexProfile.FULL,
+    ) -> None:
         self.root = root
         self.configuration = configuration
+        self.profile = IndexProfile(profile)
         self.unit_id = translation_unit_id(configuration)
         self.symbols: dict[str, CodeSymbol] = {}
         self.keys: dict[str, str] = {}
@@ -1081,12 +1106,17 @@ class _FactBatchBuilder:
                 edge = self._edge_fact(fact)
                 if edge is not None:
                     edges[edge.id] = edge
-        cfg_graphs, cfg_blocks, cfg_elements, cfg_edges = self._cfg_facts(facts)
         callsites, call_targets = self._call_facts(facts)
-        analyses, locations, accesses, evidence = self._data_flow_facts(facts)
-        summaries, effects, origins, argument_bindings, result_bindings = (
-            self._interprocedural_facts(facts)
-        )
+        if self.profile is IndexProfile.FULL:
+            cfg_graphs, cfg_blocks, cfg_elements, cfg_edges = self._cfg_facts(facts)
+            analyses, locations, accesses, evidence = self._data_flow_facts(facts)
+            summaries, effects, origins, argument_bindings, result_bindings = (
+                self._interprocedural_facts(facts)
+            )
+        else:
+            cfg_graphs = cfg_blocks = cfg_elements = cfg_edges = ()
+            analyses = locations = accesses = evidence = ()
+            summaries = effects = origins = argument_bindings = result_bindings = ()
         dependencies = tuple(
             (path, _hash_bytes(path.read_bytes())) for path in sorted(set(self.files.values()))
         )
@@ -1098,7 +1128,12 @@ class _FactBatchBuilder:
             dependencies=dependencies,
             build_variant=self.configuration.build_variant,
             analysis_backend=NativeClangIngestor.analysis_backend,
-            advanced_facts_complete=NativeClangIngestor.advanced_facts_complete,
+            advanced_facts_complete=self.profile is IndexProfile.FULL,
+            index_profile=self.profile,
+            navigation_facts_complete=True,
+            cfg_facts_complete=self.profile is IndexProfile.FULL,
+            data_flow_facts_complete=self.profile is IndexProfile.FULL,
+            summary_facts_complete=self.profile is IndexProfile.FULL,
         )
         return IngestionBatch(
             build_configurations=(self.configuration,),
@@ -2050,6 +2085,7 @@ class _FactBatchBuilder:
         if not isinstance(metadata_raw, dict):
             raise AnalyzerProtocolError("symbol metadata must be an object")
         metadata = dict(metadata_raw)
+        metadata.pop("advanced_facts_complete", None)
         metadata["analyzer_protocol"] = PROTOCOL_VERSION
         metadata["analyzer_clang_major"] = REQUIRED_CLANG_MAJOR
         if key.startswith("usr:"):

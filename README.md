@@ -93,6 +93,15 @@ are skipped. `search --json` returns stable symbol IDs, source files and line
 ranges, fused scores, selection reasons, and every code-graph hop used to connect
 context. It is fully local by default.
 
+The default `full` profile is unchanged. For a navigation-first index, explicitly
+select `--profile navigation` (or pass `profile="navigation"` to the MCP
+`index_project` tool). It preserves files, includes, symbols, references, graph
+edges, calls, targets, embeddings, and ranking, while omitting CFG, data-flow,
+summary, and binding rows. Coverage is stored per translation unit and build;
+deep tools return a structured unavailable result rather than treating omitted
+facts as a complete empty analysis. Switching profiles is an incremental,
+transactional reindex that removes stale deep facts.
+
 ### Multiple build variants
 
 Index each relevant compilation database under a stable operator-owned name:
@@ -291,6 +300,7 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_COMPILE_COMMANDS` | compilation database | `<project>/build/compile_commands.json` |
 | `CPP_CONTEXT_BUILDS` | comma-separated named databases (`NAME=PATH`) | unset |
 | `CPP_CONTEXT_BUILD_SCOPE` | comma-separated query/MCP build names | `default` |
+| `CPP_CONTEXT_INDEX_PROFILE` | indexing profile: `full` or opt-in `navigation` | `full` |
 | `LIBCLANG_LIBRARY_FILE` | exact compatible native libclang | auto-discovered |
 | `CPP_CONTEXT_CLANG_ANALYZER` | Clang-18 LibTooling companion executable | unset (baseline mode) |
 | `CPP_CONTEXT_ANALYZER_TIMEOUT` | per-companion wall timeout in seconds | `75` |
@@ -342,6 +352,9 @@ pytest -m native
 # Complete local suite (Clang 18, no skipped tests expected)
 TMPDIR=/tmp LIBCLANG_PATH=/usr/lib/llvm-18/lib pytest
 ```
+
+The complete local suite has a hard 3:00-minute acceptance limit. Run it once in
+an isolated environment; exceeding 180 seconds is a test-performance failure.
 
 Immutable native fixture facts are content-keyed and reused only within one test
 session. Analyzer/protocol, fixture and compilation-database contents, relevant

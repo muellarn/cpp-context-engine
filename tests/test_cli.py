@@ -5,6 +5,7 @@ import json
 import pytest
 
 from cpp_context_engine.cli import main
+from cpp_context_engine.models import IndexProfile
 
 
 def test_main_without_command_prints_help(capsys) -> None:
@@ -67,3 +68,17 @@ def test_mcp_subcommand_dispatches_without_secret_flags(tmp_path, monkeypatch) -
 
     assert main(["mcp"]) == 0
     assert observed == {"project": tmp_path, "transport": "stdio"}
+
+
+def test_index_accepts_explicit_navigation_profile(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    observed = {}
+
+    def run_index(config, *, as_json):
+        observed["profile"] = config.index_profile
+        return 0
+
+    monkeypatch.setattr("cpp_context_engine.cli._run_index", run_index)
+
+    assert main(["index", "--profile", "navigation"]) == 0
+    assert observed == {"profile": IndexProfile.NAVIGATION}

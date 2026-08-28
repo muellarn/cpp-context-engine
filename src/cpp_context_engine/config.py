@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from cpp_context_engine.models import BuildScope, BuildVariant
+from cpp_context_engine.models import BuildScope, BuildVariant, IndexProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +19,7 @@ class AppConfig:
     compilation_database: Path | None = None
     build_variants: tuple[BuildVariant, ...] = ()
     build_scope: BuildScope = field(default_factory=BuildScope.single)
+    index_profile: IndexProfile = IndexProfile.FULL
     libclang_library_file: Path | None = None
     clang_analyzer_path: Path | None = None
     analyzer_timeout_seconds: float = 75.0
@@ -85,6 +86,10 @@ class AppConfig:
             )
         if self.embedding_provider not in {"local", "openai"}:
             raise ValueError("embedding provider must be 'local' or 'openai'")
+        try:
+            object.__setattr__(self, "index_profile", IndexProfile(self.index_profile))
+        except ValueError as error:
+            raise ValueError("index profile must be 'full' or 'navigation'") from error
         if (
             min(
                 self.max_context_tokens,
@@ -137,6 +142,7 @@ class AppConfig:
             compilation_database=_optional_path_env("CPP_CONTEXT_COMPILE_COMMANDS"),
             build_variants=_build_variants_env(),
             build_scope=_build_scope_env(),
+            index_profile=_index_profile_env(),
             libclang_library_file=_optional_path_env("LIBCLANG_LIBRARY_FILE"),
             clang_analyzer_path=_optional_path_env("CPP_CONTEXT_CLANG_ANALYZER"),
             analyzer_timeout_seconds=_positive_float("CPP_CONTEXT_ANALYZER_TIMEOUT", 75.0),
@@ -238,3 +244,11 @@ def _build_variants_env() -> tuple[BuildVariant, ...]:
 def _build_scope_env() -> BuildScope:
     raw = os.getenv("CPP_CONTEXT_BUILD_SCOPE", "").strip()
     return BuildScope(tuple(raw.split(","))) if raw else BuildScope.single()
+
+
+def _index_profile_env() -> IndexProfile:
+    raw = os.getenv("CPP_CONTEXT_INDEX_PROFILE", IndexProfile.FULL.value).strip().casefold()
+    try:
+        return IndexProfile(raw)
+    except ValueError as error:
+        raise ValueError("CPP_CONTEXT_INDEX_PROFILE must be 'full' or 'navigation'") from error

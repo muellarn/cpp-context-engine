@@ -15,7 +15,7 @@ from typing import Any
 from cpp_context_engine import __version__
 from cpp_context_engine.api import AnswerRequest, CfgRequest, FlowRequest, QueryRequest
 from cpp_context_engine.config import AppConfig
-from cpp_context_engine.models import BuildScope, BuildVariant
+from cpp_context_engine.models import BuildScope, BuildVariant, IndexProfile
 from cpp_context_engine.runtime import build_runtime, index_project
 from cpp_context_engine.storage import SQLiteStore
 
@@ -131,6 +131,9 @@ def _add_project_options(
         parser.add_argument("--project", type=Path, help="C++ project root")
     parser.add_argument("--db", type=Path, help="SQLite index path")
     if include_compile_commands:
+        parser.add_argument(
+            "--profile", choices=tuple(IndexProfile), help="index profile (default: full)"
+        )
         parser.add_argument("--compile-commands", type=Path, help="path to compile_commands.json")
         parser.add_argument("--libclang", type=Path, help="path to compatible libclang")
         parser.add_argument(
@@ -202,6 +205,7 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         compilation_database=compilation_database,
         build_variants=configured_variants,
         build_scope=build_scope,
+        index_profile=IndexProfile(getattr(args, "profile", None) or base.index_profile),
         libclang_library_file=getattr(args, "libclang", None) or base.libclang_library_file,
         clang_analyzer_path=getattr(args, "clang_analyzer", None) or base.clang_analyzer_path,
         analyzer_timeout_seconds=getattr(args, "analyzer_timeout", None)
@@ -366,6 +370,7 @@ def _run_index(config: AppConfig, *, as_json: bool) -> int:
         "analysis_backend": result.analysis_backend,
         "advanced_facts_complete": result.advanced_facts_complete,
         "analyzer_capabilities": list(result.analyzer_capabilities),
+        "index_profile": result.index_profile.value,
         "database": str(config.database_path),
         "project_root": str(config.project_root),
     }
