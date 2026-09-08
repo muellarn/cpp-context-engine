@@ -79,6 +79,27 @@ from .contracts import (
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
+CMAKE_COMPILATION_DATABASE_COMMAND = (
+    "cmake -S <project> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+)
+MESON_COMPILATION_DATABASE_COMMAND = "meson setup <build> <project>"
+BEAR_COMPILATION_DATABASE_COMMAND = "bear -- <normal-build-command>"
+COMPILATION_DATABASE_GUIDANCE = (
+    "A compile_commands.json file records the actual include paths, defines, generated files, "
+    "and compiler flags, so it is project/build-configuration specific. Generate it outside this "
+    f"server with CMake (`{CMAKE_COMPILATION_DATABASE_COMMAND}`), Meson "
+    f"(`{MESON_COMPILATION_DATABASE_COMMAND}`), or Bear "
+    f"(`{BEAR_COMPILATION_DATABASE_COMMAND}`). Configure normally creates the database for CMake "
+    "and Meson; run the normal build when generated sources or headers must exist, and make sure "
+    "a Bear capture actually compiles the desired targets. Configure or build the target project "
+    "with normal user authorization; this MCP server never runs these commands implicitly. Keep a "
+    "separate compilation database for each materially different build configuration and register "
+    "each one as a named build."
+)
+MISSING_COMPILATION_DATABASE_ERROR = (
+    "The configured compilation database is unavailable. " + COMPILATION_DATABASE_GUIDANCE
+)
+
 
 class PublicToolFailure(RuntimeError):
     """A deliberately non-sensitive failure that may be returned to an MCP client."""
@@ -165,8 +186,10 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         description="Compiler-aware, project-bound C++ code retrieval and graph navigation.",
         instructions=(
             "This server is bound to one operator-configured project. Tool callers cannot select "
-            "project, database, compilation database, or filesystem paths. Start with search_code, "
-            "then use read_symbol and graph tools for exact connected context. On call edges, "
+            "project, database, compilation database, or filesystem paths. "
+            + COMPILATION_DATABASE_GUIDANCE
+            + " Start with search_code, then use read_symbol and graph tools for exact connected "
+            "context. On call edges, "
             "certainty is a compiler-evidence class, confidence is only a deterministic ranking "
             "signal (not a runtime probability), and target_set_complete says whether the analyzer "
             "proved the target set closed for that callsite. Treat false or missing completeness "
@@ -267,8 +290,11 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     @server.tool(
         title="Index configured C++ project",
         description=(
-            "Incrementally index the operator-configured project and compilation database. "
-            "No caller-controlled path is accepted. Hosted embeddings, when configured, receive "
+            "Incrementally index the operator-configured project and compilation database. The "
+            "server's default discovery location is build/compile_commands.json under the project; "
+            "the operator can set an explicit startup path with --compile-commands or "
+            "CPP_CONTEXT_COMPILE_COMMANDS, and can register named builds separately. No "
+            "caller-controlled path is accepted. Hosted embeddings, when configured, receive "
             "bounded symbol text."
         ),
         annotations=indexing_write,
@@ -283,6 +309,11 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             selected_config = replace(
                 state.config, index_profile=profile or state.config.index_profile
             )
+            if any(
+                not variant.compilation_database.is_file()
+                for variant in selected_config.build_variants
+            ):
+                raise PublicToolFailure(MISSING_COMPILATION_DATABASE_ERROR)
             previous, state.runtime = state.runtime, None
             if previous is not None:
                 previous.close()
