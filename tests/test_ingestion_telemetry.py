@@ -274,20 +274,26 @@ def test_optional_observer_preserves_results_and_emits_balanced_sanitized_lifecy
 
 def test_worker_failure_closes_every_started_slot(tmp_path: Path) -> None:
     configurations = _configurations(tmp_path, 2)
-    release = threading.Event()
+    peer_started = threading.Event()
 
     class FailingClient:
         def probe(self) -> object:
             return object()
 
-        def analyze(
-            self, _root: Path, configuration: BuildConfiguration
-        ) -> list[dict[str, object]]:
+        def analyze_stream(
+            self,
+            _root: Path,
+            configuration: BuildConfiguration,
+            _on_fact: object,
+            *,
+            cancelled: threading.Event,
+        ) -> None:
             if configuration.id == "build-0":
-                release.set()
+                assert peer_started.wait(timeout=2)
                 raise RuntimeError("analysis failed")
-            assert release.wait(timeout=2)
-            return []
+            peer_started.set()
+            assert cancelled.wait(timeout=2)
+            raise AnalyzerLimitError("cancelled peer")
 
     events: list[AnalyzerPipelineEvent] = []
     batches = NativeClangIngestor(  # type: ignore[arg-type]
@@ -302,8 +308,8 @@ def test_worker_failure_closes_every_started_slot(tmp_path: Path) -> None:
     assert {(event.slot_id, event.configuration_index) for event in starts} == {
         (event.slot_id, event.configuration_index) for event in finishes
     }
-    assert any(event.outcome == "failed" for event in finishes)
-    assert all(event.outcome in {"failed", "cancelled"} for event in finishes)
+    assert [event.outcome for event in finishes].count("failed") == 1
+    assert [event.outcome for event in finishes].count("cancelled") == 1
     assert not _live_telemetry_threads()
 
 
