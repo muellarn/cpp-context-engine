@@ -398,6 +398,34 @@ def test_observer_queue_overflow_is_fatal_without_blocking_scheduler_calls() -> 
     assert not _live_telemetry_threads()
 
 
+def test_full_queue_close_exits_after_blocked_observer_is_released() -> None:
+    observer_entered = threading.Event()
+    release_observer = threading.Event()
+
+    def block_observer(_event: AnalyzerPipelineEvent) -> None:
+        observer_entered.set()
+        release_observer.wait()
+
+    dispatcher = _TelemetryDispatcher(
+        block_observer,
+        slot_count=1,
+        total_configurations=100,
+        max_spool_registries=2,
+    )
+    assert observer_entered.wait(timeout=1)
+    for remaining in range(99, 59, -1):
+        dispatcher.update_state(unscheduled_count=remaining, held_registries=0)
+    assert isinstance(dispatcher.failure, AnalyzerTelemetryError)
+
+    result = dispatcher.close()
+    assert isinstance(result, AnalyzerTelemetryError)
+    release_observer.set()
+    dispatcher._thread.join(timeout=1)  # noqa: SLF001 - verify owned thread cleanup
+
+    assert not dispatcher._thread.is_alive()  # noqa: SLF001
+    assert not _live_telemetry_threads()
+
+
 def test_pipeline_event_rejects_path_or_content_extension_fields() -> None:
     event = _event(1, 0.0, "scheduling_state")
     payload = event.to_protocol_payload()

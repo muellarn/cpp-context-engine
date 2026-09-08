@@ -755,9 +755,6 @@ class NativeAnalyzerClient:
         return records
 
 
-_TELEMETRY_STOP = object()
-
-
 class _TelemetryDispatcher:
     """Serialize observer callbacks away from analyzer and scheduler critical sections."""
 
@@ -778,7 +775,8 @@ class _TelemetryDispatcher:
         self._last_time = 0.0
         self._failure: AnalyzerTelemetryError | None = None
         self._lock = threading.Lock()
-        self._events: queue.Queue[AnalyzerPipelineEvent | object] = queue.Queue(
+        self._stop_requested = threading.Event()
+        self._events: queue.Queue[AnalyzerPipelineEvent] = queue.Queue(
             maxsize=max(32, slot_count * 8)
         )
         self._thread = threading.Thread(
@@ -833,18 +831,10 @@ class _TelemetryDispatcher:
             )
 
     def close(self) -> AnalyzerTelemetryError | None:
+        # Stop must be out-of-band: a sentinel can be lost precisely when the
+        # bounded queue is full and telemetry is already failing.
+        self._stop_requested.set()
         deadline = time.monotonic() + 2.0
-        while True:
-            try:
-                self._events.put(_TELEMETRY_STOP, timeout=max(0.0, deadline - time.monotonic()))
-                break
-            except queue.Full:
-                with self._lock:
-                    if self._failure is None:
-                        self._failure = AnalyzerTelemetryError(
-                            "analyzer telemetry dispatcher did not drain its bounded queue"
-                        )
-                return self.failure
         self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._thread.is_alive():
             with self._lock:
@@ -888,13 +878,16 @@ class _TelemetryDispatcher:
 
     def _dispatch(self) -> None:
         while True:
-            event = self._events.get()
-            if event is _TELEMETRY_STOP:
+            if self._stop_requested.is_set() and self._events.empty():
                 return
+            try:
+                event = self._events.get(timeout=0.05)
+            except queue.Empty:
+                continue
             if self.failure is not None:
                 continue
             try:
-                self._observer(event)  # type: ignore[arg-type]
+                self._observer(event)
             except BaseException as error:
                 with self._lock:
                     self._failure = AnalyzerTelemetryError(
