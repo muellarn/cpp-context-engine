@@ -6,22 +6,24 @@ in CI.
 
 ## Input preflight
 
-Preflight validates every CDB entry and records its SHA-256 without starting an
-analyzer or creating an index:
+Preflight validates every CDB entry, including source-file existence, and records
+raw entries, normalized configurations, canonical unique translation units and
+the CDB SHA-256 without starting an analyzer or creating an index. Set
+`KICAD_SOURCE` and `KICAD_BUILD` to the prepared source and build directories:
 
 ```bash
 cpp-context-kicad-canary \
-  --project-root /home/arno/git/kicad \
-  --compile-commands /tmp/cpp-context-kicad-cdb.V6Xvt5/compile_commands.json \
+  --project-root "$KICAD_SOURCE" \
+  --compile-commands "$KICAD_BUILD/compile_commands.json" \
   --preflight-only
 ```
 
 Out-of-source CMake builds legitimately contain generated translation units
 outside the source root. Preflight classifies these as `generated_build_source`
 or `external_source`; it does not reject them. Numeric 1/4/16/32 gates select
-only real source-root TUs in original CDB order so a generated prefix cannot
-silently change the canary. The later `all` gate retains the exact full CDB,
-including generated entries.
+only canonical, unique source-root TUs in original CDB order so a generated or
+duplicate prefix cannot silently change the canary. The later `all` gate retains
+the exact full CDB, including generated entries.
 
 The current analyzer confines searchable facts to `project_root`. It can process
 an out-of-tree generated TU and retain facts from project-local headers, but the
@@ -31,14 +33,17 @@ CDB-owned paths; setting the project root to `/` is unsafe and unsupported.
 
 ## Progressive navigation gates
 
-Use a fresh output directory and the analyzer built from the exact revision:
+The supervised canary is Linux-only because its hard resource limits and
+identity-safe process-tree cleanup require `/proc`. Unsupported platforms fail
+before the analyzer starts. Use a fresh output directory and set
+`CLANG_ANALYZER` and `CANARY_OUTPUT` to paths owned by this run:
 
 ```bash
 cpp-context-kicad-canary \
-  --project-root /home/arno/git/kicad \
-  --compile-commands /tmp/cpp-context-kicad-cdb.V6Xvt5/compile_commands.json \
-  --clang-analyzer /absolute/path/to/cpp-context-clang-analyzer \
-  --output-directory /tmp/cpp-context-kicad-nav-a \
+  --project-root "$KICAD_SOURCE" \
+  --compile-commands "$KICAD_BUILD/compile_commands.json" \
+  --clang-analyzer "$CLANG_ANALYZER" \
+  --output-directory "$CANARY_OUTPUT/navigation-a" \
   --gates 1,4,16,32 \
   --gate-timeouts 1:60,4:90,16:120,32:150 \
   --workers 8 \
@@ -53,38 +58,41 @@ strict discovery guardrails. Every gate uses a new database and records:
   disk bytes;
 - input/subset CDB digests, selected raw indices, engine/project commits, native
   analyzer digest/protocol/capabilities, and SQLite integrity;
-- stable semantic table counts/digest plus exact ranked query IDs and scores.
+- stable semantic table counts/digest, exact ranked query IDs and scores, and
+  order-sensitive public calls/CFG/data-flow result digests.
 
 Any swap, RSS above 2.5 GiB, active database above 550 MiB, output above 1 GiB,
 hard gate timeout, or ten seconds with no TU/DB/CPU progress terminates the whole
-worker process group. A gate contains a `.running` marker until every check has
+worker process tree. A gate contains a `.running` marker until every check has
 passed; failures are renamed `.failed` and only success writes `SUCCESS`. The
-source CDB digest is rechecked before and after the run.
+source CDB digest is rechecked before publication. Baseline provenance, exact
+gate membership, semantic facts, public result ordering and analyzer identity
+are also checked before `SUCCESS` is written.
 
 Run the same gates a second time against the first report. Semantic rows, IDs,
 coverage fields, embeddings and search rankings must match exactly:
 
 ```bash
 cpp-context-kicad-canary \
-  --project-root /home/arno/git/kicad \
-  --compile-commands /tmp/cpp-context-kicad-cdb.V6Xvt5/compile_commands.json \
-  --clang-analyzer /absolute/path/to/cpp-context-clang-analyzer \
-  --output-directory /tmp/cpp-context-kicad-nav-b \
+  --project-root "$KICAD_SOURCE" \
+  --compile-commands "$KICAD_BUILD/compile_commands.json" \
+  --clang-analyzer "$CLANG_ANALYZER" \
+  --output-directory "$CANARY_OUTPUT/navigation-b" \
   --gates 1,4,16,32 \
   --gate-timeouts 1:60,4:90,16:120,32:150 \
   --workers 8 \
   --query compareVersionStrings \
-  --baseline-report /tmp/cpp-context-kicad-nav-a/report.json
+  --baseline-report "$CANARY_OUTPUT/navigation-a/report.json"
 ```
 
 Only after both progressive runs pass may the complete navigation run start:
 
 ```bash
 cpp-context-kicad-canary \
-  --project-root /home/arno/git/kicad \
-  --compile-commands /tmp/cpp-context-kicad-cdb.V6Xvt5/compile_commands.json \
-  --clang-analyzer /absolute/path/to/cpp-context-clang-analyzer \
-  --output-directory /tmp/cpp-context-kicad-nav-full \
+  --project-root "$KICAD_SOURCE" \
+  --compile-commands "$KICAD_BUILD/compile_commands.json" \
+  --clang-analyzer "$CLANG_ANALYZER" \
+  --output-directory "$CANARY_OUTPUT/navigation-full" \
   --gates all \
   --gate-timeouts all:5400 \
   --workers 8 \
@@ -104,10 +112,10 @@ may be run when no other benchmark is using the host:
 
 ```bash
 cpp-context-kicad-canary \
-  --project-root /home/arno/git/kicad \
-  --compile-commands /tmp/cpp-context-kicad-cdb.V6Xvt5/compile_commands.json \
-  --clang-analyzer /absolute/path/to/cpp-context-clang-analyzer \
-  --output-directory /tmp/cpp-context-kicad-full-32 \
+  --project-root "$KICAD_SOURCE" \
+  --compile-commands "$KICAD_BUILD/compile_commands.json" \
+  --clang-analyzer "$CLANG_ANALYZER" \
+  --output-directory "$CANARY_OUTPUT/full-32" \
   --profile full \
   --gates 32 \
   --gate-timeouts 32:360 \

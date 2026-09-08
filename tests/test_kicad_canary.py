@@ -112,6 +112,42 @@ def test_gate_subset_is_deterministic_and_retains_original_working_directory(
     assert len(digest) == 64
 
 
+def test_preflight_rejects_missing_sources_and_numeric_gates_deduplicate_tus(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "same.cpp"
+    source.write_text("int same();\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    repeated = {
+        "directory": str(project),
+        "file": str(source),
+        "arguments": ["c++", "-c", str(source)],
+    }
+    _write_cdb(cdb, [repeated, repeated])
+
+    inspection = inspect_compilation_database(project, cdb)
+
+    assert inspection.public_report()["canonical_translation_unit_count"] == 1
+    assert inspection.public_report()["numeric_gate_eligible_count"] == 1
+    with pytest.raises(ValueError, match="found 1"):
+        select_gate_entries(inspection, 2)
+
+    _write_cdb(
+        cdb,
+        [
+            {
+                "directory": str(project),
+                "file": "missing.cpp",
+                "arguments": ["c++", "-c", "missing.cpp"],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="source file does not exist"):
+        inspect_compilation_database(project, cdb)
+
+
 def test_semantic_snapshot_ignores_volatile_timestamp_and_database_location(tmp_path: Path) -> None:
     digests: list[str] = []
     for position, timestamp in enumerate(("first", "second")):
@@ -169,6 +205,7 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
         "engine_commit": "engine",
         "project_commit": "project",
         "profile": "navigation",
+        "workers": 8,
         "embedding_dimensions": 32,
         "input": {"cdb_sha256": "cdb"},
         "gates": [
@@ -179,6 +216,9 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
                 "subset_cdb_sha256": "subset",
                 "semantic_snapshot": {"digest": "facts"},
                 "rankings": {"query": ["symbol"]},
+                "public_orderings": {"query": {"digest": "ordered"}},
+                "database_provenance": {"coverage": "complete"},
+                "analyzer": {"sha256": "analyzer"},
             }
         ],
     }
@@ -188,6 +228,153 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
     baseline["gates"][0]["selected_raw_indices"] = [0]
     with pytest.raises(RuntimeError, match="selected_raw_indices"):
         _compare_baseline(report, baseline)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda baseline: baseline.update(workers=4), "workers"),
+        (lambda baseline: baseline["gates"].clear(), "gate set"),
+        (
+            lambda baseline: baseline["gates"][0]["analyzer"].update(sha256="different"),
+            "analyzer",
+        ),
+        (
+            lambda baseline: baseline["gates"][0]["database_provenance"].update(
+                coverage="different"
+            ),
+            "database_provenance",
+        ),
+        (
+            lambda baseline: baseline["gates"][0]["public_orderings"]["query"].update(
+                digest="different"
+            ),
+            "public_orderings",
+        ),
+    ],
+)
+def test_baseline_comparison_requires_exact_provenance_and_gate_set(
+    mutation: object, message: str
+) -> None:
+    report = {
+        "engine_commit": "engine",
+        "project_commit": "project",
+        "profile": "full",
+        "workers": 8,
+        "embedding_dimensions": 32,
+        "input": {"cdb_sha256": "cdb"},
+        "gates": [
+            {
+                "gate": 32,
+                "selection": "project_source_prefix",
+                "selected_raw_indices": list(range(32)),
+                "subset_cdb_sha256": "subset",
+                "semantic_snapshot": {"digest": "facts"},
+                "rankings": {"query": ["symbol"]},
+                "public_orderings": {"query": {"digest": "ordered"}},
+                "database_provenance": {"coverage": "complete"},
+                "analyzer": {"sha256": "analyzer"},
+            }
+        ],
+    }
+    baseline = json.loads(json.dumps(report))
+
+    mutation(baseline)  # type: ignore[operator]
+
+    with pytest.raises(RuntimeError, match=message):
+        _compare_baseline(report, baseline)
+
+
+def test_ordered_public_result_digest_preserves_list_order() -> None:
+    first = {"calls": [{"target": "a"}, {"target": "b"}]}
+    reversed_result = {"calls": list(reversed(first["calls"]))}
+
+    assert kicad_canary._ordered_public_result_digest(first) != (
+        kicad_canary._ordered_public_result_digest(reversed_result)
+    )
+
+
+def test_baseline_mismatch_never_publishes_gate_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    inspection = inspect_compilation_database(project, cdb)
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "engine_commit": "revision",
+                "project_commit": "revision",
+                "profile": "navigation",
+                "workers": 1,
+                "embedding_dimensions": 1,
+                "input": {"cdb_sha256": inspection.sha256},
+                "gates": [{"gate": 1}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    provenance = {
+        "translation_unit_groups": [
+            {
+                "analysis_backend": "clang-libtooling",
+                "advanced_facts_complete": 0,
+                "index_profile": "navigation",
+                "navigation_facts_complete": 1,
+                "cfg_facts_complete": 0,
+                "data_flow_facts_complete": 0,
+                "summary_facts_complete": 0,
+                "translation_units": 1,
+            }
+        ],
+        "build_variants": [{"name": "default", "index_profile": "navigation"}],
+    }
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(
+        kicad_canary,
+        "_run_supervised",
+        lambda *_args: {"completed_translation_units": 1, "database_provenance": provenance},
+    )
+    monkeypatch.setattr(
+        kicad_canary,
+        "_compare_baseline_gate",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("parity mismatch")),
+    )
+    output = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="parity mismatch"):
+        kicad_canary.run_canary(
+            project_root=project,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=output,
+            gates=(1,),
+            gate_timeouts={"1": 1.0},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            embedding_dimensions=1,
+            queries=("main",),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=1,
+            baseline_report=baseline,
+        )
+
+    failed = output / ".gate-1.failed"
+    assert (failed / ".running").is_file()
+    assert not (failed / "SUCCESS").exists()
 
 
 def test_limits_fail_immediately_on_swap_or_resource_growth() -> None:
@@ -232,6 +419,51 @@ def test_process_group_cleanup_reaps_worker_descendants() -> None:
     assert worker.poll() is not None
     assert not _process_group_live(worker.pid)
     assert not _process_group_live(child_group)
+
+
+def test_observed_process_identities_are_cumulative() -> None:
+    groups: set[kicad_canary._ProcessGroupIdentity] = set()
+    processes: set[kicad_canary._ProcessIdentity] = set()
+    first_group = kicad_canary._ProcessGroupIdentity(11, 101)
+    second_group = kicad_canary._ProcessGroupIdentity(12, 102)
+    first_process = kicad_canary._ProcessIdentity(21, 201)
+    second_process = kicad_canary._ProcessIdentity(22, 202)
+
+    kicad_canary._remember_process_tree(
+        groups,
+        processes,
+        kicad_canary._TreeMetrics(1, 0, 1, (21,), (first_process,), (first_group,)),
+    )
+    kicad_canary._remember_process_tree(
+        groups,
+        processes,
+        kicad_canary._TreeMetrics(1, 0, 2, (22,), (second_process,), (second_group,)),
+    )
+
+    assert groups == {first_group, second_group}
+    assert processes == {first_process, second_process}
+
+
+def test_supervised_run_rejects_unmeasurable_platform_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kicad_canary, "_linux_supervisor_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="no analyzer was started"):
+        kicad_canary._require_supervisor_platform()
+
+
+def test_recycled_process_identity_is_not_considered_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = kicad_canary._ProcessIdentity(42, 100)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_read_process_identity",
+        lambda _pid: kicad_canary._ProcessIdentity(42, 101),
+    )
+
+    assert not kicad_canary._process_identity_live(expected)
 
 
 def test_preflight_cli_never_requires_or_starts_an_analyzer(

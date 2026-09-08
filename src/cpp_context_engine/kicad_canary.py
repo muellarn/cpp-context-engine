@@ -20,12 +20,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
-from cpp_context_engine.api import QueryRequest
+from cpp_context_engine.api import CallRequest, CfgRequest, FlowRequest, QueryRequest
 from cpp_context_engine.benchmark import _write_report_atomic
 from cpp_context_engine.config import AppConfig
 from cpp_context_engine.ingestion import NativeAnalyzerClient, NativeClangIngestor, ProjectIndexer
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
-from cpp_context_engine.models import BuildScope, BuildVariant, IndexProfile
+from cpp_context_engine.models import BuildScope, BuildVariant, GraphDirection, IndexProfile
 from cpp_context_engine.runtime import build_runtime
 from cpp_context_engine.search import DeterministicLocalEmbeddingProvider, SQLiteVectorSearch
 from cpp_context_engine.storage import SQLiteStore
@@ -91,6 +91,20 @@ class CdbInspection:
     entries: tuple[CdbEntry, ...]
     classification_counts: dict[str, int]
 
+    @property
+    def numeric_gate_eligible_count(self) -> int:
+        return len(
+            {
+                entry.source_path
+                for entry in self.entries
+                if entry.classification == "project_source"
+            }
+        )
+
+    @property
+    def canonical_translation_unit_count(self) -> int:
+        return len({entry.source_path for entry in self.entries})
+
     def public_report(self) -> dict[str, Any]:
         return {
             "schema": "cpp-context-kicad-cdb-preflight",
@@ -98,8 +112,9 @@ class CdbInspection:
             "cdb_sha256": self.sha256,
             "entry_count": self.entry_count,
             "normalized_configuration_count": self.normalized_configuration_count,
+            "canonical_translation_unit_count": self.canonical_translation_unit_count,
             "classification_counts": self.classification_counts,
-            "numeric_gate_eligible_count": self.classification_counts["project_source"],
+            "numeric_gate_eligible_count": self.numeric_gate_eligible_count,
             "external_generated_note": (
                 "Out-of-tree entries are valid CMake inputs and are retained by the all gate; "
                 "numeric canaries deliberately select project-root sources only."
@@ -189,6 +204,10 @@ def inspect_compilation_database(project_root: Path, compilation_database: Path)
         if not source.is_absolute():
             source = directory / source
         source = source.resolve(strict=False)
+        if not source.is_file():
+            raise ValueError(
+                f"compilation database entry {raw_index} source file does not exist"
+            )
         if _within(source, root):
             classification = "project_source"
             display = source.relative_to(root).as_posix()
@@ -219,12 +238,16 @@ def select_gate_entries(inspection: CdbInspection, gate: int | str) -> tuple[Cdb
     count = int(gate)
     if count <= 0:
         raise ValueError("gate sizes must be positive")
-    eligible = tuple(
-        entry for entry in inspection.entries if entry.classification == "project_source"
-    )
+    eligible: list[CdbEntry] = []
+    seen_sources: set[Path] = set()
+    for entry in inspection.entries:
+        if entry.classification != "project_source" or entry.source_path in seen_sources:
+            continue
+        seen_sources.add(entry.source_path)
+        eligible.append(entry)
     if len(eligible) < count:
         raise ValueError(f"gate {count} needs {count} project-root TUs, found {len(eligible)}")
-    return eligible[:count]
+    return tuple(eligible[:count])
 
 
 def write_subset_database(
@@ -381,15 +404,29 @@ def _directory_size(directory: Path) -> int:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProcessIdentity:
+    pid: int
+    start_ticks: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessGroupIdentity:
+    group_id: int
+    leader_start_ticks: int
+
+
+@dataclass(frozen=True, slots=True)
 class _TreeMetrics:
     rss: int
     swap: int
     cpu_ticks: int
     live_pids: tuple[int, ...]
+    processes: tuple[_ProcessIdentity, ...] = ()
+    groups: tuple[_ProcessGroupIdentity, ...] = ()
 
 
 def _process_tree_metrics(root_pid: int) -> _TreeMetrics:
-    processes: dict[int, tuple[int, int, int, int, str]] = {}
+    processes: dict[int, tuple[int, int, int, int, str, int]] = {}
     try:
         proc_entries = tuple(Path("/proc").iterdir())
     except OSError:
@@ -413,6 +450,7 @@ def _process_tree_metrics(root_pid: int) -> _TreeMetrics:
                 int(status.get("VmSwap", "0 kB").split()[0]) * 1024,
                 int(stat[13]) + int(stat[14]),
                 status.get("State", "?"),
+                int(stat[21]),
             )
         except (OSError, KeyError, ValueError, IndexError):
             continue
@@ -429,12 +467,57 @@ def _process_tree_metrics(root_pid: int) -> _TreeMetrics:
             pid for pid in descendants if pid in processes and not processes[pid][4].startswith("Z")
         )
     )
+    identities = tuple(_ProcessIdentity(pid, processes[pid][5]) for pid in live)
+    group_identities: set[_ProcessGroupIdentity] = set()
+    for pid in live:
+        with contextlib.suppress(ProcessLookupError):
+            group_id = os.getpgid(pid)
+            leader = processes.get(group_id)
+            if leader is not None:
+                group_identities.add(_ProcessGroupIdentity(group_id, leader[5]))
     return _TreeMetrics(
         sum(processes[pid][1] for pid in live),
         sum(processes[pid][2] for pid in live),
         sum(processes[pid][3] for pid in live),
         live,
+        identities,
+        tuple(sorted(group_identities, key=lambda item: item.group_id)),
     )
+
+
+def _remember_process_tree(
+    groups: set[_ProcessGroupIdentity],
+    processes: set[_ProcessIdentity],
+    tree: _TreeMetrics,
+) -> None:
+    """Retain every verified descendant identity seen during a gate."""
+
+    groups.update(tree.groups)
+    processes.update(tree.processes)
+
+
+def _read_process_identity(pid: int) -> _ProcessIdentity | None:
+    try:
+        fields = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8").split()
+        if fields[2] == "Z":
+            return None
+        return _ProcessIdentity(pid, int(fields[21]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _process_identity_live(identity: _ProcessIdentity) -> bool:
+    return _read_process_identity(identity.pid) == identity
+
+
+def _process_group_identity_live(identity: _ProcessGroupIdentity) -> bool:
+    leader = _read_process_identity(identity.group_id)
+    if leader != _ProcessIdentity(identity.group_id, identity.leader_start_ticks):
+        return False
+    try:
+        return os.getpgid(identity.group_id) == identity.group_id
+    except ProcessLookupError:
+        return False
 
 
 def _read_lines(stream: TextIO, destination: queue.Queue[tuple[str, str]], kind: str) -> None:
@@ -449,22 +532,34 @@ def _terminate_process_group(
     process: subprocess.Popen[str],
     grace_seconds: float = 2.0,
     *,
-    known_groups: Iterable[int] = (),
+    known_groups: Iterable[_ProcessGroupIdentity] = (),
+    known_processes: Iterable[_ProcessIdentity] = (),
 ) -> None:
-    groups = {
-        process.pid,
-        *known_groups,
-        *_process_groups(_process_tree_metrics(process.pid).live_pids),
-    }
+    tree = _process_tree_metrics(process.pid)
+    groups = {*known_groups, *tree.groups}
+    processes = {*known_processes, *tree.processes}
     for group in groups:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(group, signal.SIGTERM)
+        if _process_group_identity_live(group):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(group.group_id, signal.SIGTERM)
+    for identity in processes:
+        if _process_identity_live(identity):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(identity.pid, signal.SIGTERM)
     deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline and any(_process_group_live(group) for group in groups):
+    while time.monotonic() < deadline and (
+        any(_process_group_identity_live(group) for group in groups)
+        or any(_process_identity_live(identity) for identity in processes)
+    ):
         time.sleep(0.05)
     for group in groups:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(group, signal.SIGKILL)
+        if _process_group_identity_live(group):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(group.group_id, signal.SIGKILL)
+    for identity in processes:
+        if _process_identity_live(identity):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(identity.pid, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=grace_seconds)
 
@@ -486,12 +581,16 @@ def _process_group_live(group_id: int) -> bool:
     return False
 
 
-def _process_groups(pids: Iterable[int]) -> set[int]:
-    groups: set[int] = set()
-    for pid in pids:
-        with contextlib.suppress(ProcessLookupError):
-            groups.add(os.getpgid(pid))
-    return groups
+def _linux_supervisor_available() -> bool:
+    return os.name == "posix" and Path("/proc/self/stat").is_file()
+
+
+def _require_supervisor_platform() -> None:
+    if not _linux_supervisor_available():
+        raise RuntimeError(
+            "the KiCad canary requires Linux /proc process metrics; "
+            "no analyzer was started"
+        )
 
 
 def _run_supervised(
@@ -537,7 +636,8 @@ def _run_supervised(
     worker_result: dict[str, Any] | None = None
     violation: str | None = None
     stdout_eof = stderr_eof = False
-    observed_groups = {process.pid}
+    observed_groups: set[_ProcessGroupIdentity] = set()
+    observed_processes: set[_ProcessIdentity] = set()
     database = gate_directory / "index.db"
     try:
         while process.poll() is None or not (stdout_eof and stderr_eof):
@@ -566,10 +666,8 @@ def _run_supervised(
                         violation = str(event.get("message", "worker failed"))
             elapsed = time.monotonic() - started
             tree = _process_tree_metrics(process.pid)
-            # Keep only the immediately observed live tree. Once the worker exits,
-            # retain the final sample long enough to kill a just-reparented analyzer.
-            if process.poll() is None:
-                observed_groups = {process.pid, *_process_groups(tree.live_pids)}
+            # Descendants can reparent or create their own sessions before failure cleanup.
+            _remember_process_tree(observed_groups, observed_processes, tree)
             database_bytes = _database_size(database)
             disk_bytes = _directory_size(gate_directory)
             peak_rss = max(peak_rss, tree.rss)
@@ -612,10 +710,18 @@ def _run_supervised(
                 )
                 last_report = time.monotonic()
             if violation is not None and process.poll() is None:
-                _terminate_process_group(process, known_groups=observed_groups)
+                _terminate_process_group(
+                    process,
+                    known_groups=observed_groups,
+                    known_processes=observed_processes,
+                )
         return_code = process.wait(timeout=2)
     finally:
-        _terminate_process_group(process, known_groups=observed_groups)
+        _terminate_process_group(
+            process,
+            known_groups=observed_groups,
+            known_processes=observed_processes,
+        )
         for reader in readers:
             reader.join(timeout=1)
     if violation is not None:
@@ -632,7 +738,10 @@ def _run_supervised(
         "peak_database_bytes": peak_database,
         "peak_disk_bytes": peak_disk,
         "completed_translation_units": completed_tus,
-        "process_group_clean": not any(_process_group_live(group) for group in observed_groups),
+        "process_group_clean": not any(
+            _process_group_identity_live(group) for group in observed_groups
+        )
+        and not any(_process_identity_live(identity) for identity in observed_processes),
     }
 
 
@@ -656,8 +765,17 @@ def _worker_event(event: str, **fields: Any) -> None:
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
-def _ranking_canaries(config: AppConfig, queries: Sequence[str]) -> dict[str, Any]:
+def _ordered_public_result_digest(result: Any) -> str:
+    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    document = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+def _ranking_canaries(
+    config: AppConfig, queries: Sequence[str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
     rankings: dict[str, Any] = {}
+    public_orderings: dict[str, Any] = {}
     with build_runtime(config) as runtime:
         for query in queries:
             response = runtime.query_context(
@@ -677,7 +795,53 @@ def _ranking_canaries(config: AppConfig, queries: Sequence[str]) -> dict[str, An
                 }
                 for item in response.items
             ]
-    return rankings
+            analyses: list[dict[str, Any]] = []
+            seen_symbols: set[str] = set()
+            for item in response.items:
+                symbol_id = item.hit.symbol.id
+                if symbol_id in seen_symbols:
+                    continue
+                seen_symbols.add(symbol_id)
+                control_flow = runtime.analysis_service.control_flow(
+                    CfgRequest(
+                        function_symbol_id=symbol_id,
+                        builds=list(config.build_scope.variants),
+                    )
+                )
+                data_flow = runtime.analysis_service.data_flow(
+                    FlowRequest(
+                        function_symbol_id=symbol_id,
+                        builds=list(config.build_scope.variants),
+                    )
+                )
+                incoming = runtime.analysis_service.calls(
+                    CallRequest(
+                        symbol_id=symbol_id,
+                        direction=GraphDirection.INCOMING,
+                        builds=list(config.build_scope.variants),
+                    )
+                )
+                outgoing = runtime.analysis_service.calls(
+                    CallRequest(
+                        symbol_id=symbol_id,
+                        direction=GraphDirection.OUTGOING,
+                        builds=list(config.build_scope.variants),
+                    )
+                )
+                analyses.append(
+                    {
+                        "symbol_id": symbol_id,
+                        "control_flow": _ordered_public_result_digest(control_flow),
+                        "data_flow": _ordered_public_result_digest(data_flow),
+                        "incoming_calls": _ordered_public_result_digest(incoming),
+                        "outgoing_calls": _ordered_public_result_digest(outgoing),
+                    }
+                )
+            public_orderings[query] = {
+                "retrieval_symbol_ids": [item.hit.symbol.id for item in response.items],
+                "analyses": analyses,
+            }
+    return rankings, public_orderings
 
 
 def _run_worker(spec_path: Path) -> int:
@@ -726,7 +890,7 @@ def _run_worker(spec_path: Path) -> int:
             analyzer_max_workers=int(spec["workers"]),
             embedding_dimensions=int(spec["embedding_dimensions"]),
         )
-        rankings = _ranking_canaries(config, tuple(spec["queries"]))
+        rankings, public_orderings = _ranking_canaries(config, tuple(spec["queries"]))
         snapshot = semantic_snapshot(database)
         provenance = database_provenance(database)
         with sqlite3.connect(database) as connection:
@@ -740,6 +904,7 @@ def _run_worker(spec_path: Path) -> int:
                 "indexing": asdict(indexing),
                 "embedded_symbols": embedded,
                 "rankings": rankings,
+                "public_orderings": public_orderings,
                 "semantic_snapshot": snapshot,
                 "database_provenance": provenance,
                 "database_file_sha256": _sha256(database),
@@ -813,8 +978,21 @@ def _git_revision(project_root: Path) -> str:
     return result.stdout.strip()
 
 
-def _compare_baseline(report: Mapping[str, Any], baseline: Mapping[str, Any]) -> None:
-    for field in ("engine_commit", "project_commit", "profile", "embedding_dimensions"):
+def _comparable_gates(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    gates = report.get("gates")
+    if not isinstance(gates, list) or not all(isinstance(gate, Mapping) for gate in gates):
+        raise ValueError("baseline report has no comparable gates")
+    return gates
+
+
+def _compare_baseline_header(report: Mapping[str, Any], baseline: Mapping[str, Any]) -> None:
+    for field in (
+        "engine_commit",
+        "project_commit",
+        "profile",
+        "workers",
+        "embedding_dimensions",
+    ):
         if report.get(field) != baseline.get(field):
             raise RuntimeError(f"baseline provenance differs for {field}")
     current_input = report.get("input")
@@ -823,23 +1001,36 @@ def _compare_baseline(report: Mapping[str, Any], baseline: Mapping[str, Any]) ->
         raise ValueError("baseline report has no input provenance")
     if current_input.get("cdb_sha256") != baseline_input.get("cdb_sha256"):
         raise RuntimeError("baseline compilation database digest differs")
-    current_gates = report.get("gates")
-    baseline_gates = baseline.get("gates")
-    if not isinstance(current_gates, list) or not isinstance(baseline_gates, list):
-        raise ValueError("baseline report has no comparable gates")
-    expected = {
-        str(gate["gate"]): (gate["semantic_snapshot"], gate["rankings"]) for gate in baseline_gates
-    }
-    for gate in current_gates:
-        key = str(gate["gate"])
-        if key not in expected:
-            raise RuntimeError(f"baseline has no gate {key}")
-        baseline_gate = next(item for item in baseline_gates if str(item["gate"]) == key)
-        for field in ("selection", "selected_raw_indices", "subset_cdb_sha256"):
-            if gate[field] != baseline_gate[field]:
-                raise RuntimeError(f"baseline gate {key} differs for {field}")
-        if (gate["semantic_snapshot"], gate["rankings"]) != expected[key]:
-            raise RuntimeError(f"semantic or ranking parity failed for gate {key}")
+    current_gate_names = [str(gate.get("gate")) for gate in _comparable_gates(report)]
+    baseline_gate_names = [str(gate.get("gate")) for gate in _comparable_gates(baseline)]
+    if current_gate_names != baseline_gate_names:
+        raise RuntimeError("baseline gate set or order differs")
+
+
+def _compare_baseline_gate(
+    gate: Mapping[str, Any], baseline_gate: Mapping[str, Any]
+) -> None:
+    key = str(gate.get("gate"))
+    for field in (
+        "selection",
+        "selected_raw_indices",
+        "subset_cdb_sha256",
+        "semantic_snapshot",
+        "rankings",
+        "public_orderings",
+        "database_provenance",
+        "analyzer",
+    ):
+        if gate.get(field) != baseline_gate.get(field):
+            raise RuntimeError(f"baseline gate {key} differs for {field}")
+
+
+def _compare_baseline(report: Mapping[str, Any], baseline: Mapping[str, Any]) -> None:
+    _compare_baseline_header(report, baseline)
+    for gate, baseline_gate in zip(
+        _comparable_gates(report), _comparable_gates(baseline), strict=True
+    ):
+        _compare_baseline_gate(gate, baseline_gate)
 
 
 def run_canary(
@@ -863,6 +1054,7 @@ def run_canary(
 ) -> dict[str, Any]:
     profile = IndexProfile(profile)
     inspection = inspect_compilation_database(project_root, compilation_database)
+    _require_supervisor_platform()
     analyzer = analyzer.expanduser().resolve(strict=True)
     if not analyzer.is_file() or not os.access(analyzer, os.X_OK):
         raise ValueError("Clang analyzer must be an executable file")
@@ -871,6 +1063,30 @@ def run_canary(
         raise ValueError("canary output directory must be empty")
     output.mkdir(parents=True, exist_ok=True)
     gate_reports: list[dict[str, Any]] = []
+    report: dict[str, Any] = {
+        "schema": "cpp-context-kicad-canary-report",
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "measured_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "engine_commit": _git_revision(Path(__file__).resolve().parents[2]),
+        "project_commit": _git_revision(inspection.project_root),
+        "profile": profile.value,
+        "workers": workers,
+        "embedding_dimensions": embedding_dimensions,
+        "input": inspection.public_report(),
+        "gates": gate_reports,
+        "baseline_parity": baseline_report is not None,
+    }
+    baseline: Mapping[str, Any] | None = None
+    baseline_gates: list[Mapping[str, Any]] = []
+    if baseline_report is not None:
+        loaded_baseline = json.loads(baseline_report.read_text(encoding="utf-8"))
+        if not isinstance(loaded_baseline, Mapping):
+            raise ValueError("baseline report must be an object")
+        baseline = loaded_baseline
+        # Validate immutable provenance and the exact requested gate set before indexing.
+        requested_report = {**report, "gates": [{"gate": gate} for gate in gates]}
+        _compare_baseline_header(requested_report, baseline)
+        baseline_gates = _comparable_gates(baseline)
     for gate in gates:
         name = str(gate)
         if _sha256(inspection.compilation_database) != inspection.sha256:
@@ -909,14 +1125,7 @@ def run_canary(
             if measured["completed_translation_units"] != len(selected):
                 raise RuntimeError("worker did not stage every selected translation unit")
             _validate_profile_provenance(measured["database_provenance"], profile, len(selected))
-            running_marker.unlink()
-            _write_report_atomic(running / "SUCCESS", "complete\n")
-        except BaseException:
-            if running.exists():
-                running.rename(failed)
-            raise
-        gate_reports.append(
-            {
+            gate_report = {
                 "gate": gate,
                 "selection": "complete_cdb" if gate == "all" else "project_source_prefix",
                 "translation_units": len(selected),
@@ -926,24 +1135,20 @@ def run_canary(
                 "limits": asdict(limits),
                 **measured,
             }
-        )
+            if baseline is not None:
+                _compare_baseline_gate(gate_report, baseline_gates[len(gate_reports)])
+            if _sha256(inspection.compilation_database) != inspection.sha256:
+                raise RuntimeError("source compilation database changed during the canary")
+            gate_reports.append(gate_report)
+            running_marker.unlink()
+            _write_report_atomic(running / "SUCCESS", "complete\n")
+        except BaseException:
+            if running.exists():
+                running.rename(failed)
+            raise
     if _sha256(inspection.compilation_database) != inspection.sha256:
         raise RuntimeError("source compilation database changed during the canary")
-    report: dict[str, Any] = {
-        "schema": "cpp-context-kicad-canary-report",
-        "schema_version": REPORT_SCHEMA_VERSION,
-        "measured_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
-        "engine_commit": _git_revision(Path(__file__).resolve().parents[2]),
-        "project_commit": _git_revision(inspection.project_root),
-        "profile": profile.value,
-        "workers": workers,
-        "embedding_dimensions": embedding_dimensions,
-        "input": inspection.public_report(),
-        "gates": gate_reports,
-        "baseline_parity": baseline_report is not None,
-    }
-    if baseline_report is not None:
-        baseline = json.loads(baseline_report.read_text(encoding="utf-8"))
+    if baseline is not None:
         _compare_baseline(report, baseline)
     _write_report_atomic(
         output / "report.json", json.dumps(report, indent=2, sort_keys=True) + "\n"
