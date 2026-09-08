@@ -24,18 +24,24 @@ source .venv/bin/activate
 python -m pip install -e '.[all]'
 ```
 
-Generate `compile_commands.json` with your real build configuration. For CMake:
+Generate `compile_commands.json` with your real build configuration. The file is
+project/build-configuration specific because it records actual include paths,
+defines, generated files, and compiler flags. For CMake:
 
 ```bash
-cmake -S /path/to/project -B /path/to/project/build \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build /path/to/project/build
+cmake -S <project> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
 
-Meson users can run `meson setup build` (Meson writes a compilation database in
-the build directory). For other build systems, tools such as Bear can capture
-compiler invocations. Do not hand-write a database for a non-trivial project: its
-include paths, defines, target flags, and generated headers are part of the index.
+Meson users can run `meson setup <build> <project>`; Meson writes the database in
+the build directory. Other build systems can be captured with
+`bear -- <normal-build-command>`; the captured build must actually compile the
+desired targets. Configure normally creates the database for CMake and Meson, but
+run the normal build when generated sources or headers must exist. Configure or
+build the target project only with normal user authorization.
+The MCP server never runs these commands implicitly.
+Keep a separate compilation database for each materially different build configuration and
+register each one as a named build.
+Do not hand-write a database for a non-trivial project.
 
 If libclang is not discovered automatically, select the native library explicitly:
 
@@ -246,6 +252,14 @@ scope; omitting `builds` returns that scope and labels multi-build results as a 
 For MCP call edges, interpret `certainty`, `confidence`, and `target_set_complete`
 with the evidence semantics above; in particular, confidence is ranking-only and
 an incomplete target set must not be treated as exhaustive.
+
+At startup, the default compilation-database location is
+`<project>/build/compile_commands.json`. Use `--compile-commands` or
+`CPP_CONTEXT_COMPILE_COMMANDS` to configure an explicit path, or repeated named
+builds for multiple configurations. The server initialization instructions expose
+the CMake, Meson, and Bear preparation guidance above to MCP clients. The
+`index_project` tool only consumes those operator-configured files; it never runs
+configure or build commands itself.
 
 For Codex or another stdio-capable MCP client, add a local server using the generic
 command/environment shape below. The exact settings file or UI varies by client:

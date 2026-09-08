@@ -122,6 +122,93 @@ def _fake_index(config: AppConfig) -> IndexOperationResult:
     )
 
 
+def test_mcp_client_discovers_compilation_database_setup_guidance(tmp_path: Path) -> None:
+    from cpp_context_engine.mcp.server import create_mcp_server
+
+    project = tmp_path / "project"
+    project.mkdir()
+    server = create_mcp_server(_config(project, tmp_path / "index.db"))
+
+    async def scenario() -> None:
+        async with Client(server, mode="legacy") as client:
+            instructions = client.instructions or ""
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            index_description = tools["index_project"].description or ""
+
+            assert "project/build-configuration specific" in instructions
+            assert "CMAKE_EXPORT_COMPILE_COMMANDS=ON" in instructions
+            assert "meson setup <build> <project>" in instructions
+            assert "bear -- <normal-build-command>" in instructions
+            assert "generated sources or headers" in instructions
+            assert "normal user authorization" in instructions
+            assert "never runs these commands implicitly" in instructions
+            assert "separate compilation database" in instructions
+
+            assert "build/compile_commands.json" in index_description
+            assert "--compile-commands" in index_description
+            assert "CPP_CONTEXT_COMPILE_COMMANDS" in index_description
+            assert "No caller-controlled path" in index_description
+
+    anyio.run(scenario)
+
+
+def test_missing_compilation_database_error_is_safe_and_actionable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from cpp_context_engine.mcp import server as mcp_server
+
+    project = tmp_path / "private-customer" / "project"
+    project.mkdir(parents=True)
+    missing = tmp_path / "private-customer" / "secret-build" / "compile_commands.json"
+    config = replace(
+        _config(project, tmp_path / "index.db"),
+        compilation_database=missing,
+        build_variants=(),
+    )
+
+    def forbidden_index(_config: AppConfig) -> IndexOperationResult:
+        raise AssertionError("a missing compilation database must fail before indexing")
+
+    monkeypatch.setattr(mcp_server, "run_project_index", forbidden_index)
+
+    async def scenario() -> None:
+        async with Client(mcp_server.create_mcp_server(config), mode="legacy") as client:
+            result = await client.call_tool("index_project", {})
+            assert result.is_error
+            rendered = result.content[0].text
+            assert "configured compilation database is unavailable" in rendered
+            assert "CMAKE_EXPORT_COMPILE_COMMANDS=ON" in rendered
+            assert "meson setup <build> <project>" in rendered
+            assert "bear -- <normal-build-command>" in rendered
+            assert "generated sources or headers" in rendered
+            assert "normal user authorization" in rendered
+            assert "never runs these commands implicitly" in rendered
+            assert "separate compilation database" in rendered
+            assert str(tmp_path) not in rendered
+            assert "private-customer" not in rendered
+            assert "secret-build" not in rendered
+
+    anyio.run(scenario)
+
+
+def test_readme_and_mcp_compile_database_guidance_stay_consistent() -> None:
+    from cpp_context_engine.mcp.server import COMPILATION_DATABASE_GUIDANCE
+
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    for phrase in (
+        "project/build-configuration specific",
+        "CMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "meson setup <build> <project>",
+        "bear -- <normal-build-command>",
+        "generated sources or headers",
+        "normal user authorization",
+        "never runs these commands implicitly",
+        "separate compilation database",
+    ):
+        assert phrase in COMPILATION_DATABASE_GUIDANCE
+        assert phrase in readme
+
+
 def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -130,6 +217,8 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
     project = tmp_path / "project"
     project.mkdir()
     config = _config(project, tmp_path / "index.db")
+    assert config.compilation_database is not None
+    config.compilation_database.write_text("[]", encoding="utf-8")
     runtimes: list[Runtime] = []
 
     def tracked_runtime(selected: AppConfig) -> Runtime:
