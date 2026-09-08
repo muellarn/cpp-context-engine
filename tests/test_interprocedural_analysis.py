@@ -683,11 +683,20 @@ def test_v8_migration_is_atomic_and_forces_v7_native_reindex(
     connection = sqlite3.connect(database)
     connection.executescript(
         """
-        CREATE TABLE translation_units(
-            analysis_backend TEXT NOT NULL,
-            advanced_facts_complete INTEGER NOT NULL
+        CREATE TABLE projects(id INTEGER PRIMARY KEY);
+        CREATE TABLE symbols(
+            project_id INTEGER NOT NULL,
+            id TEXT NOT NULL,
+            PRIMARY KEY(project_id, id)
         );
-        INSERT INTO translation_units VALUES ('clang-libtooling', 1);
+        CREATE TABLE translation_units(
+            project_id INTEGER NOT NULL,
+            id TEXT NOT NULL,
+            analysis_backend TEXT NOT NULL,
+            advanced_facts_complete INTEGER NOT NULL,
+            PRIMARY KEY(project_id, id)
+        );
+        INSERT INTO translation_units VALUES (1, 'tu', 'clang-libtooling', 1);
         PRAGMA user_version=7;
         """
     )
@@ -724,8 +733,8 @@ def test_v8_migration_is_atomic_and_forces_v7_native_reindex(
 
     monkeypatch.setattr(sqlite_module, "_execute_script", original)
     with SQLiteStore(database) as store:
-        assert SCHEMA_VERSION == 14
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
+        assert SCHEMA_VERSION == 15
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 15  # noqa: SLF001
         assert (
             store._connection.execute(
                 "SELECT advanced_facts_complete FROM translation_units"

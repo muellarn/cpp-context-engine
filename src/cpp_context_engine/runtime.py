@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, replace
 
 from cpp_context_engine.api import (
@@ -16,7 +17,10 @@ from cpp_context_engine.api import (
 from cpp_context_engine.config import AppConfig
 from cpp_context_engine.ingestion import (
     ClangIngestor,
+    DeepMaterializer,
     IndexingResult,
+    MaterializeDeepRequest,
+    MaterializeDeepResult,
     NativeAnalyzerClient,
     NativeClangIngestor,
     ProjectIndexer,
@@ -56,6 +60,7 @@ class Runtime:
     retrieval_service: ContextRetrievalService
     answer_service: IterativeAnswerService | None
     analysis_service: AnalysisQueryService
+    deep_materializer: DeepMaterializer
 
     def close(self) -> None:
         self.store.close()
@@ -90,6 +95,13 @@ class Runtime:
         with build_runtime(replace(self.config, build_scope=scope), require_llm=True) as selected:
             assert selected.answer_service is not None
             return selected.answer_service.answer(scoped_request)
+
+    def materialize_deep(
+        self, request: MaterializeDeepRequest, cancelled: threading.Event | None = None
+    ) -> MaterializeDeepResult:
+        """Run the explicit bounded deep-analysis mutation."""
+
+        return self.deep_materializer.materialize(request, cancelled)
 
 
 def embedding_provider(config: AppConfig) -> EmbeddingProvider:
@@ -263,7 +275,15 @@ def build_runtime(
             selected_llm = llm_provider(config)
         answer = IterativeAnswerService(retrieval, selected_llm) if selected_llm else None
         analysis = AnalysisQueryService(store, config.project_root, config.build_scope)
-        return Runtime(config, store, vector, retrieval, answer, analysis)
+        return Runtime(
+            config,
+            store,
+            vector,
+            retrieval,
+            answer,
+            analysis,
+            DeepMaterializer(config, store),
+        )
     except Exception:
         store.close()
         raise

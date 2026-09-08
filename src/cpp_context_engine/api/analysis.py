@@ -58,6 +58,11 @@ class CoverageEntry(Contract):
     control_flow: bool
     data_flow: bool
     summaries: bool
+    bindings: bool
+    closure_complete: bool
+    materialization_id: str | None
+    limit_reason: str
+    distance: int = Field(ge=0)
 
 
 class SourceLocation(Contract):
@@ -90,6 +95,7 @@ class BuildListResult(Contract):
 
 class CfgRequest(Contract):
     function_symbol_id: Identifier
+    materialization_id: Identifier | None = None
     builds: Annotated[list[BuildName] | None, Field(max_length=MAX_BUILD_VARIANTS)] = None
     max_graphs: int = Field(default=5, ge=1, le=MAX_CFG_GRAPHS)
     max_blocks: int = Field(default=100, ge=1, le=MAX_CFG_BLOCKS)
@@ -147,10 +153,14 @@ class ControlFlowResult(Contract):
     available: bool = Field(default=True, exclude_if=lambda value: value is True)
     unavailable_reason: str | None = Field(default=None, exclude_if=lambda value: value is None)
     coverage: list[CoverageEntry] = Field(default_factory=list, exclude_if=lambda value: not value)
+    required_action: Literal["materialize_deep_analysis"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class FlowRequest(Contract):
     function_symbol_id: Identifier
+    materialization_id: Identifier | None = None
     builds: Annotated[list[BuildName] | None, Field(max_length=MAX_BUILD_VARIANTS)] = None
     max_analyses: int = Field(default=5, ge=1, le=MAX_FLOW_ANALYSES)
     max_locations: int = Field(default=200, ge=1, le=MAX_FLOW_LOCATIONS)
@@ -261,6 +271,9 @@ class DataFlowResult(Contract):
     available: bool = Field(default=True, exclude_if=lambda value: value is True)
     unavailable_reason: str | None = Field(default=None, exclude_if=lambda value: value is None)
     coverage: list[CoverageEntry] = Field(default_factory=list, exclude_if=lambda value: not value)
+    required_action: Literal["materialize_deep_analysis"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class CallRequest(Contract):
@@ -324,7 +337,7 @@ class AnalysisQueryService:
     def control_flow(self, request: CfgRequest) -> ControlFlowResult:
         scope = self.resolve_scope(request.builds)
         function_symbol_id = self._require_symbol(request.function_symbol_id, scope)
-        coverage = self._coverage(function_symbol_id, scope)
+        coverage = self._coverage(function_symbol_id, scope, request.materialization_id)
         if not coverage or not all(item.control_flow for item in coverage):
             return ControlFlowResult(
                 function_symbol_id=function_symbol_id,
@@ -336,11 +349,13 @@ class AnalysisQueryService:
                     "control-flow facts are not covered by the selected index profile"
                 ),
                 coverage=coverage,
+                required_action="materialize_deep_analysis",
             )
         graphs = self.store.cfg_graphs(
             function_symbol_id,
             self.project_root,
             build_scope=scope,
+            translation_unit_ids=tuple(item.translation_unit_id for item in coverage),
             limit=request.max_graphs,
         )
         remaining_blocks = request.max_blocks
@@ -432,13 +447,14 @@ class AnalysisQueryService:
             scope=self._scope_result(scope),
             graphs=rendered,
             truncated=truncated,
+            coverage=coverage,
         )
 
     def data_flow(self, request: FlowRequest) -> DataFlowResult:
         scope = self.resolve_scope(request.builds)
         function_symbol_id = self._require_symbol(request.function_symbol_id, scope)
-        coverage = self._coverage(function_symbol_id, scope)
-        if not coverage or not all(item.data_flow and item.summaries for item in coverage):
+        coverage = self._coverage(function_symbol_id, scope, request.materialization_id)
+        if not coverage or not all(item.data_flow for item in coverage):
             return DataFlowResult(
                 function_symbol_id=function_symbol_id,
                 scope=self._scope_result(scope),
@@ -446,14 +462,16 @@ class AnalysisQueryService:
                 truncated=False,
                 available=False,
                 unavailable_reason=(
-                    "data-flow and summary facts are not covered by the selected index profile"
+                    "data-flow facts are not covered by the selected index profile"
                 ),
                 coverage=coverage,
+                required_action="materialize_deep_analysis",
             )
         graphs = self.store.cfg_graphs(
             function_symbol_id,
             self.project_root,
             build_scope=scope,
+            translation_unit_ids=tuple(item.translation_unit_id for item in coverage),
             limit=request.max_analyses,
         )
         remaining_locations = request.max_locations
@@ -464,6 +482,7 @@ class AnalysisQueryService:
             function_symbol_id,
             self.project_root,
             build_scope=scope,
+            translation_unit_ids=tuple(item.translation_unit_id for item in coverage),
             limit=request.max_analyses,
         )
         summaries_by_graph = {item.graph_id: item for item in summaries.items}
@@ -530,6 +549,7 @@ class AnalysisQueryService:
                     summary.id,
                     self.project_root,
                     build_scope=graph_scope,
+                    translation_unit_ids=tuple(item.translation_unit_id for item in coverage),
                     limit=max(1, remaining_evidence),
                 )
                 remaining_evidence -= len(cross_flows.items)
@@ -593,8 +613,38 @@ class AnalysisQueryService:
                         )
                         for item in selected_evidence
                     ],
-                    summary_complete=summary.complete if summary else None,
-                    summary_incomplete_reasons=list(summary.incomplete_reasons) if summary else [],
+                    summary_complete=(
+                        summary.complete
+                        and next(
+                            (
+                                item.summaries
+                                for item in coverage
+                                if item.translation_unit_id == graph.translation_unit_id
+                            ),
+                            False,
+                        )
+                        if summary
+                        else None
+                    ),
+                    summary_incomplete_reasons=(
+                        [
+                            *summary.incomplete_reasons,
+                            *(
+                                []
+                                if next(
+                                    (
+                                        item.closure_complete
+                                        for item in coverage
+                                        if item.translation_unit_id == graph.translation_unit_id
+                                    ),
+                                    False,
+                                )
+                                else ["partial_materialization_closure"]
+                            ),
+                        ]
+                        if summary
+                        else []
+                    ),
                     effects=[
                         SummaryEffectResult(
                             effect_id=item.id,
@@ -655,6 +705,7 @@ class AnalysisQueryService:
             scope=self._scope_result(scope),
             analyses=rendered,
             truncated=truncated,
+            coverage=coverage,
         )
 
     def calls(self, request: CallRequest) -> CallGraphResult:
@@ -717,7 +768,9 @@ class AnalysisQueryService:
         # Variant IDs are public handles, but compiler fact tables reference canonical symbol IDs.
         return symbol.id
 
-    def _coverage(self, symbol_id: str, scope: BuildScope) -> list[CoverageEntry]:
+    def _coverage(
+        self, symbol_id: str, scope: BuildScope, materialization_id: str | None = None
+    ) -> list[CoverageEntry]:
         return [
             CoverageEntry(
                 build_variant=item.build_variant,
@@ -728,9 +781,17 @@ class AnalysisQueryService:
                 control_flow=item.cfg_facts_complete,
                 data_flow=item.data_flow_facts_complete,
                 summaries=item.summary_facts_complete,
+                bindings=item.binding_facts_complete,
+                closure_complete=item.closure_complete,
+                materialization_id=item.materialization_id,
+                limit_reason=item.limit_reason,
+                distance=item.distance,
             )
             for item in self.store.analysis_coverage(
-                symbol_id, self.project_root, build_scope=scope
+                symbol_id,
+                self.project_root,
+                build_scope=scope,
+                materialization_id=materialization_id,
             )
         ]
 

@@ -140,12 +140,14 @@ class _JsonlStreamDecoder:
         max_decoded_bytes: int,
         max_record_bytes: int,
         on_record: Callable[[dict[str, Any]], None],
+        decoded_budget: _ResourceBudget | None = None,
     ) -> None:
         self._decompressor = zlib.decompressobj(wbits=31) if gzip_transport else None
         self._max_wire_bytes = max_wire_bytes
         self._max_decoded_bytes = max_decoded_bytes
         self._max_record_bytes = max_record_bytes
         self._on_record = on_record
+        self._decoded_budget = decoded_budget
         self._wire_bytes = 0
         self._decoded_bytes = 0
         self._record = bytearray()
@@ -182,6 +184,8 @@ class _JsonlStreamDecoder:
             raise AnalyzerProtocolError("analyzer returned unterminated JSONL")
 
     def _feed_decoded(self, chunk: bytes) -> None:
+        if self._decoded_budget is not None and chunk:
+            self._decoded_budget.acquire(len(chunk))
         self._decoded_bytes += len(chunk)
         if self._decoded_bytes > self._max_decoded_bytes:
             raise AnalyzerLimitError("analyzer exceeded the decoded output limit")
@@ -396,6 +400,9 @@ class NativeAnalyzerClient:
         max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
         prefer_compression: bool = True,
         profile: IndexProfile = IndexProfile.FULL,
+        deadline_monotonic: float | None = None,
+        external_cancelled: threading.Event | None = None,
+        decoded_budget: _ResourceBudget | None = None,
     ) -> None:
         self.binary = binary.expanduser().resolve(strict=False)
         if (
@@ -418,6 +425,9 @@ class NativeAnalyzerClient:
         self.max_stderr_bytes = max_stderr_bytes
         self.prefer_compression = prefer_compression
         self.profile = IndexProfile(profile)
+        self.deadline_monotonic = deadline_monotonic
+        self.external_cancelled = external_cancelled
+        self.decoded_budget = decoded_budget
         self._info: AnalyzerInfo | None = None
 
     def probe(self, *, refresh: bool = False) -> AnalyzerInfo:
@@ -431,6 +441,12 @@ class NativeAnalyzerClient:
         info = self._validate_handshake(records[0])
         self._info = info
         return info
+
+    def check_request(self) -> None:
+        if self.external_cancelled is not None and self.external_cancelled.is_set():
+            raise AnalyzerLimitError("analyzer analysis was cancelled")
+        if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
+            raise AnalyzerLimitError("analyzer exceeded the configured timeout")
 
     @staticmethod
     def _validate_handshake(record: Mapping[str, Any]) -> AnalyzerInfo:
@@ -558,6 +574,7 @@ class NativeAnalyzerClient:
         on_record: Callable[[dict[str, Any]], None] | None = None,
         cancelled: threading.Event | None = None,
     ) -> list[dict[str, Any]]:
+        self.check_request()
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
             raise AnalyzerUnavailableError(
                 "configured analyzer is missing or not executable; build it with CMake"
@@ -618,6 +635,7 @@ class NativeAnalyzerClient:
             max_decoded_bytes=self.max_decoded_bytes,
             max_record_bytes=self.max_record_bytes,
             on_record=accept,
+            decoded_budget=self.decoded_budget,
         )
 
         def read_stdout() -> None:
@@ -661,10 +679,24 @@ class NativeAnalyzerClient:
         timed_out = False
         was_cancelled = False
         deadline = time.monotonic() + self.timeout_seconds
+        if self.deadline_monotonic is not None:
+            deadline = min(deadline, self.deadline_monotonic)
+        cleanup_deadline = float("inf")
+
+        def cleanup_remaining() -> float:
+            return max(0.001, cleanup_deadline - time.monotonic())
+
         try:
             while process.poll() is None:
                 if cancelled is not None and cancelled.is_set():
                     was_cancelled = True
+                    stop_process()
+                    break
+                try:
+                    self.check_request()
+                except AnalyzerLimitError as error:
+                    was_cancelled = "cancelled" in str(error)
+                    timed_out = not was_cancelled
                     stop_process()
                     break
                 if stopped.is_set():
@@ -675,23 +707,27 @@ class NativeAnalyzerClient:
                     break
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
-            process.wait(timeout=2)
+            cleanup_deadline = time.monotonic() + 2
+            process.wait(timeout=cleanup_remaining())
             # A successful leader exit does not imply that descendants released
             # inherited protocol pipes; close the whole session before joining.
             stop_process()
         except subprocess.TimeoutExpired:
             stop_process()
             with suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=2)
+                process.wait(timeout=cleanup_remaining())
         except BaseException:
+            cleanup_deadline = time.monotonic() + 2
             stop_process()
             with suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=2)
+                process.wait(timeout=cleanup_remaining())
             raise
         finally:
-            writer.join(timeout=2)
+            if cleanup_deadline == float("inf"):
+                cleanup_deadline = time.monotonic() + 2
+            writer.join(timeout=cleanup_remaining())
             for reader in readers:
-                reader.join(timeout=2)
+                reader.join(timeout=cleanup_remaining())
         if writer.is_alive() or any(reader.is_alive() for reader in readers):
             stop_process()
             raise AnalyzerLimitError("analyzer cleanup exceeded two seconds")
@@ -801,6 +837,7 @@ class NativeClangIngestor:
         # adapter. The compact framing adds four bytes per fact, so only the
         # independent global spool budget may bound its ephemeral representation.
         registry_byte_limit = self.max_spool_bytes
+        check_request = getattr(self.client, "check_request", lambda: None)
 
         def analyze(configuration: BuildConfiguration) -> _FactRegistry:
             facts = _FactRegistry(
@@ -824,7 +861,12 @@ class NativeClangIngestor:
 
         def convert(index: int, facts: _FactRegistry) -> IngestionBatch:
             try:
-                return _FactBatchBuilder(root, selected[index], self.profile).build(facts)
+                return _FactBatchBuilder(
+                    root,
+                    selected[index],
+                    self.profile,
+                    check_callback=check_request,
+                ).build(facts)
             finally:
                 facts.close()
 
@@ -848,6 +890,13 @@ class NativeClangIngestor:
         failure: BaseException | None = None
         completion_revision = 0
 
+        def request_failure() -> AnalyzerLimitError | None:
+            try:
+                check_request()
+            except AnalyzerLimitError as error:
+                return error
+            return None
+
         def wake(_future: Future[object]) -> None:
             nonlocal completion_revision
             with condition:
@@ -861,6 +910,15 @@ class NativeClangIngestor:
                     while True:
                         observed_revision = completion_revision
                         if stopped:
+                            return
+                        if request_error := request_failure():
+                            failure = request_error
+                            cancelled.set()
+                            for future in analysis_futures:
+                                future.cancel()
+                            for future in conversion_futures.values():
+                                future.cancel()
+                            condition.notify_all()
                             return
 
                         completed_analysis = sorted(
@@ -936,7 +994,7 @@ class NativeClangIngestor:
                         # above. Its synchronous callback cannot wake a wait that
                         # has not started yet, so re-scan instead of losing it.
                         if completion_revision == observed_revision:
-                            condition.wait()
+                            condition.wait(timeout=0.05)
             except BaseException as error:  # pragma: no cover - defensive scheduler boundary
                 with condition:
                     if failure is None:
@@ -950,13 +1008,15 @@ class NativeClangIngestor:
             for index in range(len(selected)):
                 with condition:
                     while True:
+                        if request_error := request_failure():
+                            raise request_error
                         if failure is not None:
                             raise failure
                         current = conversion_futures.get(index)
                         if current is not None and current.done():
                             batch = current.result()
                             break
-                        condition.wait()
+                        condition.wait(timeout=0.05)
                 try:
                     yield batch
                 finally:
@@ -991,49 +1051,61 @@ class NativeClangIngestor:
 
     @staticmethod
     def _merge_batches(
-        batches: Sequence[IngestionBatch], *, profile: IndexProfile = IndexProfile.FULL
+        batches: Sequence[IngestionBatch],
+        *,
+        profile: IndexProfile = IndexProfile.FULL,
+        additional_call_targets: Sequence[CallTarget] = (),
+        check_callback: Callable[[], None] | None = None,
     ) -> IngestionBatch:
-        callsites = tuple(site for batch in batches for site in batch.callsites)
-        call_targets = tuple(target for batch in batches for target in batch.call_targets)
-        all_edges = tuple(edge for batch in batches for edge in batch.edges)
-        call_targets = _add_indexed_override_candidates(callsites, call_targets, all_edges)
+        def items(attribute: str):
+            for batch in batches:
+                if check_callback is not None:
+                    check_callback()
+                for index, item in enumerate(getattr(batch, attribute)):
+                    if check_callback is not None and index % 1024 == 0:
+                        check_callback()
+                    yield item
+
+        callsites = tuple(items("callsites"))
+        call_targets = tuple(items("call_targets"))
+        all_edges = tuple(items("edges"))
+        call_targets = _add_indexed_override_candidates(
+            callsites, call_targets, all_edges, check_callback=check_callback
+        )
+        targets_by_pair = {
+            (target.callsite_id, target.target_symbol_id): target for target in call_targets
+        }
+        for target in additional_call_targets:
+            # Navigation-derived targets fill project-wide gaps only.  Keeping an
+            # analyzer-provided row lets the exact parity check expose conflicts.
+            targets_by_pair.setdefault((target.callsite_id, target.target_symbol_id), target)
+        call_targets = tuple(
+            sorted(
+                targets_by_pair.values(),
+                key=lambda item: (item.callsite_id, item.target_symbol_id, item.id),
+            )
+        )
         inputs = IngestionBatch(
-            build_configurations=tuple(
-                configuration for batch in batches for configuration in batch.build_configurations
-            ),
-            translation_units=tuple(unit for batch in batches for unit in batch.translation_units),
-            symbols=tuple(symbol for batch in batches for symbol in batch.symbols),
-            occurrences=tuple(occurrence for batch in batches for occurrence in batch.occurrences),
+            build_configurations=tuple(items("build_configurations")),
+            translation_units=tuple(items("translation_units")),
+            symbols=tuple(items("symbols")),
+            occurrences=tuple(items("occurrences")),
             edges=all_edges,
-            cfg_graphs=tuple(graph for batch in batches for graph in batch.cfg_graphs),
-            cfg_blocks=tuple(block for batch in batches for block in batch.cfg_blocks),
-            cfg_elements=tuple(element for batch in batches for element in batch.cfg_elements),
-            cfg_edges=tuple(edge for batch in batches for edge in batch.cfg_edges),
+            cfg_graphs=tuple(items("cfg_graphs")),
+            cfg_blocks=tuple(items("cfg_blocks")),
+            cfg_elements=tuple(items("cfg_elements")),
+            cfg_edges=tuple(items("cfg_edges")),
             callsites=callsites,
             call_targets=call_targets,
-            data_flow_analyses=tuple(
-                analysis for batch in batches for analysis in batch.data_flow_analyses
-            ),
-            memory_locations=tuple(
-                location for batch in batches for location in batch.memory_locations
-            ),
-            data_accesses=tuple(access for batch in batches for access in batch.data_accesses),
-            data_flow_evidence=tuple(
-                evidence for batch in batches for evidence in batch.data_flow_evidence
-            ),
-            function_summaries=tuple(
-                summary for batch in batches for summary in batch.function_summaries
-            ),
-            summary_effects=tuple(effect for batch in batches for effect in batch.summary_effects),
-            summary_return_origins=tuple(
-                origin for batch in batches for origin in batch.summary_return_origins
-            ),
-            call_argument_bindings=tuple(
-                binding for batch in batches for binding in batch.call_argument_bindings
-            ),
-            call_result_bindings=tuple(
-                binding for batch in batches for binding in batch.call_result_bindings
-            ),
+            data_flow_analyses=tuple(items("data_flow_analyses")),
+            memory_locations=tuple(items("memory_locations")),
+            data_accesses=tuple(items("data_accesses")),
+            data_flow_evidence=tuple(items("data_flow_evidence")),
+            function_summaries=tuple(items("function_summaries")),
+            summary_effects=tuple(items("summary_effects")),
+            summary_return_origins=tuple(items("summary_return_origins")),
+            call_argument_bindings=tuple(items("call_argument_bindings")),
+            call_result_bindings=tuple(items("call_result_bindings")),
         )
         if profile is IndexProfile.NAVIGATION:
             return inputs
@@ -1045,6 +1117,7 @@ class NativeClangIngestor:
             inputs.call_result_bindings,
             inputs.callsites,
             inputs.call_targets,
+            check_cancelled=check_callback,
         )
         return replace(
             inputs,
@@ -1061,6 +1134,8 @@ class _FactBatchBuilder:
         root: Path,
         configuration: BuildConfiguration,
         profile: IndexProfile = IndexProfile.FULL,
+        *,
+        check_callback: Callable[[], None] | None = None,
     ) -> None:
         self.root = root
         self.configuration = configuration
@@ -1086,11 +1161,19 @@ class _FactBatchBuilder:
         self.function_summary_analysis_ids: dict[str, str] = {}
         self.function_summary_parameter_counts: dict[str, int] = {}
         self.path_cache: dict[str, Path] = {}
+        self.check_callback = check_callback
+
+    def _check(self) -> None:
+        if self.check_callback is not None:
+            self.check_callback()
 
     def build(self, facts: Iterable[Mapping[str, Any]]) -> IngestionBatch:
+        self._check()
         for fact in _fact_records(facts, "file"):
+            self._check()
             self._file_fact(fact)
         for fact in _fact_records(facts, "symbol"):
+            self._check()
             self._symbol_fact(fact)
         for fact in _fact_records(facts, "include"):
             if isinstance(fact.get("resolved_path"), str):
@@ -1099,10 +1182,12 @@ class _FactBatchBuilder:
         occurrences: dict[str, SymbolOccurrence] = {}
         edges: dict[str, GraphEdge] = {}
         for fact in _fact_records(facts, "occurrence"):
+            self._check()
             occurrence = self._occurrence_fact(fact)
             occurrences[occurrence.id] = occurrence
         for fact_kind in ("edge", "include"):
             for fact in _fact_records(facts, fact_kind):
+                self._check()
                 edge = self._edge_fact(fact)
                 if edge is not None:
                     edges[edge.id] = edge
@@ -1118,13 +1203,13 @@ class _FactBatchBuilder:
             analyses = locations = accesses = evidence = ()
             summaries = effects = origins = argument_bindings = result_bindings = ()
         dependencies = tuple(
-            (path, _hash_bytes(path.read_bytes())) for path in sorted(set(self.files.values()))
+            (path, self._file_hash(path)) for path in sorted(set(self.files.values()))
         )
         unit = TranslationUnit(
             id=self.unit_id,
             build_configuration_id=self.configuration.id,
             source_path=self.configuration.source_path,
-            content_hash=_hash_bytes(self.configuration.source_path.read_bytes()),
+            content_hash=self._file_hash(self.configuration.source_path),
             dependencies=dependencies,
             build_variant=self.configuration.build_variant,
             analysis_backend=NativeClangIngestor.analysis_backend,
@@ -1157,6 +1242,15 @@ class _FactBatchBuilder:
             call_argument_bindings=argument_bindings,
             call_result_bindings=result_bindings,
         )
+
+    def _file_hash(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                self._check()
+                digest.update(chunk)
+        self._check()
+        return digest.hexdigest()
 
     def _data_flow_facts(
         self, facts: Iterable[Mapping[str, Any]]
@@ -2324,17 +2418,23 @@ def _add_indexed_override_candidates(
     callsites: Sequence[CallSite],
     targets: Sequence[CallTarget],
     edges: Sequence[GraphEdge],
+    *,
+    check_callback: Callable[[], None] | None = None,
 ) -> tuple[CallTarget, ...]:
     """Add build-local transitive overrides without claiming an open-world complete set."""
 
     direct_overrides: dict[tuple[str, str], set[str]] = {}
     for edge in edges:
+        if check_callback is not None:
+            check_callback()
         if edge.relation == GraphRelation.OVERRIDES:
             direct_overrides.setdefault((edge.build_variant, edge.target_id), set()).add(
                 edge.source_id
             )
     result = {(target.callsite_id, target.target_symbol_id): target for target in targets}
     for site in callsites:
+        if check_callback is not None:
+            check_callback()
         if site.dispatch_kind != CallDispatchKind.VIRTUAL or site.static_target_symbol_id is None:
             continue
         pending = sorted(
@@ -2342,6 +2442,8 @@ def _add_indexed_override_candidates(
         )
         visited: set[str] = set()
         while pending:
+            if check_callback is not None:
+                check_callback()
             target_id = pending.pop(0)
             if target_id in visited:
                 continue

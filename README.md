@@ -520,3 +520,15 @@ import time.
 - One MCP process serves one configured project. It serializes indexing and shared
   SQLite access for correctness; long indexing calls therefore temporarily queue
   search and graph calls.
+
+Navigation indexes can materialize compiler-deep evidence explicitly with the
+Python `materialize_deep` operation or MCP `materialize_deep_analysis` tool. The
+request resolves a deterministic same-build definition-TU closure and defaults to
+at most 4 TUs, 2 analyzer workers, 120 seconds, 512 MiB decoded output, and 512 MiB
+of spool data in at most 128 files. CFG/data-flow reads never launch Clang: an
+unavailable response names the materialization action, and callers may pass the
+returned `materialization_id` back to those reads. Successful results are cached
+from compile-command, source, dependency, analyzer, protocol, and schema identity;
+the response reports those analyzer/protocol/schema/profile/build/closure identities
+plus each TU's opaque identity and distance. Failure or cancellation leaves the
+previous navigation and deep generations intact.

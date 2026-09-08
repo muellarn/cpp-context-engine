@@ -4,6 +4,7 @@ import math
 import sqlite3
 import struct
 import threading
+import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -12,10 +13,12 @@ from pathlib import Path
 import pytest
 
 import cpp_context_engine.storage.sqlite as sqlite_storage
+from cpp_context_engine.ingestion.deep import DeepCancellation, DeepRequestControl
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
     BuildScope,
+    BuildVariant,
     CodeSymbol,
     GraphDirection,
     GraphEdge,
@@ -346,6 +349,465 @@ def test_schema_round_trip_fts_graph_and_occurrences(tmp_path: Path) -> None:
         )
 
 
+def test_deep_overlay_preserves_navigation_rows_and_exposes_overlay_coverage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    navigation_unit = replace(
+        batch.translation_units[0],
+        index_profile=IndexProfile.NAVIGATION,
+        navigation_facts_complete=True,
+    )
+    navigation = replace(batch, translation_units=(navigation_unit,))
+    database = tmp_path / "index.db"
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(root, navigation, index_profile=IndexProfile.NAVIGATION)
+        before = store._connection.execute(  # noqa: SLF001
+            "SELECT index_profile, navigation_facts_complete, cfg_facts_complete, "
+            "data_flow_facts_complete, summary_facts_complete FROM translation_units"
+        ).fetchone()
+        full_unit = replace(
+            navigation_unit,
+            index_profile=IndexProfile.FULL,
+            advanced_facts_complete=True,
+            cfg_facts_complete=True,
+            data_flow_facts_complete=True,
+            summary_facts_complete=True,
+        )
+        store.apply_deep_overlay(
+            root,
+            (replace(navigation, translation_units=(full_unit,)),),
+            root_symbol_id="symbol-alpha",
+            materialization_id="deep-generation-a",
+            identities={full_unit.id: "identity-a"},
+            command_hashes={full_unit.id: "command-hash"},
+            distances={full_unit.id: 0},
+            analyzer_identity="analyzer-a",
+            protocol_version=5,
+            closure_complete=True,
+        )
+        after = store._connection.execute(  # noqa: SLF001
+            "SELECT index_profile, navigation_facts_complete, cfg_facts_complete, "
+            "data_flow_facts_complete, summary_facts_complete FROM translation_units"
+        ).fetchone()
+        uncovered = store.analysis_coverage("symbol-alpha", root)
+        coverage = store.analysis_coverage(
+            "symbol-alpha", root, materialization_id="deep-generation-a"
+        )
+
+    assert tuple(after) == tuple(before) == ("navigation", 1, 0, 0, 0)
+    assert len(uncovered) == 1
+    assert not uncovered[0].cfg_facts_complete
+    assert len(coverage) == 1
+    assert coverage[0].index_profile is IndexProfile.NAVIGATION
+    assert coverage[0].navigation_facts_complete
+    assert coverage[0].cfg_facts_complete
+    assert coverage[0].data_flow_facts_complete
+    assert coverage[0].summary_facts_complete
+
+
+def test_deep_coverage_ignores_declarations_and_requires_exact_token_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    definition = _batch(root)
+    declaration_path = root / "consumer.cpp"
+    declaration_path.write_text("int alpha();\n", encoding="utf-8")
+    declaration_configuration = replace(
+        definition.build_configurations[0],
+        id="build-declaration",
+        source_path=declaration_path,
+        arguments=("c++", "consumer.cpp"),
+        command_hash="declaration-command",
+    )
+    declaration_unit = replace(
+        definition.translation_units[0],
+        id="unit-declaration",
+        build_configuration_id=declaration_configuration.id,
+        source_path=declaration_path,
+        content_hash="declaration-content",
+        dependencies=((declaration_path, "declaration-content"),),
+        index_profile=IndexProfile.NAVIGATION,
+        navigation_facts_complete=True,
+    )
+    declaration_symbol = replace(
+        definition.symbols[1],
+        build_configuration_id=declaration_configuration.id,
+        translation_unit_id=declaration_unit.id,
+        variant_id="variant-declaration",
+        metadata={"is_definition": False},
+    )
+    definition_unit = replace(
+        definition.translation_units[0],
+        index_profile=IndexProfile.NAVIGATION,
+        navigation_facts_complete=True,
+    )
+    navigation = replace(
+        definition,
+        build_configurations=(definition.build_configurations[0], declaration_configuration),
+        translation_units=(definition_unit, declaration_unit),
+        symbols=(*definition.symbols, declaration_symbol),
+    )
+    deep_unit = replace(
+        definition_unit,
+        index_profile=IndexProfile.FULL,
+        advanced_facts_complete=True,
+        cfg_facts_complete=True,
+        data_flow_facts_complete=True,
+        summary_facts_complete=True,
+    )
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, navigation, index_profile=IndexProfile.NAVIGATION)
+        store.apply_deep_overlay(
+            root,
+            (replace(definition, translation_units=(deep_unit,)),),
+            root_symbol_id="symbol-alpha",
+            materialization_id="definition-token",
+            identities={deep_unit.id: "definition-identity"},
+            command_hashes={deep_unit.id: "command-hash"},
+            distances={deep_unit.id: 0},
+            analyzer_identity="analyzer",
+            protocol_version=5,
+            closure_complete=True,
+        )
+        covered = store.analysis_coverage(
+            "symbol-alpha", root, materialization_id="definition-token"
+        )
+        store._connection.execute(  # noqa: SLF001 - simulate replaced cache bytes
+            "UPDATE deep_tu_cache SET identity_hash = 'replacement-identity'"
+        )
+        mismatched = store.analysis_coverage(
+            "symbol-alpha", root, materialization_id="definition-token"
+        )
+
+    assert [item.translation_unit_id for item in covered] == ["unit-a"]
+    assert mismatched == ()
+
+
+def test_deep_materialization_tokens_and_cache_are_isolated_by_build_variant(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    base = _batch(root)
+
+    def variant_batch(name: str, suffix: str) -> IngestionBatch:
+        configuration = replace(
+            base.build_configurations[0],
+            id=f"build-{suffix}",
+            command_hash=f"command-{suffix}",
+            build_variant=name,
+        )
+        unit = replace(
+            base.translation_units[0],
+            id=f"unit-{suffix}",
+            build_configuration_id=configuration.id,
+            build_variant=name,
+            index_profile=IndexProfile.NAVIGATION,
+            navigation_facts_complete=True,
+        )
+        symbols = tuple(
+            replace(
+                symbol,
+                build_configuration_id=configuration.id,
+                translation_unit_id=unit.id,
+                build_variant=name,
+                variant_id=f"variant-{suffix}-{symbol.id}",
+            )
+            for symbol in base.symbols
+        )
+        occurrence = replace(
+            base.occurrences[0],
+            id=f"occurrence-{suffix}",
+            translation_unit_id=unit.id,
+            build_configuration_id=configuration.id,
+            build_variant=name,
+        )
+        edge = replace(
+            base.edges[0],
+            id=f"edge-{suffix}",
+            translation_unit_id=unit.id,
+            build_configuration_id=configuration.id,
+            build_variant=name,
+        )
+        return IngestionBatch((configuration,), (unit,), symbols, (occurrence,), (edge,))
+
+    default = variant_batch("default", "default")
+    debug = variant_batch("debug", "debug")
+    database = tmp_path / "index.db"
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(
+            root,
+            default,
+            build_variant=BuildVariant("default", root / "compile_commands.json"),
+            index_profile=IndexProfile.NAVIGATION,
+        )
+        store.apply_ingestion(
+            root,
+            debug,
+            build_variant=BuildVariant("debug", root / "compile_commands_debug.json"),
+            index_profile=IndexProfile.NAVIGATION,
+        )
+        for batch, token, identity in (
+            (default, "default-token", "default-identity"),
+            (debug, "debug-token", "debug-identity"),
+        ):
+            unit = replace(
+                batch.translation_units[0],
+                index_profile=IndexProfile.FULL,
+                advanced_facts_complete=True,
+                cfg_facts_complete=True,
+                data_flow_facts_complete=True,
+                summary_facts_complete=True,
+            )
+            store.apply_deep_overlay(
+                root,
+                (replace(batch, translation_units=(unit,)),),
+                root_symbol_id="symbol-alpha",
+                materialization_id=token,
+                identities={unit.id: identity},
+                command_hashes={unit.id: batch.build_configurations[0].command_hash},
+                distances={unit.id: 0},
+                analyzer_identity="analyzer",
+                protocol_version=5,
+                closure_complete=True,
+                build_scope=BuildScope.single(unit.build_variant),
+            )
+
+        union = BuildScope(("default", "debug"))
+        default_coverage = store.analysis_coverage(
+            "symbol-alpha", root, build_scope=union, materialization_id="default-token"
+        )
+        debug_coverage = store.analysis_coverage(
+            "symbol-alpha", root, build_scope=union, materialization_id="debug-token"
+        )
+        store._connection.execute(  # noqa: SLF001 - replace only one build cache
+            "UPDATE deep_tu_cache SET identity_hash = 'stale' WHERE build_variant = 'default'"
+        )
+        debug_survives = store.deep_materialization_matches(
+            "debug-token", {"unit-debug": "debug-identity"}, root
+        )
+
+    assert [item.build_variant for item in default_coverage] == ["default"]
+    assert [item.build_variant for item in debug_coverage] == ["debug"]
+    assert debug_survives
+
+
+def test_deep_overlay_failure_preserves_previous_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    unit = replace(
+        batch.translation_units[0],
+        advanced_facts_complete=True,
+        cfg_facts_complete=True,
+        data_flow_facts_complete=True,
+        summary_facts_complete=True,
+    )
+    deep_batch = replace(batch, translation_units=(unit,))
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.apply_deep_overlay(
+            root,
+            (deep_batch,),
+            root_symbol_id="symbol-alpha",
+            materialization_id="deep-generation-a",
+            identities={unit.id: "identity-a"},
+            command_hashes={unit.id: "command-hash"},
+            distances={unit.id: 0},
+            analyzer_identity="analyzer-a",
+            protocol_version=5,
+            closure_complete=True,
+        )
+
+        def fail(*_args: object) -> None:
+            raise RuntimeError("injected deep publish failure")
+
+        monkeypatch.setattr(store, "_put_data_flow_facts", fail)
+        with pytest.raises(RuntimeError, match="injected deep publish failure"):
+            store.apply_deep_overlay(
+                root,
+                (deep_batch,),
+                root_symbol_id="symbol-alpha",
+                materialization_id="deep-generation-b",
+                identities={unit.id: "identity-b"},
+                command_hashes={unit.id: "command-hash"},
+                distances={unit.id: 0},
+                analyzer_identity="analyzer-b",
+                protocol_version=5,
+                closure_complete=True,
+            )
+
+        cache = store.deep_cache_states(root)[unit.id]
+        assert cache.identity_hash == "identity-a"
+        assert store.deep_materialization_matches(
+            "deep-generation-a", {unit.id: "identity-a"}, root
+        )
+        assert not store.deep_materialization_matches(
+            "deep-generation-b", {unit.id: "identity-b"}, root
+        )
+
+
+def test_partial_deep_overlay_never_claims_summary_or_bindings_complete(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    unit = replace(
+        batch.translation_units[0],
+        cfg_facts_complete=True,
+        data_flow_facts_complete=True,
+        summary_facts_complete=True,
+    )
+    deep_batch = replace(batch, translation_units=(unit,))
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.apply_deep_overlay(
+            root,
+            (deep_batch,),
+            root_symbol_id="symbol-alpha",
+            materialization_id="partial-generation",
+            identities={unit.id: "identity"},
+            command_hashes={unit.id: "command-hash"},
+            distances={unit.id: 0},
+            analyzer_identity="analyzer",
+            protocol_version=5,
+            closure_complete=False,
+            limit_reason="max_tus",
+        )
+        state = store.deep_cache_states(root)[unit.id]
+        coverage = store.analysis_coverage(
+            "symbol-alpha", root, materialization_id="partial-generation"
+        )
+    assert state.cfg_complete
+    assert state.data_flow_complete
+    # The cache records which structural facts were materialized.  Semantic
+    # completeness is a property of the exact closure token, not of one TU.
+    assert state.summaries_complete
+    assert state.bindings_complete
+    assert len(coverage) == 1
+    assert coverage[0].cfg_facts_complete
+    assert coverage[0].data_flow_facts_complete
+    assert not coverage[0].summary_facts_complete
+    assert not coverage[0].binding_facts_complete
+    assert not coverage[0].closure_complete
+    assert coverage[0].materialization_id == "partial-generation"
+    assert coverage[0].limit_reason == "max_tus"
+    assert coverage[0].distance == 0
+
+
+def test_cancelled_deep_publish_preserves_previous_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    unit = replace(
+        batch.translation_units[0],
+        cfg_facts_complete=True,
+        data_flow_facts_complete=True,
+        summary_facts_complete=True,
+    )
+    deep_batch = replace(batch, translation_units=(unit,))
+    cancelled = DeepCancellation()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.apply_deep_overlay(
+            root,
+            (deep_batch,),
+            root_symbol_id="symbol-alpha",
+            materialization_id="old-generation",
+            identities={unit.id: "old-identity"},
+            command_hashes={unit.id: "command-hash"},
+            distances={unit.id: 0},
+            analyzer_identity="analyzer",
+            protocol_version=5,
+            closure_complete=True,
+        )
+
+        def cancel_at_commit(stage: str) -> None:
+            assert stage == "pre-commit"
+            cancelled.set()
+
+        monkeypatch.setattr(store, "_deep_publication_checkpoint", cancel_at_commit)
+        control = DeepRequestControl(time.monotonic(), 30, cancelled)
+        with pytest.raises(RuntimeError, match="was cancelled"):
+            store.apply_deep_overlay(
+                root,
+                (deep_batch,),
+                root_symbol_id="symbol-alpha",
+                materialization_id="late-generation",
+                identities={unit.id: "late-identity"},
+                command_hashes={unit.id: "command-hash"},
+                distances={unit.id: 0},
+                analyzer_identity="analyzer",
+                protocol_version=5,
+                closure_complete=True,
+                cancelled=cancelled,
+                request_control=control,
+            )
+        assert store.deep_materialization_matches("old-generation", {unit.id: "old-identity"}, root)
+        assert not store.deep_materialization_matches(
+            "late-generation", {unit.id: "late-identity"}, root
+        )
+
+
+def test_deep_navigation_parity_rejects_changed_retained_facts(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.validate_deep_navigation_parity(root, (batch,))
+        store._connection.execute(  # noqa: SLF001 - simulate a stale navigation snapshot
+            "UPDATE occurrences SET metadata_json = '{\"changed\": true}'"
+        )
+
+        with pytest.raises(RuntimeError, match="occurrences differ"):
+            store.validate_deep_navigation_parity(root, (batch,))
+
+
+def test_v15_deep_overlay_migration_failure_rolls_back_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "index.db"
+    with SQLiteStore(database, project_root=root):
+        pass
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE deep_materialization_units")
+    connection.execute("DROP TABLE deep_tu_cache")
+    connection.execute("DROP TABLE deep_materializations")
+    connection.execute("PRAGMA user_version = 14")
+    connection.commit()
+    connection.close()
+
+    def fail(_store: SQLiteStore, stage: str) -> None:
+        if stage == "indexes":
+            raise RuntimeError("injected v15 migration failure")
+
+    monkeypatch.setattr(SQLiteStore, "_deep_migration_checkpoint", fail)
+    with pytest.raises(RuntimeError, match="injected v15 migration failure"):
+        SQLiteStore(database, project_root=root)
+
+    unchanged = sqlite3.connect(database)
+    try:
+        assert unchanged.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert (
+            unchanged.execute("SELECT name FROM sqlite_master WHERE name LIKE 'deep_%'").fetchall()
+            == []
+        )
+    finally:
+        unchanged.close()
+
+
 def _create_v12_profile_fixture(database: Path, root: Path) -> None:
     """Create a structurally accurate v12 database with representative TU rows."""
 
@@ -409,7 +871,7 @@ def test_v13_migration_upgrades_real_v12_profile_and_coverage_rows(tmp_path: Pat
         }.isdisjoint(row[1] for row in legacy.execute("PRAGMA table_info(translation_units)"))
 
     with SQLiteStore(database, project_root=root) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 15  # noqa: SLF001
         assert "vector_encoding" in {  # noqa: SLF001
             row[1] for row in migrated._connection.execute("PRAGMA table_info(embedding_vectors)")
         }
@@ -1488,7 +1950,7 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     legacy.close()
 
     with SQLiteStore(database, project_root=root) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 15  # noqa: SLF001
         assert store.embedding_count("fixture") == 2
         assert store.embedding_vector_count("fixture") == 1
         assert store.embedding_count("openai-compatible:legacy") == 0
@@ -1585,7 +2047,7 @@ def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 14  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 15  # noqa: SLF001
         assert "vector_encoding" in {
             row[1]
             for row in store._connection.execute(  # noqa: SLF001
