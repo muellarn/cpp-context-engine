@@ -123,6 +123,13 @@ class CdbInspection:
 
 
 @dataclass(frozen=True, slots=True)
+class SubsetDatabase:
+    sha256: str
+    raw_entry_count: int
+    normalized_configuration_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class CanaryLimits:
     wall_seconds: float
     rss_bytes: int = int(2.5 * 1024**3)
@@ -252,7 +259,7 @@ def select_gate_entries(inspection: CdbInspection, gate: int | str) -> tuple[Cdb
 
 def write_subset_database(
     source_database: Path, entries: Sequence[CdbEntry], destination: Path
-) -> str:
+) -> SubsetDatabase:
     """Write a gate CDB while preserving command bytes and working-directory meaning."""
 
     raw = _load_raw_cdb(source_database.resolve(strict=True))
@@ -265,9 +272,12 @@ def write_subset_database(
     destination.parent.mkdir(parents=True, exist_ok=True)
     _write_report_atomic(destination, document)
     normalized = CompilationDatabase.load(destination)
-    if len(normalized.configurations) != len(entries):
-        raise ValueError("selected CDB contains duplicate compiler configurations")
-    return hashlib.sha256(document.encode()).hexdigest()
+    # Real CDBs may repeat raw commands; preserve every row while indexing each identity once.
+    return SubsetDatabase(
+        sha256=hashlib.sha256(document.encode()).hexdigest(),
+        raw_entry_count=len(selected),
+        normalized_configuration_count=len(normalized.configurations),
+    )
 
 
 def _encode_digest_value(value: Any) -> bytes:
@@ -1013,6 +1023,8 @@ def _compare_baseline_gate(
     key = str(gate.get("gate"))
     for field in (
         "selection",
+        "raw_cdb_entries",
+        "translation_units",
         "selected_raw_indices",
         "subset_cdb_sha256",
         "semantic_snapshot",
@@ -1098,13 +1110,21 @@ def run_canary(
         running_marker = running / ".running"
         _write_report_atomic(running_marker, "incomplete\n")
         subset = running / "compile_commands.json"
-        subset_hash = write_subset_database(inspection.compilation_database, selected, subset)
+        subset_metadata = write_subset_database(
+            inspection.compilation_database, selected, subset
+        )
+        if gate != "all" and (
+            subset_metadata.normalized_configuration_count
+            != subset_metadata.raw_entry_count
+        ):
+            raise RuntimeError("numeric gate did not select unique compiler configurations")
+        expected_translation_units = subset_metadata.normalized_configuration_count
         spec = {
             "project_root": str(inspection.project_root),
             "compilation_database": str(subset),
             "database": str(running / "index.db"),
             "analyzer": str(analyzer),
-            "translation_units": len(selected),
+            "translation_units": expected_translation_units,
             "workers": workers,
             "analyzer_timeout_seconds": analyzer_timeout_seconds,
             "embedding_dimensions": embedding_dimensions,
@@ -1121,17 +1141,25 @@ def run_canary(
             no_progress_seconds=no_progress_seconds,
         )
         try:
-            measured = _run_supervised(spec_path, running, limits, len(selected))
-            if measured["completed_translation_units"] != len(selected):
+            measured = _run_supervised(
+                spec_path, running, limits, expected_translation_units
+            )
+            # Never publish success while an analyzer descendant observed by the supervisor lives.
+            if measured.get("process_group_clean") is not True:
+                raise RuntimeError("canary worker process tree was not cleaned up")
+            if measured["completed_translation_units"] != expected_translation_units:
                 raise RuntimeError("worker did not stage every selected translation unit")
-            _validate_profile_provenance(measured["database_provenance"], profile, len(selected))
+            _validate_profile_provenance(
+                measured["database_provenance"], profile, expected_translation_units
+            )
             gate_report = {
                 "gate": gate,
                 "selection": "complete_cdb" if gate == "all" else "project_source_prefix",
-                "translation_units": len(selected),
+                "raw_cdb_entries": subset_metadata.raw_entry_count,
+                "translation_units": expected_translation_units,
                 "selected_raw_indices": [entry.raw_index for entry in selected],
                 "selected_sources": [entry.display_path for entry in selected],
-                "subset_cdb_sha256": subset_hash,
+                "subset_cdb_sha256": subset_metadata.sha256,
                 "limits": asdict(limits),
                 **measured,
             }

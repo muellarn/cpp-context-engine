@@ -23,7 +23,9 @@ outside the source root. Preflight classifies these as `generated_build_source`
 or `external_source`; it does not reject them. Numeric 1/4/16/32 gates select
 only canonical, unique source-root TUs in original CDB order so a generated or
 duplicate prefix cannot silently change the canary. The later `all` gate retains
-the exact full CDB, including generated entries.
+the exact full raw CDB, including generated entries and duplicate rows. Its
+`raw_cdb_entries` report field counts those rows, while `translation_units` and
+progress use the loader's normalized unique compiler configurations.
 
 The current analyzer confines searchable facts to `project_root`. It can process
 an out-of-tree generated TU and retain facts from project-local headers, but the

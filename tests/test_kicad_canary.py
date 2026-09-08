@@ -103,13 +103,101 @@ def test_gate_subset_is_deterministic_and_retains_original_working_directory(
     selected = select_gate_entries(inspection, 2)
     subset = tmp_path / "gate" / "compile_commands.json"
 
-    digest = write_subset_database(cdb, selected, subset)
+    metadata = write_subset_database(cdb, selected, subset)
     payload = json.loads(subset.read_text(encoding="utf-8"))
 
     assert [entry.raw_index for entry in selected] == [0, 1]
     assert all(Path(entry["directory"]).is_absolute() for entry in payload)
     assert payload[0]["file"] == "src/a.cpp"
-    assert len(digest) == 64
+    assert len(metadata.sha256) == 64
+    assert metadata.raw_entry_count == metadata.normalized_configuration_count == 2
+
+
+def test_all_gate_retains_raw_duplicates_but_counts_normalized_configurations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    first = project / "first.cpp"
+    second = project / "second.cpp"
+    first.write_text("int first();\n", encoding="utf-8")
+    second.write_text("int second();\n", encoding="utf-8")
+    duplicate = {
+        "directory": str(project),
+        "file": "first.cpp",
+        "arguments": ["c++", "-c", "first.cpp"],
+    }
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [
+            duplicate,
+            duplicate,
+            {
+                "directory": str(project),
+                "file": "second.cpp",
+                "arguments": ["c++", "-c", "second.cpp"],
+            },
+        ],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    observed: dict[str, object] = {}
+
+    def supervised(spec_path, gate_directory, _limits, total_tus):
+        observed["spec"] = json.loads(spec_path.read_text(encoding="utf-8"))
+        observed["total_tus"] = total_tus
+        observed["subset"] = json.loads(
+            (gate_directory / "compile_commands.json").read_text(encoding="utf-8")
+        )
+        return {
+            "completed_translation_units": 2,
+            "process_group_clean": True,
+            "database_provenance": {
+                "translation_unit_groups": [
+                    {
+                        "analysis_backend": "clang-libtooling",
+                        "advanced_facts_complete": 0,
+                        "index_profile": "navigation",
+                        "navigation_facts_complete": 1,
+                        "cfg_facts_complete": 0,
+                        "data_flow_facts_complete": 0,
+                        "summary_facts_complete": 0,
+                        "translation_units": 2,
+                    }
+                ],
+                "build_variants": [{"name": "default", "index_profile": "navigation"}],
+            },
+        }
+
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
+
+    report = kicad_canary.run_canary(
+        project_root=project,
+        compilation_database=cdb,
+        analyzer=analyzer,
+        output_directory=tmp_path / "output",
+        gates=("all",),
+        gate_timeouts={"all": 1.0},
+        workers=1,
+        analyzer_timeout_seconds=1,
+        embedding_dimensions=1,
+        queries=("first",),
+        rss_bytes=1,
+        database_bytes=1,
+        disk_bytes=1,
+        no_progress_seconds=1,
+    )
+
+    gate = report["gates"][0]
+    assert len(observed["subset"]) == 3
+    assert observed["total_tus"] == 2
+    assert observed["spec"]["translation_units"] == 2
+    assert gate["selected_raw_indices"] == [0, 1, 2]
+    assert gate["raw_cdb_entries"] == 3
+    assert gate["translation_units"] == 2
 
 
 def test_preflight_rejects_missing_sources_and_numeric_gates_deduplicate_tus(
@@ -212,6 +300,8 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
             {
                 "gate": 1,
                 "selection": "project_source_prefix",
+                "raw_cdb_entries": 1,
+                "translation_units": 1,
                 "selected_raw_indices": [16],
                 "subset_cdb_sha256": "subset",
                 "semantic_snapshot": {"digest": "facts"},
@@ -235,6 +325,14 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
     [
         (lambda baseline: baseline.update(workers=4), "workers"),
         (lambda baseline: baseline["gates"].clear(), "gate set"),
+        (
+            lambda baseline: baseline["gates"][0].update(raw_cdb_entries=2),
+            "raw_cdb_entries",
+        ),
+        (
+            lambda baseline: baseline["gates"][0].update(translation_units=2),
+            "translation_units",
+        ),
         (
             lambda baseline: baseline["gates"][0]["analyzer"].update(sha256="different"),
             "analyzer",
@@ -267,6 +365,8 @@ def test_baseline_comparison_requires_exact_provenance_and_gate_set(
             {
                 "gate": 32,
                 "selection": "project_source_prefix",
+                "raw_cdb_entries": 32,
+                "translation_units": 32,
                 "selected_raw_indices": list(range(32)),
                 "subset_cdb_sha256": "subset",
                 "semantic_snapshot": {"digest": "facts"},
@@ -344,7 +444,11 @@ def test_baseline_mismatch_never_publishes_gate_success(
     monkeypatch.setattr(
         kicad_canary,
         "_run_supervised",
-        lambda *_args: {"completed_translation_units": 1, "database_provenance": provenance},
+        lambda *_args: {
+            "completed_translation_units": 1,
+            "process_group_clean": True,
+            "database_provenance": provenance,
+        },
     )
     monkeypatch.setattr(
         kicad_canary,
@@ -374,6 +478,57 @@ def test_baseline_mismatch_never_publishes_gate_success(
 
     failed = output / ".gate-1.failed"
     assert (failed / ".running").is_file()
+    assert not (failed / "SUCCESS").exists()
+
+
+def test_unclean_process_tree_never_publishes_gate_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(kicad_canary, "_validate_profile_provenance", lambda *_args: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_run_supervised",
+        lambda *_args: {
+            "completed_translation_units": 1,
+            "process_group_clean": False,
+            "database_provenance": {},
+        },
+    )
+    output = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="process tree"):
+        kicad_canary.run_canary(
+            project_root=project,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=output,
+            gates=(1,),
+            gate_timeouts={"1": 1.0},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            embedding_dimensions=1,
+            queries=("main",),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=1,
+        )
+
+    failed = output / ".gate-1.failed"
+    assert failed.is_dir()
     assert not (failed / "SUCCESS").exists()
 
 
