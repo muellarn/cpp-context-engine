@@ -64,10 +64,10 @@ def _config(project: Path, database: Path) -> AppConfig:
     )
 
 
-def _seed(config: AppConfig) -> None:
-    source = config.project_root / "src" / "fixture.cpp"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_text(
+def _seed(config: AppConfig, *, sources: dict[str, Path] | None = None) -> None:
+    default_source = config.project_root / "src" / "fixture.cpp"
+    default_source.parent.mkdir(parents=True, exist_ok=True)
+    default_source.write_text(
         "int target() { return 1; }\nint analyze() { int x = 1; return target() + x; }\n",
         encoding="utf-8",
     )
@@ -75,6 +75,7 @@ def _seed(config: AppConfig) -> None:
     with SQLiteStore(config.database_path, project_root=config.project_root) as store:
         for variant in config.build_variants:
             name = variant.name
+            source = sources.get(name, default_source) if sources is not None else default_source
             configuration = BuildConfiguration(
                 id=f"config-{name}",
                 source_path=source,
@@ -82,6 +83,7 @@ def _seed(config: AppConfig) -> None:
                 arguments=("c++", str(source)),
                 command_hash=f"command-{name}",
                 build_variant=name,
+                generated_source_roots=variant.generated_source_roots,
             )
             unit = TranslationUnit(
                 id=f"unit-{name}",
@@ -711,6 +713,159 @@ def test_mcp_build_filters_do_not_leak_and_call_evidence_is_ranked(tmp_path: Pat
             )
             assert len(bounded_neighbors.structured_content["edges"]) == 1
             assert bounded_neighbors.structured_content["truncated"]
+
+    anyio.run(scenario)
+
+
+def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    variants = []
+    sources = {}
+    for name in ("alpha", "beta"):
+        build = tmp_path / f"build-{name}"
+        generated = build / "generated"
+        generated.mkdir(parents=True)
+        source = generated / f"{name}.cpp"
+        source.write_text(
+            "int target() { return 1; }\nint analyze() { int x = 1; return target() + x; }\n",
+            encoding="utf-8",
+        )
+        compilation_database = build / "compile_commands.json"
+        compilation_database.write_text("[]", encoding="utf-8")
+        variants.append(
+            BuildVariant(name, compilation_database, generated_source_roots=(generated,))
+        )
+        sources[name] = source
+    config = AppConfig(
+        project_root=project,
+        index_directory=tmp_path,
+        database_path=tmp_path / "index.db",
+        build_variants=tuple(variants),
+        build_scope=BuildScope(("alpha", "beta")),
+        embedding_dimensions=16,
+    )
+    _seed(config, sources=sources)
+    alpha_only = CodeSymbol(
+        id="cxx:alpha-only",
+        qualified_name="alpha_only_marker",
+        kind=SymbolKind.FUNCTION,
+        span=SourceSpan(sources["alpha"], 1, 1),
+        source_hash="alpha-only",
+        source_text="int alpha_only_marker() { return 1; }",
+        build_configuration_id="config-alpha",
+        translation_unit_id="unit-alpha",
+        build_variant="alpha",
+        metadata={"is_definition": True},
+    )
+    beta_with_alpha_location = CodeSymbol(
+        id="cxx:beta-with-alpha-location",
+        qualified_name="forged_cross_build_location",
+        kind=SymbolKind.FUNCTION,
+        span=SourceSpan(sources["alpha"], 1, 1),
+        source_hash="forged-cross-build-location",
+        source_text="int forged_cross_build_location() { return 1; }",
+        build_configuration_id="config-beta",
+        translation_unit_id="unit-beta",
+        build_variant="beta",
+        metadata={"is_definition": True},
+    )
+    with SQLiteStore(config.database_path, project_root=project) as store:
+        store.put_symbols((alpha_only, beta_with_alpha_location))
+        store.put_edges(
+            (
+                GraphEdge(
+                    beta_with_alpha_location.id,
+                    "cxx:target",
+                    GraphRelation.CALLS,
+                    "unit-beta",
+                    "forged-cross-build-edge",
+                    "config-beta",
+                    "beta",
+                ),
+            )
+        )
+
+    async def scenario() -> None:
+        arguments = {"symbol_id": "cxx:analyze", "builds": ["beta"]}
+        async with Client(create_mcp_server(config), mode="legacy") as mcp:
+            cfg = await mcp.call_tool("control_flow", arguments)
+            flow = await mcp.call_tool("data_flow", arguments)
+            neighbors = await mcp.call_tool(
+                "neighbors", {**arguments, "relations": ["calls"], "direction": "both"}
+            )
+            callees = await mcp.call_tool("callees", arguments)
+            callers = await mcp.call_tool(
+                "callers", {"symbol_id": "cxx:target", "builds": ["beta"]}
+            )
+            read = await mcp.call_tool("read_symbol", arguments)
+            searched = await mcp.call_tool(
+                "search_code",
+                {
+                    "query": "analyze",
+                    "builds": ["beta"],
+                    "max_results": 10,
+                    "max_context_tokens": 1_000,
+                },
+            )
+
+            assert all(
+                not result.is_error
+                for result in (cfg, flow, neighbors, callees, callers, read, searched)
+            )
+            expected_path = "@generated/0/beta.cpp"
+            assert cfg.structured_content["graphs"][0]["elements"][0]["location"]["path"] == (
+                expected_path
+            )
+            assert flow.structured_content["analyses"][0]["accesses"][0]["location"]["path"] == (
+                expected_path
+            )
+            for result in (neighbors, callees, callers):
+                assert {
+                    edge[side]["location"]["path"]
+                    for edge in result.structured_content["edges"]
+                    for side in ("source", "target")
+                } == {expected_path}
+            assert read.structured_content["symbol"]["location"]["path"] == expected_path
+            assert {
+                item["symbol"]["location"]["path"] for item in searched.structured_content["items"]
+            } == {expected_path}
+
+            for tool in (
+                "control_flow",
+                "data_flow",
+                "neighbors",
+                "callers",
+                "callees",
+                "read_symbol",
+            ):
+                rejected = await mcp.call_tool(
+                    tool, {"symbol_id": alpha_only.id, "builds": ["beta"]}
+                )
+                assert rejected.is_error
+                assert str(tmp_path) not in rejected.content[0].text
+            alpha_search = await mcp.call_tool(
+                "search_code",
+                {
+                    "query": alpha_only.qualified_name,
+                    "builds": ["beta"],
+                    "max_results": 10,
+                    "max_context_tokens": 1_000,
+                },
+            )
+            assert all(
+                item["symbol"]["symbol_id"] != alpha_only.id
+                for item in alpha_search.structured_content["items"]
+            )
+            for tool in ("neighbors", "callees", "read_symbol"):
+                rejected = await mcp.call_tool(
+                    tool,
+                    {"symbol_id": beta_with_alpha_location.id, "builds": ["beta"]},
+                )
+                assert rejected.is_error
+                assert str(tmp_path) not in rejected.content[0].text
 
     anyio.run(scenario)
 

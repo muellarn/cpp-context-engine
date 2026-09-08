@@ -318,16 +318,20 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "control_flow",
-            lambda: state.require_runtime().analysis_service.control_flow(
-                CfgRequest(
-                    function_symbol_id=symbol_id,
-                    materialization_id=materialization_id,
-                    builds=builds,
-                    max_graphs=max_graphs,
-                    max_blocks=max_blocks,
-                    max_elements=max_elements,
-                    max_edges=max_edges,
-                )
+            lambda: _use_runtime_for_builds(
+                state,
+                builds,
+                lambda runtime: runtime.analysis_service.control_flow(
+                    CfgRequest(
+                        function_symbol_id=symbol_id,
+                        materialization_id=materialization_id,
+                        builds=builds,
+                        max_graphs=max_graphs,
+                        max_blocks=max_blocks,
+                        max_elements=max_elements,
+                        max_edges=max_edges,
+                    )
+                ),
             ),
             "Control-flow lookup failed for the configured project index.",
         )
@@ -354,16 +358,20 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "data_flow",
-            lambda: state.require_runtime().analysis_service.data_flow(
-                FlowRequest(
-                    function_symbol_id=symbol_id,
-                    materialization_id=materialization_id,
-                    builds=builds,
-                    max_analyses=max_analyses,
-                    max_locations=max_locations,
-                    max_accesses=max_accesses,
-                    max_evidence=max_evidence,
-                )
+            lambda: _use_runtime_for_builds(
+                state,
+                builds,
+                lambda runtime: runtime.analysis_service.data_flow(
+                    FlowRequest(
+                        function_symbol_id=symbol_id,
+                        materialization_id=materialization_id,
+                        builds=builds,
+                        max_analyses=max_analyses,
+                        max_locations=max_locations,
+                        max_accesses=max_accesses,
+                        max_evidence=max_evidence,
+                    )
+                ),
             ),
             "Data-flow lookup failed for the configured project index.",
         )
@@ -485,17 +493,12 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     ) -> SearchCodeResult:
         state = _state(ctx)
 
-        def operation() -> SearchCodeResult:
-            runtime, temporary = _runtime_for_builds(state, builds)
-            try:
-                bundle = runtime.retrieval_service.query(
-                    QueryRequest(query.strip(), max_context_tokens, max_results=max_results)
-                ).context
-                selected_scope = runtime.config.build_scope
-                source_reader = runtime.source_reader
-            finally:
-                if temporary:
-                    runtime.close()
+        def query_runtime(runtime: Runtime) -> SearchCodeResult:
+            bundle = runtime.retrieval_service.query(
+                QueryRequest(query.strip(), max_context_tokens, max_results=max_results)
+            ).context
+            selected_scope = runtime.config.build_scope
+            source_reader = runtime.source_reader
             items = [
                 SearchCodeItem(
                     symbol=_symbol_reference(item.hit.symbol, source_reader),
@@ -531,7 +534,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "search_code",
-            operation,
+            lambda: _use_runtime_for_builds(state, builds, query_runtime),
             "Code search failed; check the configured index and embedding provider.",
         )
 
@@ -551,33 +554,28 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     ) -> ReadSymbolResult:
         state = _state(ctx)
 
-        def operation() -> ReadSymbolResult:
-            runtime, temporary = _runtime_for_builds(state, builds)
-            try:
-                scope = runtime.config.build_scope
-                symbol = _get_symbol(runtime, symbol_id, scope.variants)
-                source = runtime.source_reader.read_symbol(symbol)
-                truncated = len(source) > max_source_chars
-                return ReadSymbolResult(
-                    symbol=_symbol_reference(symbol, runtime.source_reader),
-                    source_text=source[:max_source_chars],
-                    truncated=truncated,
-                    scope_kind="union" if scope.is_union else "single",
-                    scope_label=(
-                        f"union:{','.join(scope.variants)}"
-                        if scope.is_union
-                        else f"build:{scope.variants[0]}"
-                    ),
-                    scope_variants=list(scope.variants),
-                )
-            finally:
-                if temporary:
-                    runtime.close()
+        def read_runtime(runtime: Runtime) -> ReadSymbolResult:
+            scope = runtime.config.build_scope
+            symbol = _get_symbol(runtime, symbol_id, scope.variants)
+            source = runtime.source_reader.read_symbol(symbol)
+            truncated = len(source) > max_source_chars
+            return ReadSymbolResult(
+                symbol=_symbol_reference(symbol, runtime.source_reader),
+                source_text=source[:max_source_chars],
+                truncated=truncated,
+                scope_kind="union" if scope.is_union else "single",
+                scope_label=(
+                    f"union:{','.join(scope.variants)}"
+                    if scope.is_union
+                    else f"build:{scope.variants[0]}"
+                ),
+                scope_variants=list(scope.variants),
+            )
 
         return await _call_tool(
             state,
             "read_symbol",
-            operation,
+            lambda: _use_runtime_for_builds(state, builds, read_runtime),
             "The symbol could not be read from the configured project.",
         )
 
@@ -683,20 +681,15 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     ) -> AskCodeResult:
         state = _state(ctx)
 
-        def operation() -> AskCodeResult:
-            runtime, temporary = _runtime_for_builds(state, builds)
-            try:
-                if runtime.answer_service is None:
-                    raise PublicToolFailure(
-                        "Code answering is unavailable; configure an LLM when starting the server."
-                    )
-                answer = runtime.answer_service.answer(
-                    AnswerRequest(query.strip(), max_context_tokens, max_steps)
+        def answer_runtime(runtime: Runtime) -> AskCodeResult:
+            if runtime.answer_service is None:
+                raise PublicToolFailure(
+                    "Code answering is unavailable; configure an LLM when starting the server."
                 )
-                source_reader = runtime.source_reader
-            finally:
-                if temporary:
-                    runtime.close()
+            answer = runtime.answer_service.answer(
+                AnswerRequest(query.strip(), max_context_tokens, max_steps)
+            )
+            source_reader = runtime.source_reader
             rendered_answer = _redact_project_root(answer.answer, state.config.project_root)
             diagnostics = list(answer.diagnostics[:MAX_DIAGNOSTICS])
             complete = answer.complete
@@ -731,7 +724,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "ask_code",
-            operation,
+            lambda: _use_runtime_for_builds(state, builds, answer_runtime),
             "Code answering failed; check the configured index and LLM provider.",
         )
 
@@ -779,9 +772,8 @@ async def _graph_tool(
     per_node_fanout: int,
     builds: list[str] | None,
 ) -> GraphResult:
-    def operation() -> GraphResult:
-        runtime = state.require_runtime()
-        scope = runtime.analysis_service.resolve_scope(builds)
+    def graph_runtime(runtime: Runtime) -> GraphResult:
+        scope = runtime.config.build_scope
         origin = _get_symbol(runtime, symbol_id, scope.variants)
         if (
             relations == [GraphRelation.CALLS]
@@ -995,7 +987,7 @@ async def _graph_tool(
     return await _call_tool(
         state,
         tool_name,
-        operation,
+        lambda: _use_runtime_for_builds(state, builds, graph_runtime),
         "Graph navigation failed for the configured project index.",
     )
 
@@ -1013,14 +1005,22 @@ def _get_symbol(
     return symbol
 
 
-def _runtime_for_builds(
-    state: ProjectServerState, builds: list[str] | None
-) -> tuple[Runtime, bool]:
+def _use_runtime_for_builds(
+    state: ProjectServerState,
+    builds: list[str] | None,
+    operation: Callable[[Runtime], T],
+) -> T:
     runtime = state.require_runtime()
     scope = runtime.analysis_service.resolve_scope(builds)
     if scope == runtime.config.build_scope:
-        return runtime, False
-    return build_runtime(replace(runtime.config, build_scope=scope)), True
+        return operation(runtime)
+    # A union reader gives generated roots union-wide ordinal aliases and could
+    # render a location using provenance from a build the caller did not select.
+    scoped_runtime = build_runtime(replace(runtime.config, build_scope=scope))
+    try:
+        return operation(scoped_runtime)
+    finally:
+        scoped_runtime.close()
 
 
 def _symbol_reference(symbol: CodeSymbol, source_reader: FilesystemSourceReader) -> SymbolReference:
