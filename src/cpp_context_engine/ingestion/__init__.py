@@ -25,6 +25,13 @@ from cpp_context_engine.ingestion.native import (
     NativeClangIngestor,
 )
 from cpp_context_engine.ingestion.protocols import IngestionBatch, Ingestor
+from cpp_context_engine.ingestion.telemetry import (
+    AnalyzerPipelineEvent,
+    AnalyzerPipelineObserver,
+    AnalyzerSlotIdleError,
+    AnalyzerSlotIdleGate,
+    AnalyzerTelemetryError,
+)
 
 __all__ = [
     "ClangIngestor",
@@ -38,7 +45,12 @@ __all__ = [
     "Ingestor",
     "AnalyzerInfo",
     "AnalyzerLimitError",
+    "AnalyzerPipelineEvent",
+    "AnalyzerPipelineObserver",
     "AnalyzerProtocolError",
+    "AnalyzerSlotIdleError",
+    "AnalyzerSlotIdleGate",
+    "AnalyzerTelemetryError",
     "AnalyzerUnavailableError",
     "NativeAnalyzerClient",
     "NativeClangIngestor",
