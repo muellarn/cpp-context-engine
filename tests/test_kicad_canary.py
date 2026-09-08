@@ -74,6 +74,10 @@ def _successful_pipeline_report(
         "clock": "monotonic",
         "event_count": configuration_count * 2 + 1,
         "configuration_count": configuration_count,
+        "configuration_outcomes": [
+            {"configuration_index": index, "outcome": "succeeded"}
+            for index in range(configuration_count)
+        ],
         "max_idle_seconds": max_idle_seconds,
         "slots": [
             {
@@ -88,6 +92,28 @@ def _successful_pipeline_report(
             for slot_id in range(slot_count)
         ],
     }
+
+
+def _write_final_canary_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE translation_units (
+                analysis_backend TEXT,
+                advanced_facts_complete INTEGER,
+                index_profile TEXT,
+                navigation_facts_complete INTEGER,
+                cfg_facts_complete INTEGER,
+                data_flow_facts_complete INTEGER,
+                summary_facts_complete INTEGER
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO translation_units VALUES ('clang-libtooling', 0, 'navigation', 1, 0, 0, 0)"
+        )
+        connection.execute("CREATE TABLE build_variants (name TEXT, index_profile TEXT)")
+        connection.execute("INSERT INTO build_variants VALUES ('default', 'navigation')")
 
 
 def test_canary_child_wires_exact_analyzer_protocol_observer(
@@ -285,6 +311,47 @@ def test_canary_monitor_rejects_missing_malformed_sequence_and_active_slot() -> 
     )
     with pytest.raises(RuntimeError, match="active slot"):
         active.success_report()
+
+
+@pytest.mark.parametrize("first_outcome", ["failed", "cancelled"])
+def test_canary_monitor_rejects_non_successful_history_after_slot_reuse(
+    first_outcome: str,
+) -> None:
+    clock = _Clock()
+    monitor = kicad_canary._AnalyzerTelemetryMonitor(
+        max_idle_seconds=10.0,
+        expected_configurations=2,
+        clock=clock,
+    )
+    events = (
+        _pipeline_event(1, 0.0, "scheduling_state", slot_count=1),
+        _pipeline_event(2, 0.0, "analyzer_started", slot_id=0, configuration_index=0, slot_count=1),
+        _pipeline_event(
+            3,
+            1.0,
+            "analyzer_finished",
+            slot_id=0,
+            configuration_index=0,
+            outcome=first_outcome,
+            slot_count=1,
+        ),
+        _pipeline_event(4, 1.0, "analyzer_started", slot_id=0, configuration_index=1, slot_count=1),
+        _pipeline_event(
+            5,
+            2.0,
+            "analyzer_finished",
+            slot_id=0,
+            configuration_index=1,
+            outcome="succeeded",
+            slot_count=1,
+        ),
+    )
+    for event in events:
+        monitor.observe_payload(event.to_protocol_payload())
+    clock.now = 2.0
+
+    with pytest.raises(RuntimeError, match="non-successful"):
+        monitor.success_report()
 
 
 def test_canary_monitor_success_report_is_deterministic_and_has_provenance() -> None:
@@ -491,6 +558,8 @@ def test_all_gate_retains_raw_duplicates_but_counts_normalized_configurations(
 
     monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
     monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
+    monkeypatch.setattr(kicad_canary, "_revalidate_final_artifacts", lambda **_kwargs: None)
+    monkeypatch.setattr(kicad_canary, "_confirm_validated_artifacts_unchanged", lambda *_args: None)
 
     report = kicad_canary.run_canary(
         project_root=project,
@@ -626,6 +695,8 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
                 "rankings": {"query": ["symbol"]},
                 "public_orderings": {"query": {"digest": "ordered"}},
                 "database_provenance": {"coverage": "complete"},
+                "database_file_sha256": "database",
+                "database_integrity": "ok",
                 "analyzer": {"sha256": "analyzer"},
             }
         ],
@@ -662,6 +733,14 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
             "database_provenance",
         ),
         (
+            lambda baseline: baseline["gates"][0].update(database_file_sha256="different"),
+            "database_file_sha256",
+        ),
+        (
+            lambda baseline: baseline["gates"][0].update(database_integrity="different"),
+            "database_integrity",
+        ),
+        (
             lambda baseline: baseline["gates"][0]["public_orderings"]["query"].update(
                 digest="different"
             ),
@@ -691,6 +770,8 @@ def test_baseline_comparison_requires_exact_provenance_and_gate_set(
                 "rankings": {"query": ["symbol"]},
                 "public_orderings": {"query": {"digest": "ordered"}},
                 "database_provenance": {"coverage": "complete"},
+                "database_file_sha256": "database",
+                "database_integrity": "ok",
                 "analyzer": {"sha256": "analyzer"},
             }
         ],
@@ -778,6 +859,8 @@ def test_baseline_mismatch_never_publishes_gate_success(
         "_compare_baseline_gate",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("parity mismatch")),
     )
+    monkeypatch.setattr(kicad_canary, "_revalidate_final_artifacts", lambda **_kwargs: None)
+    monkeypatch.setattr(kicad_canary, "_confirm_validated_artifacts_unchanged", lambda *_args: None)
     output = tmp_path / "output"
 
     with pytest.raises(RuntimeError, match="parity mismatch"):
@@ -900,6 +983,90 @@ def test_missing_analyzer_telemetry_never_publishes_gate_success(
             disk_bytes=1,
             no_progress_seconds=1,
         )
+
+    failed = output / ".gate-1.failed"
+    assert failed.is_dir()
+    assert not (failed / "SUCCESS").exists()
+
+
+@pytest.mark.parametrize(
+    "tamper", [None, "child-result", "database-after-hash", "subset-after-hash"]
+)
+def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
+    tamper: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+
+    def supervised(_spec_path, gate_directory, _limits, _total_tus):
+        database = gate_directory / "index.db"
+        _write_final_canary_database(database)
+        result = {
+            "completed_translation_units": 1,
+            "process_group_clean": True,
+            "analyzer_pipeline": _successful_pipeline_report(
+                configuration_count=1,
+                slot_count=1,
+                max_idle_seconds=1,
+            ),
+            "rankings": {},
+            "public_orderings": {},
+            "semantic_snapshot": semantic_snapshot(database),
+            "database_provenance": database_provenance(database),
+            "database_file_sha256": kicad_canary._sha256(database),
+            "database_integrity": "ok",
+            "analyzer": {"sha256": kicad_canary._sha256(analyzer)},
+        }
+        if tamper == "child-result":
+            result["semantic_snapshot"] = {"digest": "forged-child-result"}
+        elif tamper == "database-after-hash":
+            with sqlite3.connect(database) as connection:
+                connection.execute("UPDATE translation_units SET navigation_facts_complete = 0")
+        elif tamper == "subset-after-hash":
+            subset = gate_directory / "compile_commands.json"
+            subset.write_text(subset.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
+    monkeypatch.setattr(kicad_canary, "_ranking_canaries", lambda *_args: ({}, {}))
+    output = tmp_path / "output"
+
+    def run() -> dict[str, object]:
+        return kicad_canary.run_canary(
+            project_root=project,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=output,
+            gates=(1,),
+            gate_timeouts={"1": 1.0},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            embedding_dimensions=1,
+            queries=(),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=1,
+        )
+
+    if tamper is None:
+        run()
+        assert (output / "gate-1" / "SUCCESS").is_file()
+        return
+
+    with pytest.raises(RuntimeError, match="parent artifact revalidation"):
+        run()
 
     failed = output / ".gate-1.failed"
     assert failed.is_dir()

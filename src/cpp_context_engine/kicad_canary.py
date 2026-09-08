@@ -136,6 +136,21 @@ class SubsetDatabase:
 
 
 @dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedArtifacts:
+    subset_identity: _FileIdentity
+    database_state: tuple[_FileIdentity, _FileIdentity | None]
+
+
+@dataclass(frozen=True, slots=True)
 class CanaryLimits:
     wall_seconds: float
     rss_bytes: int = int(2.5 * 1024**3)
@@ -186,6 +201,7 @@ class _AnalyzerTelemetryMonitor:
         self._event_count = 0
         self._started: set[int] = set()
         self._finished: set[int] = set()
+        self._outcomes: dict[int, str] = {}
 
     def observe_payload(self, payload: Mapping[str, Any]) -> None:
         event = AnalyzerPipelineEvent.from_protocol_payload(payload)
@@ -203,6 +219,8 @@ class _AnalyzerTelemetryMonitor:
         elif event.kind == "analyzer_finished":
             assert event.configuration_index is not None
             self._finished.add(event.configuration_index)
+            assert event.outcome is not None
+            self._outcomes[event.configuration_index] = event.outcome
         self._event_count += 1
 
     def check(self) -> None:
@@ -217,6 +235,10 @@ class _AnalyzerTelemetryMonitor:
         expected = set(range(self._expected_configurations))
         if self._started != expected or self._finished != expected:
             raise RuntimeError("analyzer pipeline telemetry is missing lifecycle events")
+        if any(self._outcomes[index] != "succeeded" for index in sorted(expected)):
+            # A later success on the same logical slot must never erase an
+            # earlier configuration failure or cancellation from acceptance.
+            raise RuntimeError("analyzer pipeline telemetry contains a non-successful lifecycle")
         if not slots or any(slot["outcome"] != "succeeded" for slot in slots):
             raise RuntimeError("analyzer pipeline telemetry has no successful terminal slot state")
         return {
@@ -224,6 +246,10 @@ class _AnalyzerTelemetryMonitor:
             "clock": "monotonic",
             "event_count": self._event_count,
             "configuration_count": self._expected_configurations,
+            "configuration_outcomes": [
+                {"configuration_index": index, "outcome": self._outcomes[index]}
+                for index in sorted(expected)
+            ],
             "max_idle_seconds": self._max_idle_seconds,
             "slots": slots,
         }
@@ -247,6 +273,11 @@ def _validate_analyzer_pipeline_report(
         or report["event_count"] < expected_configurations * 2 + 1
     ):
         raise RuntimeError("analyzer pipeline telemetry provenance is invalid")
+    if report.get("configuration_outcomes") != [
+        {"configuration_index": index, "outcome": "succeeded"}
+        for index in range(expected_configurations)
+    ]:
+        raise RuntimeError("analyzer pipeline telemetry lifecycle history is invalid")
     slots = report.get("slots")
     if not isinstance(slots, list) or len(slots) != expected_slots:
         raise RuntimeError("analyzer pipeline telemetry slot report is incomplete")
@@ -277,6 +308,24 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _file_identity(path: Path) -> _FileIdentity:
+    metadata = path.stat()
+    return _FileIdentity(
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _sqlite_artifact_state(
+    database: Path,
+) -> tuple[_FileIdentity, _FileIdentity | None]:
+    wal = Path(f"{database}-wal")
+    return _file_identity(database), _file_identity(wal) if wal.is_file() else None
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -399,13 +448,18 @@ def _encode_digest_value(value: Any) -> bytes:
     return b"s" + len(encoded).to_bytes(8, "big") + encoded
 
 
-def semantic_snapshot(database: Path) -> dict[str, Any]:
+def semantic_snapshot(
+    database: Path, *, _connection: sqlite3.Connection | None = None
+) -> dict[str, Any]:
     """Hash stable semantic rows, excluding timestamps and artifact-location columns."""
 
     digest = hashlib.sha256()
     counts: dict[str, int] = {}
     table_digests: dict[str, str] = {}
-    with sqlite3.connect(database) as connection:
+    connection_context = (
+        sqlite3.connect(database) if _connection is None else contextlib.nullcontext(_connection)
+    )
+    with connection_context as connection:
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         available = {
             row[0]
@@ -446,7 +500,9 @@ def semantic_snapshot(database: Path) -> dict[str, Any]:
     }
 
 
-def database_provenance(database: Path) -> dict[str, Any]:
+def database_provenance(
+    database: Path, *, _connection: sqlite3.Connection | None = None
+) -> dict[str, Any]:
     """Summarize backend and independent coverage claims for every indexed TU."""
 
     fields = (
@@ -458,7 +514,10 @@ def database_provenance(database: Path) -> dict[str, Any]:
         "data_flow_facts_complete",
         "summary_facts_complete",
     )
-    with sqlite3.connect(database) as connection:
+    connection_context = (
+        sqlite3.connect(database) if _connection is None else contextlib.nullcontext(_connection)
+    )
+    with connection_context as connection:
         available = {row[1] for row in connection.execute('PRAGMA table_info("translation_units")')}
         if not set(fields).issubset(available):
             raise RuntimeError("translation-unit coverage provenance is incomplete")
@@ -1000,6 +1059,99 @@ def _ranking_canaries(
     return rankings, public_orderings
 
 
+def _revalidate_final_artifacts(
+    *,
+    project_root: Path,
+    subset: Path,
+    expected_subset: SubsetDatabase,
+    database: Path,
+    analyzer: Path,
+    profile: IndexProfile,
+    workers: int,
+    embedding_dimensions: int,
+    queries: Sequence[str],
+    child_result: Mapping[str, Any],
+) -> _ValidatedArtifacts:
+    try:
+        subset_identity = _file_identity(subset)
+        database_state = _sqlite_artifact_state(database)
+        normalized = CompilationDatabase.load(subset)
+        actual_subset = SubsetDatabase(
+            sha256=_sha256(subset),
+            raw_entry_count=len(_load_raw_cdb(subset)),
+            normalized_configuration_count=len(normalized.configurations),
+        )
+        if actual_subset != expected_subset:
+            raise RuntimeError("retained compilation database differs from the selected subset")
+
+        database_uri = database.resolve(strict=True).as_uri() + "?mode=ro"
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchone()
+            snapshot = semantic_snapshot(database, _connection=connection)
+            provenance = database_provenance(database, _connection=connection)
+        if integrity != "ok" or foreign_keys is not None:
+            raise RuntimeError("retained database failed integrity checks")
+
+        variant = BuildVariant("default", subset)
+        scope = BuildScope((variant.name,))
+        config = AppConfig(
+            project_root=project_root,
+            index_directory=database.parent,
+            database_path=database,
+            compilation_database=subset,
+            build_variants=(variant,),
+            build_scope=scope,
+            index_profile=profile,
+            clang_analyzer_path=analyzer,
+            analyzer_max_workers=workers,
+            embedding_dimensions=embedding_dimensions,
+        )
+        rankings, public_orderings = _ranking_canaries(config, queries)
+        parent_evidence = {
+            "rankings": rankings,
+            "public_orderings": public_orderings,
+            "semantic_snapshot": snapshot,
+            "database_provenance": provenance,
+            "database_file_sha256": _sha256(database),
+            "database_integrity": integrity,
+        }
+        for field, value in parent_evidence.items():
+            if child_result.get(field) != value:
+                raise RuntimeError(f"child result differs for {field}")
+        child_analyzer = child_result.get("analyzer")
+        if not isinstance(child_analyzer, Mapping) or child_analyzer.get("sha256") != _sha256(
+            analyzer
+        ):
+            raise RuntimeError("child result differs for analyzer sha256")
+
+        # A child or external writer changing either artifact during validation
+        # invalidates every digest derived from that read window.
+        if _file_identity(subset) != subset_identity:
+            raise RuntimeError("retained compilation database changed during validation")
+        if _sqlite_artifact_state(database) != database_state:
+            raise RuntimeError("retained database changed during validation")
+        return _ValidatedArtifacts(subset_identity, database_state)
+    except Exception as error:
+        raise RuntimeError(f"parent artifact revalidation failed: {error}") from None
+
+
+def _confirm_validated_artifacts_unchanged(
+    subset: Path, database: Path, validated: _ValidatedArtifacts
+) -> None:
+    try:
+        changed = (
+            _file_identity(subset) != validated.subset_identity
+            or _sqlite_artifact_state(database) != validated.database_state
+        )
+    except OSError as error:
+        raise RuntimeError(f"parent artifact revalidation failed: {error}") from None
+    if changed:
+        raise RuntimeError("parent artifact revalidation failed: retained artifacts changed")
+
+
 def _run_worker(spec_path: Path) -> int:
     try:
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
@@ -1176,6 +1328,8 @@ def _compare_baseline_gate(gate: Mapping[str, Any], baseline_gate: Mapping[str, 
         "rankings",
         "public_orderings",
         "database_provenance",
+        "database_file_sha256",
+        "database_integrity",
         "analyzer",
     ):
         if gate.get(field) != baseline_gate.get(field):
@@ -1295,6 +1449,18 @@ def run_canary(
             )
             if measured["completed_translation_units"] != expected_translation_units:
                 raise RuntimeError("worker did not stage every selected translation unit")
+            validated_artifacts = _revalidate_final_artifacts(
+                project_root=inspection.project_root,
+                subset=subset,
+                expected_subset=subset_metadata,
+                database=running / "index.db",
+                analyzer=analyzer,
+                profile=profile,
+                workers=workers,
+                embedding_dimensions=embedding_dimensions,
+                queries=queries,
+                child_result=measured,
+            )
             _validate_profile_provenance(
                 measured["database_provenance"], profile, expected_translation_units
             )
@@ -1313,6 +1479,9 @@ def run_canary(
                 _compare_baseline_gate(gate_report, baseline_gates[len(gate_reports)])
             if _sha256(inspection.compilation_database) != inspection.sha256:
                 raise RuntimeError("source compilation database changed during the canary")
+            _confirm_validated_artifacts_unchanged(
+                subset, running / "index.db", validated_artifacts
+            )
             gate_reports.append(gate_report)
             running_marker.unlink()
             _write_report_atomic(running / "SUCCESS", "complete\n")
