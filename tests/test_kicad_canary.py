@@ -458,6 +458,148 @@ def test_preflight_classifies_out_of_tree_generated_sources_without_rejecting_th
     assert [entry.raw_index for entry in select_gate_entries(inspection, "all")] == [0, 1, 2]
 
 
+def test_all_gate_forwards_only_explicit_generated_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    build = tmp_path / "build"
+    generated_root = build / "generated"
+    generated_root.mkdir(parents=True)
+    generated = generated_root / "messages.pb.cc"
+    generated.write_text("int generated() {}\n", encoding="utf-8")
+    cdb = build / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [
+            {"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]},
+            {
+                "directory": str(generated_root),
+                "file": str(generated),
+                "arguments": ["c++", str(generated)],
+            },
+        ],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    observed_roots: list[list[str]] = []
+
+    def supervised(spec_path, _gate_directory, _limits, total_tus):
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        observed_roots.append(spec["generated_source_roots"])
+        return {
+            "completed_translation_units": total_tus,
+            "process_group_clean": True,
+            "analyzer_pipeline": _successful_pipeline_report(
+                configuration_count=total_tus,
+                slot_count=1,
+                max_idle_seconds=1,
+            ),
+            "database_provenance": {
+                "translation_unit_groups": [
+                    {
+                        "analysis_backend": "clang-libtooling",
+                        "advanced_facts_complete": 0,
+                        "index_profile": "navigation",
+                        "navigation_facts_complete": 1,
+                        "cfg_facts_complete": 0,
+                        "data_flow_facts_complete": 0,
+                        "summary_facts_complete": 0,
+                        "translation_units": total_tus,
+                    }
+                ],
+                "build_variants": [{"name": "default", "index_profile": "navigation"}],
+            },
+        }
+
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
+    monkeypatch.setattr(kicad_canary, "_revalidate_final_artifacts", lambda **_kwargs: None)
+    monkeypatch.setattr(kicad_canary, "_confirm_validated_artifacts_unchanged", lambda *_args: None)
+
+    kicad_canary.run_canary(
+        project_root=project,
+        compilation_database=cdb,
+        analyzer=analyzer,
+        output_directory=tmp_path / "output",
+        gates=(1, "all"),
+        gate_timeouts={"1": 1.0, "all": 1.0},
+        workers=1,
+        analyzer_timeout_seconds=1,
+        embedding_dimensions=1,
+        queries=(),
+        rss_bytes=1,
+        database_bytes=1,
+        disk_bytes=1,
+        no_progress_seconds=1,
+        generated_source_roots=(Path("generated"),),
+    )
+
+    assert observed_roots == [[], [str(generated_root.resolve())]]
+
+
+def test_all_gate_requires_explicit_generated_root_before_analyzer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    generated = tmp_path / "build" / "generated.cpp"
+    generated.parent.mkdir()
+    generated.write_text("int generated() {}\n", encoding="utf-8")
+    cdb = generated.parent / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(generated.parent), "file": str(generated), "arguments": ["c++"]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_run_supervised",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("analyzer must not start")),
+    )
+
+    with pytest.raises(ValueError, match="explicit generated source root"):
+        kicad_canary.run_canary(
+            project_root=project,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=tmp_path / "output",
+            gates=("all",),
+            gate_timeouts={"all": 1.0},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            embedding_dimensions=1,
+            queries=(),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=1,
+        )
+
+    assert (
+        kicad_canary.main(
+            [
+                "--project-root",
+                str(project),
+                "--compile-commands",
+                str(cdb),
+                "--gates",
+                "all",
+                "--preflight-only",
+            ]
+        )
+        == 2
+    )
+    assert "explicit generated source root" in capsys.readouterr().err
+
+
 def test_gate_subset_is_deterministic_and_retains_original_working_directory(
     tmp_path: Path,
 ) -> None:

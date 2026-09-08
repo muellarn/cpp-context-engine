@@ -27,11 +27,24 @@ the exact full raw CDB, including generated entries and duplicate rows. Its
 `raw_cdb_entries` report field counts those rows, while `translation_units` and
 progress use the loader's normalized unique compiler configurations.
 
-The current analyzer confines searchable facts to `project_root`. It can process
-an out-of-tree generated TU and retain facts from project-local headers, but the
-generated source's own definitions are not searchable. That separate product
-limitation must be fixed with explicitly authorized generated-source roots or
-CDB-owned paths; setting the project root to `/` is unsafe and unsupported.
+Classification does not authorize access. Before an `all` run, repeat
+`--generated-source-root` for the narrow generated directories that contain
+every out-of-tree CDB source. The harness canonicalizes and validates those
+operator-provided directories during preflight, then binds them only to the
+`all` gate's `default` build variant. Missing coverage fails before an analyzer
+starts. Numeric gates need no generated-root authorization and never inherit it.
+Setting the project root or a generated root to `/` is unsafe and unsupported.
+
+To validate the complete gate's source boundary without starting an analyzer:
+
+```bash
+cpp-context-kicad-canary \
+  --project-root "$KICAD_SOURCE" \
+  --compile-commands "$KICAD_BUILD/compile_commands.json" \
+  --generated-source-root "$KICAD_GENERATED_ROOT" \
+  --gates all \
+  --preflight-only
+```
 
 ## Progressive navigation gates
 
@@ -93,6 +106,7 @@ Only after both progressive runs pass may the complete navigation run start:
 cpp-context-kicad-canary \
   --project-root "$KICAD_SOURCE" \
   --compile-commands "$KICAD_BUILD/compile_commands.json" \
+  --generated-source-root "$KICAD_GENERATED_ROOT" \
   --clang-analyzer "$CLANG_ANALYZER" \
   --output-directory "$CANARY_OUTPUT/navigation-full" \
   --gates all \

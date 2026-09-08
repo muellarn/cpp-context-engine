@@ -416,6 +416,33 @@ def select_gate_entries(inspection: CdbInspection, gate: int | str) -> tuple[Cdb
     return tuple(eligible[:count])
 
 
+def _canonical_generated_roots_for_gates(
+    inspection: CdbInspection,
+    gates: Sequence[int | str],
+    configured_roots: Sequence[Path],
+) -> tuple[Path, ...]:
+    roots = BuildVariant(
+        "default",
+        inspection.compilation_database,
+        generated_source_roots=tuple(configured_roots),
+    ).generated_source_roots
+    if "all" not in gates:
+        return roots
+    unauthorized = [
+        entry
+        for entry in inspection.entries
+        if entry.classification != "project_source"
+        and not any(_within(entry.source_path, root) for root in roots)
+    ]
+    if unauthorized:
+        # Classification discovers candidates but never grants the analyzer a source boundary.
+        raise ValueError(
+            "the all gate requires an explicit generated source root covering every "
+            "out-of-tree source"
+        )
+    return roots
+
+
 def write_subset_database(
     source_database: Path, entries: Sequence[CdbEntry], destination: Path
 ) -> SubsetDatabase:
@@ -1070,12 +1097,17 @@ def _revalidate_final_artifacts(
     workers: int,
     embedding_dimensions: int,
     queries: Sequence[str],
+    generated_source_roots: tuple[Path, ...],
     child_result: Mapping[str, Any],
 ) -> _ValidatedArtifacts:
     try:
         subset_identity = _file_identity(subset)
         database_state = _sqlite_artifact_state(database)
-        normalized = CompilationDatabase.load(subset)
+        normalized = CompilationDatabase.load(
+            subset,
+            project_root=project_root,
+            generated_source_roots=generated_source_roots,
+        )
         actual_subset = SubsetDatabase(
             sha256=_sha256(subset),
             raw_entry_count=len(_load_raw_cdb(subset)),
@@ -1095,7 +1127,7 @@ def _revalidate_final_artifacts(
         if integrity != "ok" or foreign_keys is not None:
             raise RuntimeError("retained database failed integrity checks")
 
-        variant = BuildVariant("default", subset)
+        variant = BuildVariant("default", subset, generated_source_roots=generated_source_roots)
         scope = BuildScope((variant.name,))
         config = AppConfig(
             project_root=project_root,
@@ -1173,7 +1205,10 @@ def _run_worker(spec_path: Path) -> int:
             profile=profile,
             observer=_worker_analyzer_event,
         )
-        variant = BuildVariant("default", cdb)
+        generated_source_roots = tuple(
+            Path(path) for path in spec.get("generated_source_roots", ())
+        )
+        variant = BuildVariant("default", cdb, generated_source_roots=generated_source_roots)
         scope = BuildScope((variant.name,))
         _worker_event("phase", name="index")
         with SQLiteStore(database, project_root=project, build_scope=scope) as store:
@@ -1362,9 +1397,13 @@ def run_canary(
     no_progress_seconds: float,
     profile: IndexProfile = IndexProfile.NAVIGATION,
     baseline_report: Path | None = None,
+    generated_source_roots: Sequence[Path] = (),
 ) -> dict[str, Any]:
     profile = IndexProfile(profile)
     inspection = inspect_compilation_database(project_root, compilation_database)
+    canonical_generated_roots = _canonical_generated_roots_for_gates(
+        inspection, gates, generated_source_roots
+    )
     _require_supervisor_platform()
     analyzer = analyzer.expanduser().resolve(strict=True)
     if not analyzer.is_file() or not os.access(analyzer, os.X_OK):
@@ -1415,6 +1454,7 @@ def run_canary(
         ):
             raise RuntimeError("numeric gate did not select unique compiler configurations")
         expected_translation_units = subset_metadata.normalized_configuration_count
+        gate_generated_roots = canonical_generated_roots if gate == "all" else ()
         spec = {
             "project_root": str(inspection.project_root),
             "compilation_database": str(subset),
@@ -1426,6 +1466,7 @@ def run_canary(
             "embedding_dimensions": embedding_dimensions,
             "queries": list(queries),
             "profile": profile.value,
+            "generated_source_roots": [str(root) for root in gate_generated_roots],
         }
         spec_path = running / "worker-spec.json"
         _write_report_atomic(spec_path, json.dumps(spec, sort_keys=True) + "\n")
@@ -1459,6 +1500,7 @@ def run_canary(
                 workers=workers,
                 embedding_dimensions=embedding_dimensions,
                 queries=queries,
+                generated_source_roots=gate_generated_roots,
                 child_result=measured,
             )
             _validate_profile_provenance(
@@ -1521,6 +1563,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--disk-limit-mib", type=float)
     parser.add_argument("--no-progress-seconds", type=float, default=10)
     parser.add_argument("--baseline-report", type=Path)
+    parser.add_argument(
+        "--generated-source-root",
+        action="append",
+        default=[],
+        type=Path,
+        help="explicit generated-source directory for the all gate; repeat as needed",
+    )
     parser.add_argument("--_worker-spec", type=Path, help=argparse.SUPPRESS)
     return parser
 
@@ -1534,6 +1583,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--project-root and --compile-commands are required")
         if args.preflight_only:
             inspection = inspect_compilation_database(args.project_root, args.compile_commands)
+            _canonical_generated_roots_for_gates(
+                inspection, _parse_gates(args.gates), args.generated_source_root
+            )
             print(json.dumps(inspection.public_report(), indent=2, sort_keys=True))
             return 0
         if args.clang_analyzer is None or args.output_directory is None:
@@ -1584,6 +1636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             no_progress_seconds=args.no_progress_seconds,
             profile=profile,
             baseline_report=args.baseline_report,
+            generated_source_roots=args.generated_source_root,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
