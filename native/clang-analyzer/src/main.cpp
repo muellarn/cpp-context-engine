@@ -2932,9 +2932,11 @@ bool handleAnalyze(const llvm::json::Object &request) {
         std::unique(generatedSourceRoots.begin(), generatedSourceRoots.end()),
         generatedSourceRoots.end());
   }
-  const std::filesystem::path requestedRoot(root->str());
-  const std::filesystem::path requestedSource(source->str());
-  const std::filesystem::path requestedDirectory(directory->str());
+  // requiredString already owns std::string values; using StringRef::str() here
+  // breaks the native Release build before any boundary validation can run.
+  const std::filesystem::path requestedRoot(*root);
+  const std::filesystem::path requestedSource(*source);
+  const std::filesystem::path requestedDirectory(*directory);
   if (!requestedRoot.is_absolute() || !requestedSource.is_absolute() ||
       !requestedDirectory.is_absolute()) {
     emitError("invalid_request", "project, source, and compiler directory must be absolute");
