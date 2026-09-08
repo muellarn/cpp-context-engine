@@ -26,6 +26,7 @@ from cpp_context_engine.models import (
     SymbolOccurrence,
     TranslationUnit,
 )
+from cpp_context_engine.source_paths import SourceBoundary
 
 
 class ClangUnavailableError(RuntimeError):
@@ -57,14 +58,6 @@ def _hash_text(*values: str) -> str:
         digest.update(value.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-def _is_within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
 
 
 def _discover_libclang() -> Path | None:
@@ -117,6 +110,7 @@ class _TranslationUnitCollector:
     ) -> None:
         self.cindex = cindex
         self.project_root = project_root
+        self.boundary = SourceBoundary(project_root, configuration.generated_source_roots)
         self.configuration = configuration
         self.translation_unit_id = translation_unit_id
         self.symbols: dict[str, CodeSymbol] = {}
@@ -135,7 +129,7 @@ class _TranslationUnitCollector:
             return
 
         path = self._cursor_path(cursor)
-        if path is None or not _is_within(path, self.project_root):
+        if path is None or not self.boundary.contains(path):
             return
         self.dependencies.add(path)
 
@@ -178,7 +172,7 @@ class _TranslationUnitCollector:
             if included is None:
                 return
             included_path = Path(included.name).resolve(strict=False)
-            if _is_within(included_path, self.project_root):
+            if self.boundary.contains(included_path):
                 self.dependencies.add(included_path)
                 self._put_edge(
                     self._file_symbol(path).id,
@@ -217,7 +211,7 @@ class _TranslationUnitCollector:
         if referenced is None:
             return
         referenced_path = self._cursor_path(referenced)
-        if referenced_path is None or not _is_within(referenced_path, self.project_root):
+        if referenced_path is None or not self.boundary.contains(referenced_path):
             return
         target_kind = self._symbol_kind(referenced)
         if target_kind is None:
@@ -255,7 +249,7 @@ class _TranslationUnitCollector:
                 overridden._tu = cursor._tu
                 path = self._cursor_path(overridden)
                 kind = self._symbol_kind(overridden)
-                if path is None or kind is None or not _is_within(path, self.project_root):
+                if path is None or kind is None or not self.boundary.contains(path):
                     continue
                 target = self._make_symbol(overridden, kind, path)
                 self._put_symbol(target)
@@ -353,7 +347,7 @@ class _TranslationUnitCollector:
         )
 
     def _file_symbol(self, path: Path) -> CodeSymbol:
-        relative = path.relative_to(self.project_root).as_posix()
+        relative = self.boundary.display(path)
         symbol_id = "file_" + _hash_text(relative)[:32]
         existing = self.symbols.get(symbol_id)
         if existing is not None:
@@ -391,7 +385,7 @@ class _TranslationUnitCollector:
         if usr:
             identity = f"usr:{usr}"
         else:
-            relative = path.relative_to(self.project_root).as_posix()
+            relative = self.boundary.display(path)
             identity = f"fallback:{kind.value}:{relative}:{qualified_name}"
         symbol_id = "sym_" + _hash_text(identity)[:32]
         span = self._span(cursor) or SourceSpan(path, 1, 1)
@@ -524,8 +518,14 @@ class ClangIngestor:
         compilation_database: Path,
         *,
         build_variant: str = "default",
+        generated_source_roots: tuple[Path, ...] = (),
     ) -> IngestionBatch:
-        database = CompilationDatabase.load(compilation_database, build_variant=build_variant)
+        database = CompilationDatabase.load(
+            compilation_database,
+            build_variant=build_variant,
+            project_root=project_root,
+            generated_source_roots=generated_source_roots,
+        )
         return self.ingest_configurations(project_root, database.configurations)
 
     def ingest_configurations(

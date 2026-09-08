@@ -141,6 +141,208 @@ else:
     )
 
 
+def test_native_analyzer_indexes_explicit_out_of_tree_generated_translation_unit(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    include = project / "include"
+    source = project / "src"
+    include.mkdir(parents=True)
+    source.mkdir()
+    header = include / "api.hpp"
+    header.write_text(
+        "int project_target(int value);\nint generated_entry(int value);\n",
+        encoding="utf-8",
+    )
+    project_source = source / "api.cpp"
+    project_source.write_text(
+        '#include "api.hpp"\n'
+        "int project_target(int value) { return value + 1; }\n"
+        "int project_bridge(int value) { return generated_entry(value); }\n",
+        encoding="utf-8",
+    )
+    build = tmp_path / "build"
+    generated = build / "generated"
+    generated.mkdir(parents=True)
+    generated_source = generated / "messages.pb.cc"
+    generated_source.write_text(
+        '#include "api.hpp"\nint generated_entry(int value) { return project_target(value); }\n',
+        encoding="utf-8",
+    )
+    database = build / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(build),
+                    "file": str(path),
+                    "arguments": [
+                        "clang++",
+                        "-std=c++20",
+                        f"-I{include}",
+                        "-c",
+                        str(path),
+                    ],
+                }
+                for path in (project_source, generated_source)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    variant = BuildVariant(
+        "generated",
+        database,
+        generated_source_roots=(Path("generated"),),
+    )
+
+    batch = NativeClangIngestor(fresh_native_client(analyzer_binary(), timeout_seconds=30)).ingest(
+        project,
+        database,
+        build_variant=variant.name,
+        generated_source_roots=variant.generated_source_roots,
+    )
+
+    generated_symbols = [
+        symbol for symbol in batch.symbols if symbol.qualified_name == "generated_entry"
+    ]
+    assert any(
+        not symbol.metadata.get("is_definition") and symbol.span.path == header.resolve()
+        for symbol in generated_symbols
+    )
+    generated_symbol = next(
+        symbol for symbol in generated_symbols if symbol.metadata.get("is_definition")
+    )
+    target_symbol = next(
+        symbol for symbol in batch.symbols if symbol.qualified_name == "project_target"
+    )
+    bridge_symbol = next(
+        symbol for symbol in batch.symbols if symbol.qualified_name == "project_bridge"
+    )
+    assert generated_symbol.span.path == generated_source.resolve()
+    assert any(
+        symbol.kind is SymbolKind.FILE and symbol.qualified_name == "@generated/0/messages.pb.cc"
+        for symbol in batch.symbols
+    )
+    assert any(
+        edge.relation is GraphRelation.INCLUDES
+        and edge.source_id
+        == next(
+            symbol.id
+            for symbol in batch.symbols
+            if symbol.qualified_name == "@generated/0/messages.pb.cc"
+        )
+        for edge in batch.edges
+    )
+    callsites = [site for site in batch.callsites if site.owner_symbol_id == generated_symbol.id]
+    assert callsites
+    assert any(
+        target.callsite_id in {site.id for site in callsites}
+        and target.target_symbol_id == target_symbol.id
+        for target in batch.call_targets
+    )
+    bridge_callsites = {
+        site.id for site in batch.callsites if site.owner_symbol_id == bridge_symbol.id
+    }
+    assert any(
+        target.callsite_id in bridge_callsites and target.target_symbol_id == generated_symbol.id
+        for target in batch.call_targets
+    )
+    graphs = [
+        graph for graph in batch.cfg_graphs if graph.function_symbol_id == generated_symbol.id
+    ]
+    assert graphs
+    assert any(analysis.graph_id == graphs[0].id for analysis in batch.data_flow_analyses)
+
+
+@pytest.mark.parametrize("escape_kind", ["missing-allowlist", "traversal", "symlink"])
+def test_real_companion_rejects_generated_source_escape(tmp_path: Path, escape_kind: str) -> None:
+    project = tmp_path / "project"
+    generated = tmp_path / "build" / "generated"
+    project.mkdir()
+    generated.mkdir(parents=True)
+    outside = tmp_path / "outside.cc"
+    outside.write_text("int outside();\n", encoding="utf-8")
+    roots: list[str] = [str(generated)]
+    if escape_kind == "missing-allowlist":
+        source = generated / "generated.cc"
+        source.write_text("int generated();\n", encoding="utf-8")
+        roots = []
+    elif escape_kind == "traversal":
+        source = generated / ".." / ".." / outside.name
+    else:
+        source = generated / "linked.cc"
+        source.symlink_to(outside)
+    hello = {
+        "type": "hello",
+        "protocol": "cpp-context-clang-facts",
+        "protocol_version": 5,
+        "required_clang_major": 18,
+    }
+    analyze = {
+        "type": "analyze",
+        "request_id": "generated-escape",
+        "project_root": str(project),
+        "source_path": str(source),
+        "directory": str(tmp_path),
+        "arguments": ["-std=c++20"],
+    }
+    if roots:
+        analyze["generated_source_roots"] = roots
+
+    completed = subprocess.run(  # noqa: S603 - repository-built test binary
+        [analyzer_binary()],
+        input="\n".join((json.dumps(hello), json.dumps(analyze), "")),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    records = [json.loads(line) for line in completed.stdout.splitlines()]
+
+    assert completed.returncode == 2
+    assert [record["type"] for record in records] == ["hello", "error"]
+    assert records[-1]["code"] == "invalid_request"
+    assert records[-1]["message"] == "source is outside the authorized source roots"
+    assert str(tmp_path) not in records[-1]["message"]
+
+
+def test_real_companion_accepts_legacy_v5_request_without_generated_roots(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "source.cc"
+    source.write_text("int legacy() { return 1; }\n", encoding="utf-8")
+    requests = (
+        {
+            "type": "hello",
+            "protocol": "cpp-context-clang-facts",
+            "protocol_version": 5,
+            "required_clang_major": 18,
+        },
+        {
+            "type": "analyze",
+            "request_id": "legacy-v5",
+            "project_root": str(project),
+            "source_path": str(source),
+            "directory": str(tmp_path),
+            "arguments": ["-std=c++20"],
+        },
+    )
+
+    completed = subprocess.run(  # noqa: S603 - repository-built test binary
+        [analyzer_binary()],
+        input="\n".join((*map(json.dumps, requests), "")),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    records = [json.loads(line) for line in completed.stdout.splitlines()]
+
+    assert records[0]["type"] == "hello"
+    assert records[1]["type"] == "begin"
+    assert records[-1] == {"request_id": "legacy-v5", "success": True, "type": "complete"}
+
+
 def test_fact_builder_and_native_cache_cover_all_semantic_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

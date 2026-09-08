@@ -14,7 +14,7 @@ from typing import Any
 
 from cpp_context_engine import __version__
 from cpp_context_engine.api import AnswerRequest, CfgRequest, FlowRequest, QueryRequest
-from cpp_context_engine.config import AppConfig
+from cpp_context_engine.config import AppConfig, _bind_generated_source_roots
 from cpp_context_engine.models import BuildScope, BuildVariant, IndexProfile
 from cpp_context_engine.runtime import build_runtime, index_project
 from cpp_context_engine.storage import SQLiteStore
@@ -130,6 +130,13 @@ def _add_project_options(
     else:
         parser.add_argument("--project", type=Path, help="C++ project root")
     parser.add_argument("--db", type=Path, help="SQLite index path")
+    parser.add_argument(
+        "--generated-source-root",
+        action="append",
+        default=[],
+        metavar="[NAME=]PATH",
+        help="explicit generated-source directory; repeat and name it for multiple builds",
+    )
     if include_compile_commands:
         parser.add_argument(
             "--profile", choices=tuple(IndexProfile), help="index profile (default: full)"
@@ -197,6 +204,11 @@ def _resolved_config(args: argparse.Namespace) -> AppConfig:
         configured_variants = (BuildVariant("default", compilation_database),)
     if build_arguments and not any("=" in item for item in build_arguments):
         build_scope = BuildScope(tuple(build_arguments))
+    configured_variants = _bind_generated_source_roots(
+        tuple(configured_variants),
+        getattr(args, "generated_source_root", ()),
+        setting="--generated-source-root",
+    )
     return replace(
         base,
         project_root=project,
@@ -447,10 +459,19 @@ def _run_flow(config: AppConfig, args: argparse.Namespace) -> int:
     return _print_contract(result, as_json=args.json)
 
 
-def _context_payload(bundle: Any, project_root: Path | None = None) -> dict[str, Any]:
+def _context_payload(
+    bundle: Any,
+    project_root: Path | None = None,
+    source_reader: Any | None = None,
+) -> dict[str, Any]:
     root = project_root.resolve(strict=False) if project_root is not None else None
 
     def display_path(path: Path) -> str:
+        if source_reader is not None:
+            try:
+                return source_reader.display_path(path)
+            except Exception:
+                return "<outside-project>"
         if root is None:
             return path.as_posix() if not path.is_absolute() else "<absolute-path-redacted>"
         resolved = (path if path.is_absolute() else root / path).resolve(strict=False)
@@ -499,7 +520,7 @@ def _run_search(config: AppConfig, args: argparse.Namespace) -> int:
         response = runtime.retrieval_service.query(
             QueryRequest(args.query, args.max_context_tokens, max_results=args.max_results)
         )
-    payload = _context_payload(response.context, config.project_root)
+        payload = _context_payload(response.context, config.project_root, runtime.source_reader)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -528,6 +549,7 @@ def _run_ask(config: AppConfig, args: argparse.Namespace) -> int:
         response = runtime.answer_service.answer(
             AnswerRequest(args.query, args.max_context_tokens, args.max_steps)
         )
+        source_reader = runtime.source_reader
     payload = {
         "answer": response.answer,
         "scope": {
@@ -542,7 +564,7 @@ def _run_ask(config: AppConfig, args: argparse.Namespace) -> int:
                 "symbol_id": source.symbol_id,
                 "qualified_name": source.qualified_name,
                 "build_variant": source.build_variant,
-                "path": _project_path(source.path, config.project_root),
+                "path": _project_path(source.path, config.project_root, source_reader),
                 "start_line": source.start_line,
                 "end_line": source.end_line,
             }
@@ -564,7 +586,12 @@ def _run_ask(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
-def _project_path(path: Path, project_root: Path) -> str:
+def _project_path(path: Path, project_root: Path, source_reader: Any | None = None) -> str:
+    if source_reader is not None:
+        try:
+            return source_reader.display_path(path)
+        except Exception:
+            return "<outside-project>"
     root = project_root.resolve(strict=False)
     resolved = (path if path.is_absolute() else root / path).resolve(strict=False)
     return (

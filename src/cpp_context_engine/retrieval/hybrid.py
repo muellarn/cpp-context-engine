@@ -550,8 +550,14 @@ class HybridRetriever:
         symbol = candidate.symbol
         span = symbol.span
         display_path = span.path.as_posix()
+        render_path = getattr(self._source_reader, "display_path", None)
+        if render_path is not None:
+            try:
+                display_path = render_path(span.path)
+            except Exception:
+                display_path = "<outside-project>"
         project_root = getattr(self._source_reader, "project_root", None)
-        if project_root is not None:
+        if render_path is None and project_root is not None:
             root = project_root.resolve(strict=False)
             resolved = (span.path if span.path.is_absolute() else root / span.path).resolve(
                 strict=False

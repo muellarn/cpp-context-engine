@@ -50,6 +50,7 @@ from cpp_context_engine.runtime import (
     index_project as run_project_index,
 )
 from cpp_context_engine.storage import FilesystemSourceReader
+from cpp_context_engine.storage.source import SourceReadError
 
 from .contracts import (
     MAX_ANSWER_CHARS,
@@ -112,6 +113,12 @@ COMPILATION_DATABASE_GUIDANCE = (
     "with normal user authorization; this MCP server never runs these commands implicitly. Keep a "
     "separate compilation database for each materially different build configuration and register "
     "each one as a named build."
+)
+GENERATED_SOURCE_GUIDANCE = (
+    "If that database names generated translation units outside the project root, the operator "
+    "must explicitly bind each existing generated directory with --generated-source-root or "
+    "CPP_CONTEXT_GENERATED_SOURCE_ROOTS. Relative roots are resolved against that build's "
+    "compilation-database directory; MCP callers cannot add or change them."
 )
 MISSING_COMPILATION_DATABASE_ERROR = (
     "The configured compilation database is unavailable. " + COMPILATION_DATABASE_GUIDANCE
@@ -266,7 +273,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             "as open-world evidence, never as proof that no other target exists. "
             "If hosted embeddings or an LLM are configured, queries, indexed symbol text, or "
             "selected code excerpts are "
-            "sent to that external provider."
+            "sent to that external provider. " + GENERATED_SOURCE_GUIDANCE
         ),
         version=__version__,
         lifespan=lifespan,
@@ -311,16 +318,20 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "control_flow",
-            lambda: state.require_runtime().analysis_service.control_flow(
-                CfgRequest(
-                    function_symbol_id=symbol_id,
-                    materialization_id=materialization_id,
-                    builds=builds,
-                    max_graphs=max_graphs,
-                    max_blocks=max_blocks,
-                    max_elements=max_elements,
-                    max_edges=max_edges,
-                )
+            lambda: _use_runtime_for_builds(
+                state,
+                builds,
+                lambda runtime: runtime.analysis_service.control_flow(
+                    CfgRequest(
+                        function_symbol_id=symbol_id,
+                        materialization_id=materialization_id,
+                        builds=builds,
+                        max_graphs=max_graphs,
+                        max_blocks=max_blocks,
+                        max_elements=max_elements,
+                        max_edges=max_edges,
+                    )
+                ),
             ),
             "Control-flow lookup failed for the configured project index.",
         )
@@ -347,16 +358,20 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "data_flow",
-            lambda: state.require_runtime().analysis_service.data_flow(
-                FlowRequest(
-                    function_symbol_id=symbol_id,
-                    materialization_id=materialization_id,
-                    builds=builds,
-                    max_analyses=max_analyses,
-                    max_locations=max_locations,
-                    max_accesses=max_accesses,
-                    max_evidence=max_evidence,
-                )
+            lambda: _use_runtime_for_builds(
+                state,
+                builds,
+                lambda runtime: runtime.analysis_service.data_flow(
+                    FlowRequest(
+                        function_symbol_id=symbol_id,
+                        materialization_id=materialization_id,
+                        builds=builds,
+                        max_analyses=max_analyses,
+                        max_locations=max_locations,
+                        max_accesses=max_accesses,
+                        max_evidence=max_evidence,
+                    )
+                ),
             ),
             "Data-flow lookup failed for the configured project index.",
         )
@@ -368,7 +383,9 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             "server's default discovery location is build/compile_commands.json under the project; "
             "the operator can set an explicit startup path with --compile-commands or "
             "CPP_CONTEXT_COMPILE_COMMANDS, and can register named builds separately. No "
-            "caller-controlled path is accepted. Hosted embeddings, when configured, receive "
+            "caller-controlled path is accepted. "
+            + GENERATED_SOURCE_GUIDANCE
+            + " Hosted embeddings, when configured, receive "
             "bounded symbol text."
         ),
         annotations=indexing_write,
@@ -476,19 +493,15 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     ) -> SearchCodeResult:
         state = _state(ctx)
 
-        def operation() -> SearchCodeResult:
-            runtime, temporary = _runtime_for_builds(state, builds)
-            try:
-                bundle = runtime.retrieval_service.query(
-                    QueryRequest(query.strip(), max_context_tokens, max_results=max_results)
-                ).context
-                selected_scope = runtime.config.build_scope
-            finally:
-                if temporary:
-                    runtime.close()
+        def query_runtime(runtime: Runtime) -> SearchCodeResult:
+            bundle = runtime.retrieval_service.query(
+                QueryRequest(query.strip(), max_context_tokens, max_results=max_results)
+            ).context
+            selected_scope = runtime.config.build_scope
+            source_reader = runtime.source_reader
             items = [
                 SearchCodeItem(
-                    symbol=_symbol_reference(item.hit.symbol, state.config.project_root),
+                    symbol=_symbol_reference(item.hit.symbol, source_reader),
                     source_text=item.source_text,
                     score=item.hit.score,
                     reason=item.reason,
@@ -521,7 +534,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "search_code",
-            operation,
+            lambda: _use_runtime_for_builds(state, builds, query_runtime),
             "Code search failed; check the configured index and embedding provider.",
         )
 
@@ -529,7 +542,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         title="Read exact indexed symbol",
         description=(
             "Read the indexed source span for one exact symbol ID. The source path is taken only "
-            "from the configured index and must remain inside the configured project."
+            "from the configured index and its build-scoped source boundary."
         ),
         annotations=local_read,
     )
@@ -541,14 +554,13 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     ) -> ReadSymbolResult:
         state = _state(ctx)
 
-        def operation() -> ReadSymbolResult:
-            runtime = state.require_runtime()
-            scope = runtime.analysis_service.resolve_scope(builds)
+        def read_runtime(runtime: Runtime) -> ReadSymbolResult:
+            scope = runtime.config.build_scope
             symbol = _get_symbol(runtime, symbol_id, scope.variants)
-            source = FilesystemSourceReader(state.config.project_root).read_symbol(symbol)
+            source = runtime.source_reader.read_symbol(symbol)
             truncated = len(source) > max_source_chars
             return ReadSymbolResult(
-                symbol=_symbol_reference(symbol, state.config.project_root),
+                symbol=_symbol_reference(symbol, runtime.source_reader),
                 source_text=source[:max_source_chars],
                 truncated=truncated,
                 scope_kind="union" if scope.is_union else "single",
@@ -563,7 +575,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "read_symbol",
-            operation,
+            lambda: _use_runtime_for_builds(state, builds, read_runtime),
             "The symbol could not be read from the configured project.",
         )
 
@@ -669,19 +681,15 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     ) -> AskCodeResult:
         state = _state(ctx)
 
-        def operation() -> AskCodeResult:
-            runtime, temporary = _runtime_for_builds(state, builds)
-            try:
-                if runtime.answer_service is None:
-                    raise PublicToolFailure(
-                        "Code answering is unavailable; configure an LLM when starting the server."
-                    )
-                answer = runtime.answer_service.answer(
-                    AnswerRequest(query.strip(), max_context_tokens, max_steps)
+        def answer_runtime(runtime: Runtime) -> AskCodeResult:
+            if runtime.answer_service is None:
+                raise PublicToolFailure(
+                    "Code answering is unavailable; configure an LLM when starting the server."
                 )
-            finally:
-                if temporary:
-                    runtime.close()
+            answer = runtime.answer_service.answer(
+                AnswerRequest(query.strip(), max_context_tokens, max_steps)
+            )
+            source_reader = runtime.source_reader
             rendered_answer = _redact_project_root(answer.answer, state.config.project_root)
             diagnostics = list(answer.diagnostics[:MAX_DIAGNOSTICS])
             complete = answer.complete
@@ -702,7 +710,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                             source.path,
                             source.start_line,
                             source.end_line,
-                            state.config.project_root,
+                            source_reader,
                         ),
                     )
                     for source in answer.sources[:MAX_SEARCH_RESULTS]
@@ -716,7 +724,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         return await _call_tool(
             state,
             "ask_code",
-            operation,
+            lambda: _use_runtime_for_builds(state, builds, answer_runtime),
             "Code answering failed; check the configured index and LLM provider.",
         )
 
@@ -764,9 +772,8 @@ async def _graph_tool(
     per_node_fanout: int,
     builds: list[str] | None,
 ) -> GraphResult:
-    def operation() -> GraphResult:
-        runtime = state.require_runtime()
-        scope = runtime.analysis_service.resolve_scope(builds)
+    def graph_runtime(runtime: Runtime) -> GraphResult:
+        scope = runtime.config.build_scope
         origin = _get_symbol(runtime, symbol_id, scope.variants)
         if (
             relations == [GraphRelation.CALLS]
@@ -800,8 +807,8 @@ async def _graph_tool(
                     GraphEdgeResult(
                         edge_id=call.target_evidence_id,
                         build_variant=call.provenance.build_variant,
-                        source=_symbol_reference(source, state.config.project_root),
-                        target=_symbol_reference(target, state.config.project_root),
+                        source=_symbol_reference(source, runtime.source_reader),
+                        target=_symbol_reference(target, runtime.source_reader),
                         relation=GraphRelation.CALLS,
                         translation_unit_id=call.provenance.translation_unit_id,
                         build_configuration_id=call.provenance.build_configuration_id,
@@ -815,7 +822,7 @@ async def _graph_tool(
                 )
             if rendered_calls:
                 return GraphResult(
-                    symbol=_symbol_reference(origin, state.config.project_root),
+                    symbol=_symbol_reference(origin, runtime.source_reader),
                     direction=direction,
                     depth=depth,
                     edges=rendered_calls,
@@ -949,8 +956,8 @@ async def _graph_tool(
                 GraphEdgeResult(
                     edge_id=edge.id,
                     build_variant=edge.build_variant,
-                    source=_symbol_reference(source, state.config.project_root),
-                    target=_symbol_reference(target, state.config.project_root),
+                    source=_symbol_reference(source, runtime.source_reader),
+                    target=_symbol_reference(target, runtime.source_reader),
                     relation=edge.relation,
                     translation_unit_id=edge.translation_unit_id,
                     build_configuration_id=edge.build_configuration_id,
@@ -963,7 +970,7 @@ async def _graph_tool(
                 )
             )
         return GraphResult(
-            symbol=_symbol_reference(origin, state.config.project_root),
+            symbol=_symbol_reference(origin, runtime.source_reader),
             direction=direction,
             depth=depth,
             edges=rendered,
@@ -980,7 +987,7 @@ async def _graph_tool(
     return await _call_tool(
         state,
         tool_name,
-        operation,
+        lambda: _use_runtime_for_builds(state, builds, graph_runtime),
         "Graph navigation failed for the configured project index.",
     )
 
@@ -998,17 +1005,25 @@ def _get_symbol(
     return symbol
 
 
-def _runtime_for_builds(
-    state: ProjectServerState, builds: list[str] | None
-) -> tuple[Runtime, bool]:
+def _use_runtime_for_builds(
+    state: ProjectServerState,
+    builds: list[str] | None,
+    operation: Callable[[Runtime], T],
+) -> T:
     runtime = state.require_runtime()
     scope = runtime.analysis_service.resolve_scope(builds)
     if scope == runtime.config.build_scope:
-        return runtime, False
-    return build_runtime(replace(runtime.config, build_scope=scope)), True
+        return operation(runtime)
+    # A union reader gives generated roots union-wide ordinal aliases and could
+    # render a location using provenance from a build the caller did not select.
+    scoped_runtime = build_runtime(replace(runtime.config, build_scope=scope))
+    try:
+        return operation(scoped_runtime)
+    finally:
+        scoped_runtime.close()
 
 
-def _symbol_reference(symbol: CodeSymbol, project_root: Path) -> SymbolReference:
+def _symbol_reference(symbol: CodeSymbol, source_reader: FilesystemSourceReader) -> SymbolReference:
     return SymbolReference(
         symbol_id=symbol.id,
         variant_id=symbol.variant_id,
@@ -1020,21 +1035,24 @@ def _symbol_reference(symbol: CodeSymbol, project_root: Path) -> SymbolReference
             symbol.span.path,
             symbol.span.start_line,
             symbol.span.end_line,
-            project_root,
+            source_reader,
         ),
     )
 
 
-def _source_location(path: Path, start_line: int, end_line: int, root: Path) -> SourceLocation:
-    resolved_root = root.resolve(strict=False)
-    resolved = (path if path.is_absolute() else resolved_root / path).resolve(strict=False)
-    if not resolved.is_relative_to(resolved_root):
-        raise PublicToolFailure("An indexed source location is outside the configured project.")
-    return SourceLocation(
-        path=resolved.relative_to(resolved_root).as_posix(),
-        start_line=start_line,
-        end_line=end_line,
-    )
+def _source_location(
+    path: Path,
+    start_line: int,
+    end_line: int,
+    source_reader: FilesystemSourceReader,
+) -> SourceLocation:
+    try:
+        rendered = source_reader.display_path(path)
+    except SourceReadError:
+        raise PublicToolFailure(
+            "An indexed source location is outside the configured source boundary."
+        ) from None
+    return SourceLocation(path=rendered, start_line=start_line, end_line=end_line)
 
 
 def _redact_project_root(text: str, root: Path) -> str:

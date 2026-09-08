@@ -532,6 +532,8 @@ class DeepMaterializer:
             database = CompilationDatabase.load(
                 variant.compilation_database,
                 build_variant=variant.name,
+                project_root=self.config.project_root,
+                generated_source_roots=variant.generated_source_roots,
                 check_cancelled=lambda: control.check("compilation database load"),
             )
             control.check("compilation database load")

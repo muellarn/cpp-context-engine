@@ -871,7 +871,7 @@ def test_v13_migration_upgrades_real_v12_profile_and_coverage_rows(tmp_path: Pat
         }.isdisjoint(row[1] for row in legacy.execute("PRAGMA table_info(translation_units)"))
 
     with SQLiteStore(database, project_root=root) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 15  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 16  # noqa: SLF001
         assert "vector_encoding" in {  # noqa: SLF001
             row[1] for row in migrated._connection.execute("PRAGMA table_info(embedding_vectors)")
         }
@@ -1950,7 +1950,7 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     legacy.close()
 
     with SQLiteStore(database, project_root=root) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 15  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 16  # noqa: SLF001
         assert store.embedding_count("fixture") == 2
         assert store.embedding_vector_count("fixture") == 1
         assert store.embedding_count("openai-compatible:legacy") == 0
@@ -2047,7 +2047,7 @@ def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 15  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 16  # noqa: SLF001
         assert "vector_encoding" in {
             row[1]
             for row in store._connection.execute(  # noqa: SLF001

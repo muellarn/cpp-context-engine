@@ -24,7 +24,8 @@
     "function_summaries_v1",
     "interprocedural_bindings_v1",
     "gzip_jsonl_v1",
-    "analysis_profiles_v1"
+    "analysis_profiles_v1",
+    "generated_source_roots_v1"
   ],
   "clang_major": 18,
   "protocol": "cpp-context-clang-facts",

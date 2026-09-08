@@ -16,7 +16,8 @@ from cpp_context_engine.models import (
     GraphDirection,
     SourceSpan,
 )
-from cpp_context_engine.storage import SQLiteStore
+from cpp_context_engine.storage import FilesystemSourceReader, SQLiteStore
+from cpp_context_engine.storage.source import SourceReadError
 
 MAX_BUILD_VARIANTS = 16
 MAX_BUILD_NAME_CHARS = 128
@@ -314,6 +315,7 @@ class AnalysisQueryService:
     store: SQLiteStore
     project_root: Path
     allowed_scope: BuildScope
+    source_reader: FilesystemSourceReader | None = None
 
     def list_builds(self) -> BuildListResult:
         reindex = set(self.store.reindex_required_variants(self.project_root))
@@ -807,12 +809,13 @@ class AnalysisQueryService:
         return self._required_location(span) if span is not None else None
 
     def _required_location(self, span: SourceSpan) -> SourceLocation:
-        root = self.project_root.resolve(strict=False)
-        path = (span.path if span.path.is_absolute() else root / span.path).resolve(strict=False)
-        if not path.is_relative_to(root):
-            raise ValueError("indexed source location is outside the configured project")
+        reader = self.source_reader or FilesystemSourceReader(self.project_root)
+        try:
+            path = reader.display_path(span.path)
+        except SourceReadError:
+            raise ValueError("indexed source location is outside the configured project") from None
         return SourceLocation(
-            path=path.relative_to(root).as_posix(),
+            path=path,
             start_line=span.start_line,
             end_line=span.end_line,
             start_column=span.start_column,

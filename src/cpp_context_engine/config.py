@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from cpp_context_engine.models import BuildScope, BuildVariant, IndexProfile
@@ -135,12 +136,27 @@ class AppConfig:
         base = (cwd or Path.cwd()).resolve()
         project_root = _path_env("CPP_CONTEXT_PROJECT_ROOT", base)
         index_directory = _path_env("CPP_CONTEXT_INDEX_DIRECTORY", project_root / ".cpp-context")
+        compilation_database = _optional_path_env("CPP_CONTEXT_COMPILE_COMMANDS")
+        variants = _build_variants_env()
+        generated_roots = _generated_roots_env()
+        if generated_roots:
+            variants = _bind_generated_source_roots(
+                variants
+                or (
+                    BuildVariant(
+                        "default",
+                        compilation_database or project_root / "build" / "compile_commands.json",
+                    ),
+                ),
+                generated_roots,
+                setting="CPP_CONTEXT_GENERATED_SOURCE_ROOTS",
+            )
         return cls(
             project_root=project_root,
             index_directory=index_directory,
             database_path=_optional_path_env("CPP_CONTEXT_DATABASE"),
-            compilation_database=_optional_path_env("CPP_CONTEXT_COMPILE_COMMANDS"),
-            build_variants=_build_variants_env(),
+            compilation_database=compilation_database,
+            build_variants=variants,
             build_scope=_build_scope_env(),
             index_profile=_index_profile_env(),
             libclang_library_file=_optional_path_env("LIBCLANG_LIBRARY_FILE"),
@@ -244,6 +260,44 @@ def _build_variants_env() -> tuple[BuildVariant, ...]:
 def _build_scope_env() -> BuildScope:
     raw = os.getenv("CPP_CONTEXT_BUILD_SCOPE", "").strip()
     return BuildScope(tuple(raw.split(","))) if raw else BuildScope.single()
+
+
+def _generated_roots_env() -> tuple[str, ...]:
+    raw = os.getenv("CPP_CONTEXT_GENERATED_SOURCE_ROOTS", "").strip()
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _bind_generated_source_roots(
+    variants: tuple[BuildVariant, ...], values: Sequence[str], *, setting: str
+) -> tuple[BuildVariant, ...]:
+    """Attach repeatable plain or NAME=PATH roots to configured build variants."""
+
+    if not values:
+        return variants
+    named = ["=" in value for value in values]
+    if any(named) and not all(named):
+        raise ValueError(f"{setting} must not mix PATH and NAME=PATH entries")
+    roots_by_name: dict[str, list[Path]] = {variant.name: [] for variant in variants}
+    if all(named):
+        for value in values:
+            name, _separator, raw_path = value.partition("=")
+            if not name.strip() or not raw_path.strip() or name.strip() not in roots_by_name:
+                raise ValueError(f"{setting} references an unknown or invalid build variant")
+            roots_by_name[name.strip()].append(Path(raw_path.strip()))
+    else:
+        if len(variants) != 1:
+            raise ValueError(f"{setting} requires NAME=PATH with multiple build variants")
+        roots_by_name[variants[0].name].extend(Path(value) for value in values)
+    return tuple(
+        replace(
+            variant,
+            generated_source_roots=(
+                *variant.generated_source_roots,
+                *roots_by_name[variant.name],
+            ),
+        )
+        for variant in variants
+    )
 
 
 def _index_profile_env() -> IndexProfile:

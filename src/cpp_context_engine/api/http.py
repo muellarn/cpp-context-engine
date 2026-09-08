@@ -77,6 +77,7 @@ def create_app(
         return _serialize_context(
             response.context,
             project_root=analysis_service.project_root if analysis_service else None,
+            source_reader=analysis_service.source_reader if analysis_service else None,
         )
 
     @app.post("/v1/answer")
@@ -114,6 +115,7 @@ def create_app(
                     "path": _safe_path(
                         source.path,
                         analysis_service.project_root if analysis_service else None,
+                        analysis_service.source_reader if analysis_service else None,
                     ),
                     "start_line": source.start_line,
                     "end_line": source.end_line,
@@ -165,7 +167,10 @@ def _require_analysis(service: AnalysisQueryService | None) -> AnalysisQueryServ
 
 
 def _serialize_context(
-    bundle: ContextBundle, *, project_root: Path | None = None
+    bundle: ContextBundle,
+    *,
+    project_root: Path | None = None,
+    source_reader: Any | None = None,
 ) -> dict[str, Any]:
     return {
         "query": bundle.query,
@@ -176,7 +181,7 @@ def _serialize_context(
                 "build_variant": item.hit.symbol.build_variant,
                 "qualified_name": item.hit.symbol.qualified_name,
                 "kind": item.hit.symbol.kind.value,
-                "path": _safe_path(item.hit.symbol.span.path, project_root),
+                "path": _safe_path(item.hit.symbol.span.path, project_root, source_reader),
                 "start_line": item.hit.symbol.span.start_line,
                 "end_line": item.hit.symbol.span.end_line,
                 "score": item.hit.score,
@@ -206,7 +211,12 @@ def _serialize_context(
     }
 
 
-def _safe_path(path: Path, project_root: Path | None) -> str:
+def _safe_path(path: Path, project_root: Path | None, source_reader: Any | None = None) -> str:
+    if source_reader is not None:
+        try:
+            return source_reader.display_path(path)
+        except Exception:
+            return "<outside-project>"
     if project_root is None:
         return path.as_posix() if not path.is_absolute() else "<absolute-path-redacted>"
     root = project_root.resolve(strict=False)

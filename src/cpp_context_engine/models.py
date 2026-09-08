@@ -9,6 +9,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generic, TypeVar
 
+from cpp_context_engine.source_paths import canonical_generated_source_roots
+
 DEFAULT_BUILD_VARIANT = "default"
 MAX_BUILD_VARIANTS = 16
 MAX_BUILD_VARIANT_NAME_CHARS = 128
@@ -185,6 +187,7 @@ class BuildVariant:
     target: str = ""
     platform: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    generated_source_roots: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         name = self.name.strip()
@@ -199,6 +202,13 @@ class BuildVariant:
             self,
             "compilation_database",
             self.compilation_database.expanduser().resolve(strict=False),
+        )
+        object.__setattr__(
+            self,
+            "generated_source_roots",
+            canonical_generated_source_roots(
+                self.compilation_database, tuple(self.generated_source_roots)
+            ),
         )
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
@@ -243,6 +253,7 @@ class BuildConfiguration:
     command_hash: str
     output: Path | None = None
     build_variant: str = DEFAULT_BUILD_VARIANT
+    generated_source_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

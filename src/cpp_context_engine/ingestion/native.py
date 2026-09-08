@@ -74,6 +74,7 @@ from cpp_context_engine.models import (
     SymbolOccurrence,
     TranslationUnit,
 )
+from cpp_context_engine.source_paths import SourceBoundary
 
 PROTOCOL = "cpp-context-clang-facts"
 PROTOCOL_VERSION = 5
@@ -112,6 +113,7 @@ DEFAULT_MAX_RECORD_BYTES = 16 * 1_048_576
 DEFAULT_MAX_STDERR_BYTES = 256 * 1024
 GZIP_TRANSPORT = "gzip_jsonl_v1"
 PROFILE_CAPABILITY = "analysis_profiles_v1"
+GENERATED_SOURCE_ROOTS_CAPABILITY = "generated_source_roots_v1"
 MAX_FACT_KINDS = 64
 _FRAME_HEADER = struct.Struct(">I")
 
@@ -385,14 +387,6 @@ def _hash_text(*values: str) -> str:
     return digest.hexdigest()
 
 
-def _within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
 class NativeAnalyzerClient:
     """Execute one explicitly configured binary without a shell or unbounded pipes."""
 
@@ -502,7 +496,19 @@ class NativeAnalyzerClient:
     ) -> None:
         """Validate one response while forwarding facts without retaining raw output."""
 
+        boundary = SourceBoundary(project_root, configuration.generated_source_roots)
+        try:
+            source_path = boundary.canonical_file(configuration.source_path)
+        except ValueError as error:
+            raise AnalyzerProtocolError(
+                "analyzer source is outside the authorized source roots"
+            ) from error
         info = self.probe()
+        if (
+            configuration.generated_source_roots
+            and GENERATED_SOURCE_ROOTS_CAPABILITY not in info.capabilities
+        ):
+            raise AnalyzerProtocolError("analyzer does not support explicit generated source roots")
         if self.profile is IndexProfile.NAVIGATION and PROFILE_CAPABILITY not in info.capabilities:
             raise AnalyzerProtocolError("analyzer does not support the navigation profile")
         unit_id = translation_unit_id(configuration)
@@ -515,10 +521,14 @@ class NativeAnalyzerClient:
             "type": "analyze",
             "request_id": unit_id,
             "project_root": str(project_root.resolve(strict=False)),
-            "source_path": str(configuration.source_path),
+            "source_path": str(source_path),
             "directory": str(configuration.directory),
             "arguments": list(libclang_arguments(configuration)),
         }
+        if configuration.generated_source_roots:
+            request["generated_source_roots"] = [
+                str(root) for root in configuration.generated_source_roots
+            ]
         # Omit the default so existing protocol-v5 companions keep accepting full requests.
         if self.profile is IndexProfile.NAVIGATION:
             request["profile"] = self.profile.value
@@ -955,8 +965,14 @@ class NativeClangIngestor:
         compilation_database: Path,
         *,
         build_variant: str = "default",
+        generated_source_roots: tuple[Path, ...] = (),
     ) -> IngestionBatch:
-        database = CompilationDatabase.load(compilation_database, build_variant=build_variant)
+        database = CompilationDatabase.load(
+            compilation_database,
+            build_variant=build_variant,
+            project_root=project_root,
+            generated_source_roots=generated_source_roots,
+        )
         return self.ingest_configurations(project_root, database.configurations)
 
     def ingest_configurations(
@@ -1353,6 +1369,7 @@ class _FactBatchBuilder:
     ) -> None:
         self.root = root
         self.configuration = configuration
+        self.boundary = SourceBoundary(root, configuration.generated_source_roots)
         self.profile = IndexProfile(profile)
         self.unit_id = translation_unit_id(configuration)
         self.symbols: dict[str, CodeSymbol] = {}
@@ -2348,7 +2365,7 @@ class _FactBatchBuilder:
         self._file_symbol(path, key=key)
 
     def _file_symbol(self, path: Path, *, key: str | None = None) -> CodeSymbol:
-        relative = path.relative_to(self.root).as_posix()
+        relative = self.boundary.display(path)
         symbol_id = "file_" + _hash_text(relative)[:32]
         key = key or "file:" + relative
         self.keys[key] = symbol_id
@@ -2516,8 +2533,10 @@ class _FactBatchBuilder:
         if cached is not None:
             return cached
         path = Path(raw).resolve(strict=False)
-        if not _within(path, self.root) or not path.is_file():
-            raise AnalyzerProtocolError("analyzer returned a path outside the project")
+        if not self.boundary.contains(path) or not path.is_file():
+            raise AnalyzerProtocolError(
+                "analyzer returned a path outside the authorized source roots"
+            )
         self.path_cache[raw] = path
         return path
 
