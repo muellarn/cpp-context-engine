@@ -6,6 +6,7 @@ import hashlib
 import json
 import marshal
 import os
+import queue
 import signal
 import struct
 import subprocess
@@ -28,6 +29,13 @@ from cpp_context_engine.ingestion.compilation_database import (
     translation_unit_id,
 )
 from cpp_context_engine.ingestion.protocols import IngestionBatch
+from cpp_context_engine.ingestion.telemetry import (
+    AnalyzerEventKind,
+    AnalyzerOutcome,
+    AnalyzerPipelineEvent,
+    AnalyzerPipelineObserver,
+    AnalyzerTelemetryError,
+)
 from cpp_context_engine.models import (
     BuildConfiguration,
     CallArgumentBinding,
@@ -747,6 +755,153 @@ class NativeAnalyzerClient:
         return records
 
 
+_TELEMETRY_STOP = object()
+
+
+class _TelemetryDispatcher:
+    """Serialize observer callbacks away from analyzer and scheduler critical sections."""
+
+    def __init__(
+        self,
+        observer: AnalyzerPipelineObserver,
+        *,
+        slot_count: int,
+        total_configurations: int,
+        max_spool_registries: int,
+    ) -> None:
+        self._observer = observer
+        self._slot_count = slot_count
+        self._max_spool_registries = max_spool_registries
+        self._unscheduled_count = total_configurations
+        self._held_registries = 0
+        self._sequence = 0
+        self._last_time = 0.0
+        self._failure: AnalyzerTelemetryError | None = None
+        self._lock = threading.Lock()
+        self._events: queue.Queue[AnalyzerPipelineEvent | object] = queue.Queue(
+            maxsize=max(32, slot_count * 8)
+        )
+        self._thread = threading.Thread(
+            target=self._dispatch,
+            name="cpp-context-telemetry",
+            daemon=True,
+        )
+        self._thread.start()
+        self.update_state(
+            unscheduled_count=total_configurations,
+            held_registries=0,
+        )
+
+    @property
+    def failure(self) -> AnalyzerTelemetryError | None:
+        with self._lock:
+            return self._failure
+
+    def update_state(self, *, unscheduled_count: int, held_registries: int) -> None:
+        with self._lock:
+            self._unscheduled_count = unscheduled_count
+            self._held_registries = held_registries
+            self._enqueue_locked(
+                kind="scheduling_state",
+                slot_id=None,
+                configuration_index=None,
+                outcome=None,
+            )
+
+    def started(self, *, slot_id: int, configuration_index: int) -> None:
+        with self._lock:
+            self._enqueue_locked(
+                kind="analyzer_started",
+                slot_id=slot_id,
+                configuration_index=configuration_index,
+                outcome=None,
+            )
+
+    def finished(
+        self,
+        *,
+        slot_id: int,
+        configuration_index: int,
+        outcome: AnalyzerOutcome,
+    ) -> None:
+        with self._lock:
+            self._enqueue_locked(
+                kind="analyzer_finished",
+                slot_id=slot_id,
+                configuration_index=configuration_index,
+                outcome=outcome,
+            )
+
+    def close(self) -> AnalyzerTelemetryError | None:
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                self._events.put(_TELEMETRY_STOP, timeout=max(0.0, deadline - time.monotonic()))
+                break
+            except queue.Full:
+                with self._lock:
+                    if self._failure is None:
+                        self._failure = AnalyzerTelemetryError(
+                            "analyzer telemetry dispatcher did not drain its bounded queue"
+                        )
+                return self.failure
+        self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self._thread.is_alive():
+            with self._lock:
+                if self._failure is None:
+                    self._failure = AnalyzerTelemetryError(
+                        "analyzer telemetry observer did not finish within two seconds"
+                    )
+        return self.failure
+
+    def _enqueue_locked(
+        self,
+        *,
+        kind: AnalyzerEventKind,
+        slot_id: int | None,
+        configuration_index: int | None,
+        outcome: AnalyzerOutcome | None,
+    ) -> None:
+        if self._failure is not None:
+            return
+        observed_at = max(self._last_time, time.monotonic())
+        self._last_time = observed_at
+        self._sequence += 1
+        event = AnalyzerPipelineEvent(
+            sequence=self._sequence,
+            monotonic_seconds=observed_at,
+            kind=kind,
+            slot_id=slot_id,
+            configuration_index=configuration_index,
+            outcome=outcome,
+            unscheduled_count=self._unscheduled_count,
+            held_registries=self._held_registries,
+            max_spool_registries=self._max_spool_registries,
+            slot_count=self._slot_count,
+        )
+        try:
+            self._events.put_nowait(event)
+        except queue.Full:
+            self._failure = AnalyzerTelemetryError(
+                "analyzer telemetry exceeded its bounded event queue"
+            )
+
+    def _dispatch(self) -> None:
+        while True:
+            event = self._events.get()
+            if event is _TELEMETRY_STOP:
+                return
+            if self.failure is not None:
+                continue
+            try:
+                self._observer(event)  # type: ignore[arg-type]
+            except BaseException as error:
+                with self._lock:
+                    self._failure = AnalyzerTelemetryError(
+                        f"analyzer telemetry observer failed: {type(error).__name__}: {error}"
+                    )
+
+
 class NativeClangIngestor:
     """Convert complete companion facts into the existing durable domain model."""
 
@@ -760,6 +915,7 @@ class NativeClangIngestor:
         max_spool_fds: int | None = None,
         max_domain_batches: int = 2,
         profile: IndexProfile = IndexProfile.FULL,
+        observer: AnalyzerPipelineObserver | None = None,
     ) -> None:
         registry_limit = max_workers * 2 if max_spool_registries is None else max_spool_registries
         decoded_limit = int(getattr(client, "max_decoded_bytes", DEFAULT_MAX_DECODED_BYTES))
@@ -792,6 +948,7 @@ class NativeClangIngestor:
         self.max_domain_batches = min(max_domain_batches, registry_limit)
         self.profile = selected_profile
         self.advanced_facts_complete = self.profile is IndexProfile.FULL
+        self.observer = observer
 
     analysis_backend = "clang-libtooling"
 
@@ -838,6 +995,18 @@ class NativeClangIngestor:
         # independent global spool budget may bound its ephemeral representation.
         registry_byte_limit = self.max_spool_bytes
         check_request = getattr(self.client, "check_request", lambda: None)
+        worker_count = min(self.max_workers, max(1, len(selected)))
+        condition = threading.Condition()
+        telemetry = (
+            _TelemetryDispatcher(
+                self.observer,
+                slot_count=worker_count,
+                total_configurations=len(selected),
+                max_spool_registries=self.max_spool_registries,
+            )
+            if self.observer is not None
+            else None
+        )
 
         def analyze(configuration: BuildConfiguration) -> _FactRegistry:
             facts = _FactRegistry(
@@ -859,6 +1028,26 @@ class NativeClangIngestor:
                 facts.close()
                 raise
 
+        def analyze_observed(
+            index: int, slot_id: int, configuration: BuildConfiguration
+        ) -> _FactRegistry:
+            assert telemetry is not None
+            telemetry.started(slot_id=slot_id, configuration_index=index)
+            outcome: AnalyzerOutcome = "failed"
+            try:
+                result = analyze(configuration)
+                outcome = "cancelled" if cancelled.is_set() else "succeeded"
+                return result
+            except BaseException:
+                outcome = "cancelled" if cancelled.is_set() else "failed"
+                raise
+            finally:
+                telemetry.finished(
+                    slot_id=slot_id,
+                    configuration_index=index,
+                    outcome=outcome,
+                )
+
         def convert(index: int, facts: _FactRegistry) -> IngestionBatch:
             try:
                 return _FactBatchBuilder(
@@ -870,7 +1059,6 @@ class NativeClangIngestor:
             finally:
                 facts.close()
 
-        worker_count = min(self.max_workers, max(1, len(selected)))
         converter_count = min(self.max_domain_batches, len(selected))
         analyzer_executor = ThreadPoolExecutor(
             max_workers=worker_count, thread_name_prefix="cpp-context-analyzer"
@@ -878,8 +1066,9 @@ class NativeClangIngestor:
         converter_executor = ThreadPoolExecutor(
             max_workers=converter_count, thread_name_prefix="cpp-context-converter"
         )
-        condition = threading.Condition()
         analysis_futures: dict[Future[_FactRegistry], int] = {}
+        analysis_slots: dict[Future[_FactRegistry], int] = {}
+        available_slots = list(range(worker_count))
         pending_registries: dict[int, _FactRegistry] = {}
         conversion_futures: dict[int, Future[IngestionBatch]] = {}
         conversion_registries: dict[int, _FactRegistry] = {}
@@ -890,7 +1079,9 @@ class NativeClangIngestor:
         failure: BaseException | None = None
         completion_revision = 0
 
-        def request_failure() -> AnalyzerLimitError | None:
+        def request_failure() -> BaseException | None:
+            if telemetry is not None and telemetry.failure is not None:
+                return telemetry.failure
             try:
                 check_request()
             except AnalyzerLimitError as error:
@@ -932,6 +1123,9 @@ class NativeClangIngestor:
                         completed_failures: list[tuple[int, BaseException]] = []
                         for index, future in completed_analysis:
                             analysis_futures.pop(future)
+                            if telemetry is not None:
+                                available_slots.append(analysis_slots.pop(future))
+                                available_slots.sort()
                             if future.cancelled():
                                 continue
                             error = future.exception()
@@ -976,10 +1170,28 @@ class NativeClangIngestor:
                             and held_registries < self.max_spool_registries
                         ):
                             index = next_configuration
-                            next_configuration += 1
-                            analyzed = analyzer_executor.submit(analyze, selected[index])
+                            if telemetry is None:
+                                next_configuration += 1
+                                analyzed = analyzer_executor.submit(analyze, selected[index])
+                                held_registries += 1
+                            else:
+                                # Record the exact scheduler state before the submitted
+                                # callable can start on its assigned logical slot.
+                                slot_id = available_slots.pop(0)
+                                next_configuration += 1
+                                held_registries += 1
+                                telemetry.update_state(
+                                    unscheduled_count=len(selected) - next_configuration,
+                                    held_registries=held_registries,
+                                )
+                                analyzed = analyzer_executor.submit(
+                                    analyze_observed,
+                                    index,
+                                    slot_id,
+                                    selected[index],
+                                )
+                                analysis_slots[analyzed] = slot_id
                             analysis_futures[analyzed] = index
-                            held_registries += 1
                             analyzed.add_done_callback(wake)
 
                         analyses_finished = (
@@ -1024,6 +1236,11 @@ class NativeClangIngestor:
                         conversion_futures.pop(index, None)
                         conversion_registries.pop(index, None)
                         held_registries -= 1
+                        if telemetry is not None:
+                            telemetry.update_state(
+                                unscheduled_count=len(selected) - next_configuration,
+                                held_registries=held_registries,
+                            )
                         condition.notify_all()
                     del batch
         finally:
@@ -1048,6 +1265,10 @@ class NativeClangIngestor:
             for future in analysis_futures:
                 if future.done() and not future.cancelled() and future.exception() is None:
                     future.result().close()
+            if telemetry is not None:
+                telemetry_error = telemetry.close()
+                if telemetry_error is not None and failure is None:
+                    raise telemetry_error
 
     @staticmethod
     def _merge_batches(
