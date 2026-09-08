@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 import weakref
 from collections.abc import Iterable, Iterator
 from dataclasses import replace
@@ -15,6 +16,7 @@ from cpp_context_engine.ingestion.compilation_database import (
     translation_unit_id,
 )
 from cpp_context_engine.ingestion.indexer import ProjectIndexer
+from cpp_context_engine.ingestion.native import REQUIRED_CAPABILITIES, AnalyzerLimitError
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.models import (
     BuildConfiguration,
@@ -452,3 +454,71 @@ def test_project_indexer_forwards_cancellation_and_publishes_nothing(
         assert isinstance(failures[0], RuntimeError)
         assert "cancelled" in str(failures[0])
         assert store.translation_unit_states(root) == {}
+
+
+def test_runtime_cancellation_reaches_active_native_analyzer(tmp_path: Path) -> None:
+    from cpp_context_engine.config import AppConfig
+    from cpp_context_engine.runtime import index_project
+
+    root = tmp_path / "project"
+    root.mkdir()
+    database = _database(root, 1)
+    analyzer_started = tmp_path / "analyzer-started"
+    hello = {
+        "type": "hello",
+        "protocol": "cpp-context-clang-facts",
+        "protocol_version": 5,
+        "analyzer_version": "test",
+        "clang_major": 18,
+        "capabilities": sorted(REQUIRED_CAPABILITIES),
+    }
+    analyzer = tmp_path / "blocking-analyzer"
+    analyzer.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        "requests = [json.loads(line) for line in sys.stdin]\n"
+        f"hello = {hello!r}\n"
+        "print(json.dumps(hello), flush=True)\n"
+        "if len(requests) > 1:\n"
+        f"    pathlib.Path({str(analyzer_started)!r}).touch()\n"
+        "    time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    analyzer.chmod(0o755)
+    index_path = tmp_path / "index.db"
+    config = AppConfig(
+        project_root=root,
+        index_directory=tmp_path,
+        database_path=index_path,
+        compilation_database=database,
+        clang_analyzer_path=analyzer,
+        analyzer_timeout_seconds=2,
+        embedding_dimensions=16,
+    )
+    cancelled = threading.Event()
+    failures: list[BaseException] = []
+
+    def run_index() -> None:
+        try:
+            index_project(config, cancelled=cancelled)
+        except BaseException as error:  # pragma: no cover - surfaced below
+            failures.append(error)
+
+    worker = threading.Thread(target=run_index)
+    worker.start()
+    start_deadline = time.monotonic() + 1
+    while not analyzer_started.exists() and time.monotonic() < start_deadline:
+        time.sleep(0.01)
+    assert analyzer_started.exists()
+    cancelled.set()
+    worker.join(timeout=0.5)
+    stopped_promptly = not worker.is_alive()
+    worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert stopped_promptly
+    assert len(failures) == 1
+    assert isinstance(failures[0], AnalyzerLimitError)
+    assert "cancelled" in str(failures[0])
+    with SQLiteStore(index_path, project_root=root) as store:
+        assert not store.has_project(root)

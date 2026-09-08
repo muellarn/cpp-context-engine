@@ -159,6 +159,9 @@ def index_project(
                 max_record_bytes=config.analyzer_max_record_bytes,
                 max_stderr_bytes=config.analyzer_max_stderr_bytes,
                 profile=config.index_profile,
+                # Without the request event, an MCP cancellation can leave an
+                # active companion running until its independent timeout.
+                external_cancelled=cancelled,
             )
             info = client.probe()
             ingestor = NativeClangIngestor(
