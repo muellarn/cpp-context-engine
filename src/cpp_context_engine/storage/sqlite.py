@@ -4476,6 +4476,21 @@ class SQLiteStore:
             ),
         )
 
+    def _put_summary_solution_payloads(
+        self,
+        project_id: int,
+        summary_ids: set[str],
+        effects: Iterable[SummaryEffect],
+        origins: Iterable[SummaryReturnOrigin],
+    ) -> None:
+        """Persist sorted solver output one summary at a time without relational expansion."""
+
+        self._write_summary_solution_groups(
+            project_id,
+            _propagated_summary_groups(effects, summary_ids),
+            _propagated_summary_groups(origins, summary_ids),
+        )
+
     def _write_summary_solution_batch(
         self,
         rows: Sequence[tuple[object, ...]],
@@ -8428,6 +8443,27 @@ def _encode_summary_payload(
         hashlib.sha256(raw).hexdigest(),
         compressed,
     )
+
+
+def _propagated_summary_groups(
+    records: Iterable[SummaryEffect | SummaryReturnOrigin],
+    selected_summary_ids: set[str],
+) -> Iterator[tuple[str, tuple[SummaryEffect | SummaryReturnOrigin, ...]]]:
+    """Group propagated solver output deterministically with one record list per group."""
+
+    current_id: str | None = None
+    current: list[SummaryEffect | SummaryReturnOrigin] = []
+    selected = (
+        item for item in records if not item.is_local and item.summary_id in selected_summary_ids
+    )
+    for item in sorted(selected, key=lambda value: (value.summary_id, value.id)):
+        if current_id is not None and item.summary_id != current_id:
+            yield current_id, tuple(current)
+            current = []
+        current_id = item.summary_id
+        current.append(item)
+    if current_id is not None:
+        yield current_id, tuple(current)
 
 
 def _ordered_summary_groups(
