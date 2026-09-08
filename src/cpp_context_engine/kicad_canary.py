@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import queue
 import signal
@@ -14,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +38,9 @@ from cpp_context_engine.search import DeterministicLocalEmbeddingProvider, SQLit
 from cpp_context_engine.storage import SQLiteStore
 
 REPORT_SCHEMA_VERSION = 1
+DATABASE_ARTIFACT_POLICY = (
+    "framed-sha256-v1:main+nonempty-wal;shm-excluded;journal+other-sidecars-forbidden"
+)
 DEFAULT_GATE_TIMEOUTS: Mapping[str, float] = {
     "1": 60.0,
     "4": 90.0,
@@ -147,7 +151,19 @@ class _FileIdentity:
 @dataclass(frozen=True, slots=True)
 class _ValidatedArtifacts:
     subset_identity: _FileIdentity
-    database_state: tuple[_FileIdentity, _FileIdentity | None]
+    database_artifact: _DatabaseArtifact
+
+
+@dataclass(frozen=True, slots=True)
+class _DatabaseArtifact:
+    sha256: str
+    state: tuple[_FileIdentity, _FileIdentity | None]
+
+
+def _require_finite_positive(name: str, value: int | float) -> None:
+    # NaN bypasses ordinary <= 0 checks and would silently disable a hard gate.
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +173,16 @@ class CanaryLimits:
     database_bytes: int = 550 * 1024**2
     disk_bytes: int = 1024**3
     no_progress_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "wall_seconds",
+            "rss_bytes",
+            "database_bytes",
+            "disk_bytes",
+            "no_progress_seconds",
+        ):
+            _require_finite_positive(name, getattr(self, name))
 
     def violation(
         self,
@@ -325,7 +351,84 @@ def _sqlite_artifact_state(
     database: Path,
 ) -> tuple[_FileIdentity, _FileIdentity | None]:
     wal = Path(f"{database}-wal")
-    return _file_identity(database), _file_identity(wal) if wal.is_file() else None
+    wal_identity = _file_identity(wal) if wal.is_file() else None
+    if wal_identity is not None and wal_identity.size == 0:
+        wal_identity = None
+    return _file_identity(database), wal_identity
+
+
+def _validate_sqlite_sidecars(database: Path) -> None:
+    wal = Path(f"{database}-wal")
+    shm = Path(f"{database}-shm")
+    journal = Path(f"{database}-journal")
+    if journal.exists():
+        raise RuntimeError("retained database has a rollback journal")
+    allowed = {wal, shm}
+    unexpected = [
+        path
+        for path in database.parent.glob(database.name + "-*")
+        if path.exists() and path not in allowed
+    ]
+    if unexpected:
+        raise RuntimeError("retained database has an unexpected SQLite sidecar")
+    if shm.exists() and not wal.exists():
+        raise RuntimeError("retained database has shared memory without a WAL")
+
+
+def _database_artifact_digest(database: Path) -> _DatabaseArtifact:
+    _validate_sqlite_sidecars(database)
+    before = _sqlite_artifact_state(database)
+    # WAL bytes are durable database state; SHM is volatile coordination state.
+    digest = hashlib.sha256()
+    digest.update(b"cpp-context-sqlite-artifact\0v1\0")
+    for role, path, identity in (
+        (b"main", database, before[0]),
+        (b"wal", Path(f"{database}-wal"), before[1]),
+    ):
+        digest.update(len(role).to_bytes(8, "big"))
+        digest.update(role)
+        if identity is None:
+            digest.update(b"\0")
+            continue
+        digest.update(b"\1")
+        digest.update(identity.size.to_bytes(8, "big"))
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    _validate_sqlite_sidecars(database)
+    after = _sqlite_artifact_state(database)
+    if after != before:
+        raise RuntimeError("retained database changed while its artifact digest was computed")
+    return _DatabaseArtifact(digest.hexdigest(), after)
+
+
+@contextlib.contextmanager
+def _database_writer_exclusion(database: Path) -> Iterator[sqlite3.Connection]:
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = database.resolve(strict=True).as_uri() + "?mode=rw"
+        connection = sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+        connection.execute("PRAGMA busy_timeout = 0")
+        connection.execute("BEGIN IMMEDIATE")
+    except (OSError, sqlite3.Error) as error:
+        if connection is not None:
+            connection.close()
+        raise RuntimeError(f"retained database has an active writer: {error}") from None
+    try:
+        yield connection
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
+
+
+def _validate_database_integrity(connection: sqlite3.Connection) -> str:
+    # quick_check omits index consistency, so it cannot support release evidence.
+    integrity_rows = [tuple(row) for row in connection.execute("PRAGMA integrity_check")]
+    foreign_key_rows = [tuple(row) for row in connection.execute("PRAGMA foreign_key_check")]
+    if integrity_rows != [("ok",)] or foreign_key_rows:
+        raise RuntimeError("canary database failed integrity or foreign-key checks")
+    return "ok"
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -1102,7 +1205,6 @@ def _revalidate_final_artifacts(
 ) -> _ValidatedArtifacts:
     try:
         subset_identity = _file_identity(subset)
-        database_state = _sqlite_artifact_state(database)
         normalized = CompilationDatabase.load(
             subset,
             project_root=project_root,
@@ -1116,16 +1218,11 @@ def _revalidate_final_artifacts(
         if actual_subset != expected_subset:
             raise RuntimeError("retained compilation database differs from the selected subset")
 
-        database_uri = database.resolve(strict=True).as_uri() + "?mode=ro"
-        with sqlite3.connect(database_uri, uri=True) as connection:
-            connection.execute("PRAGMA query_only = ON")
-            connection.execute("BEGIN")
-            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-            foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchone()
+        with _database_writer_exclusion(database) as connection:
+            database_artifact = _database_artifact_digest(database)
+            integrity = _validate_database_integrity(connection)
             snapshot = semantic_snapshot(database, _connection=connection)
             provenance = database_provenance(database, _connection=connection)
-        if integrity != "ok" or foreign_keys is not None:
-            raise RuntimeError("retained database failed integrity checks")
 
         variant = BuildVariant("default", subset, generated_source_roots=generated_source_roots)
         scope = BuildScope((variant.name,))
@@ -1147,7 +1244,8 @@ def _revalidate_final_artifacts(
             "public_orderings": public_orderings,
             "semantic_snapshot": snapshot,
             "database_provenance": provenance,
-            "database_file_sha256": _sha256(database),
+            "database_artifact_sha256": database_artifact.sha256,
+            "database_sidecar_policy": DATABASE_ARTIFACT_POLICY,
             "database_integrity": integrity,
         }
         for field, value in parent_evidence.items():
@@ -1163,25 +1261,31 @@ def _revalidate_final_artifacts(
         # invalidates every digest derived from that read window.
         if _file_identity(subset) != subset_identity:
             raise RuntimeError("retained compilation database changed during validation")
-        if _sqlite_artifact_state(database) != database_state:
+        with _database_writer_exclusion(database):
+            final_database_artifact = _database_artifact_digest(database)
+        if final_database_artifact != database_artifact:
             raise RuntimeError("retained database changed during validation")
-        return _ValidatedArtifacts(subset_identity, database_state)
+        return _ValidatedArtifacts(subset_identity, final_database_artifact)
     except Exception as error:
         raise RuntimeError(f"parent artifact revalidation failed: {error}") from None
 
 
-def _confirm_validated_artifacts_unchanged(
+@contextlib.contextmanager
+def _validated_artifact_publication(
     subset: Path, database: Path, validated: _ValidatedArtifacts
-) -> None:
+) -> Iterator[None]:
     try:
-        changed = (
-            _file_identity(subset) != validated.subset_identity
-            or _sqlite_artifact_state(database) != validated.database_state
-        )
-    except OSError as error:
+        if _file_identity(subset) != validated.subset_identity:
+            raise RuntimeError("retained compilation database changed")
+        # Hold SQLite's writer reservation through marker publication; a momentary
+        # preflight lock would still allow a late commit behind SUCCESS.
+        with _database_writer_exclusion(database):
+            artifact = _database_artifact_digest(database)
+            if artifact != validated.database_artifact:
+                raise RuntimeError("retained database changed")
+            yield
+    except Exception as error:
         raise RuntimeError(f"parent artifact revalidation failed: {error}") from None
-    if changed:
-        raise RuntimeError("parent artifact revalidation failed: retained artifacts changed")
 
 
 def _run_worker(spec_path: Path) -> int:
@@ -1237,11 +1341,9 @@ def _run_worker(spec_path: Path) -> int:
         rankings, public_orderings = _ranking_canaries(config, tuple(spec["queries"]))
         snapshot = semantic_snapshot(database)
         provenance = database_provenance(database)
-        with sqlite3.connect(database) as connection:
-            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-            foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchone()
-        if integrity != "ok" or foreign_keys is not None:
-            raise RuntimeError("canary database failed post-run integrity checks")
+        with _database_writer_exclusion(database) as connection:
+            integrity = _validate_database_integrity(connection)
+            database_artifact = _database_artifact_digest(database)
         _worker_event(
             "result",
             result={
@@ -1251,7 +1353,8 @@ def _run_worker(spec_path: Path) -> int:
                 "public_orderings": public_orderings,
                 "semantic_snapshot": snapshot,
                 "database_provenance": provenance,
-                "database_file_sha256": _sha256(database),
+                "database_artifact_sha256": database_artifact.sha256,
+                "database_sidecar_policy": DATABASE_ARTIFACT_POLICY,
                 "database_integrity": integrity,
                 "analyzer": {
                     "version": info.analyzer_version,
@@ -1302,8 +1405,7 @@ def _parse_timeouts(raw: str) -> dict[str, float]:
         if not separator:
             raise ValueError("gate timeouts must use GATE:SECONDS")
         seconds = float(seconds_raw)
-        if seconds <= 0:
-            raise ValueError("gate timeouts must be positive")
+        _require_finite_positive("gate timeout", seconds)
         values[name] = seconds
     return values
 
@@ -1363,7 +1465,8 @@ def _compare_baseline_gate(gate: Mapping[str, Any], baseline_gate: Mapping[str, 
         "rankings",
         "public_orderings",
         "database_provenance",
-        "database_file_sha256",
+        "database_artifact_sha256",
+        "database_sidecar_policy",
         "database_integrity",
         "analyzer",
     ):
@@ -1399,6 +1502,21 @@ def run_canary(
     baseline_report: Path | None = None,
     generated_source_roots: Sequence[Path] = (),
 ) -> dict[str, Any]:
+    for name, value in (
+        ("workers", workers),
+        ("analyzer timeout", analyzer_timeout_seconds),
+        ("embedding dimensions", embedding_dimensions),
+        ("RSS limit", rss_bytes),
+        ("database limit", database_bytes),
+        ("disk limit", disk_bytes),
+        ("no-progress timeout", no_progress_seconds),
+    ):
+        _require_finite_positive(name, value)
+    for name, seconds in gate_timeouts.items():
+        _require_finite_positive(f"gate {name} timeout", seconds)
+    missing_timeouts = [str(gate) for gate in gates if str(gate) not in gate_timeouts]
+    if missing_timeouts:
+        raise ValueError("no timeout configured for gates: " + ", ".join(missing_timeouts))
     profile = IndexProfile(profile)
     inspection = inspect_compilation_database(project_root, compilation_database)
     canonical_generated_roots = _canonical_generated_roots_for_gates(
@@ -1521,12 +1639,10 @@ def run_canary(
                 _compare_baseline_gate(gate_report, baseline_gates[len(gate_reports)])
             if _sha256(inspection.compilation_database) != inspection.sha256:
                 raise RuntimeError("source compilation database changed during the canary")
-            _confirm_validated_artifacts_unchanged(
-                subset, running / "index.db", validated_artifacts
-            )
-            gate_reports.append(gate_report)
-            running_marker.unlink()
-            _write_report_atomic(running / "SUCCESS", "complete\n")
+            with _validated_artifact_publication(subset, running / "index.db", validated_artifacts):
+                gate_reports.append(gate_report)
+                running_marker.unlink()
+                _write_report_atomic(running / "SUCCESS", "complete\n")
         except BaseException:
             if running.exists():
                 running.rename(failed)
@@ -1597,19 +1713,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         disk_limit_mib = args.disk_limit_mib
         if disk_limit_mib is None:
             disk_limit_mib = 1_024 if profile is IndexProfile.NAVIGATION else 2_048
-        if (
-            min(
-                args.workers,
-                args.analyzer_timeout_seconds,
-                args.embedding_dimensions,
-                args.rss_limit_mib,
-                database_limit_mib,
-                disk_limit_mib,
-                args.no_progress_seconds,
-            )
-            <= 0
+        for name, value in (
+            ("workers", args.workers),
+            ("analyzer timeout", args.analyzer_timeout_seconds),
+            ("embedding dimensions", args.embedding_dimensions),
+            ("RSS limit", args.rss_limit_mib),
+            ("database limit", database_limit_mib),
+            ("disk limit", disk_limit_mib),
+            ("no-progress timeout", args.no_progress_seconds),
         ):
-            raise ValueError("canary limits and worker count must be positive")
+            _require_finite_positive(name, value)
         gates = _parse_gates(args.gates)
         timeouts = (
             _parse_timeouts(args.gate_timeouts)

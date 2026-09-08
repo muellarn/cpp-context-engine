@@ -105,12 +105,14 @@ def _write_final_canary_database(path: Path) -> None:
                 navigation_facts_complete INTEGER,
                 cfg_facts_complete INTEGER,
                 data_flow_facts_complete INTEGER,
-                summary_facts_complete INTEGER
+                summary_facts_complete INTEGER,
+                indexed_at TEXT
             )
             """
         )
         connection.execute(
-            "INSERT INTO translation_units VALUES ('clang-libtooling', 0, 'navigation', 1, 0, 0, 0)"
+            "INSERT INTO translation_units VALUES "
+            "('clang-libtooling', 0, 'navigation', 1, 0, 0, 0, 'before')"
         )
         connection.execute("CREATE TABLE build_variants (name TEXT, index_profile TEXT)")
         connection.execute("INSERT INTO build_variants VALUES ('default', 'navigation')")
@@ -518,7 +520,11 @@ def test_all_gate_forwards_only_explicit_generated_roots(
     monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
     monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
     monkeypatch.setattr(kicad_canary, "_revalidate_final_artifacts", lambda **_kwargs: None)
-    monkeypatch.setattr(kicad_canary, "_confirm_validated_artifacts_unchanged", lambda *_args: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_validated_artifact_publication",
+        lambda *_args: kicad_canary.contextlib.nullcontext(),
+    )
 
     kicad_canary.run_canary(
         project_root=project,
@@ -701,7 +707,11 @@ def test_all_gate_retains_raw_duplicates_but_counts_normalized_configurations(
     monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
     monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
     monkeypatch.setattr(kicad_canary, "_revalidate_final_artifacts", lambda **_kwargs: None)
-    monkeypatch.setattr(kicad_canary, "_confirm_validated_artifacts_unchanged", lambda *_args: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_validated_artifact_publication",
+        lambda *_args: kicad_canary.contextlib.nullcontext(),
+    )
 
     report = kicad_canary.run_canary(
         project_root=project,
@@ -837,7 +847,8 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
                 "rankings": {"query": ["symbol"]},
                 "public_orderings": {"query": {"digest": "ordered"}},
                 "database_provenance": {"coverage": "complete"},
-                "database_file_sha256": "database",
+                "database_artifact_sha256": "database",
+                "database_sidecar_policy": kicad_canary.DATABASE_ARTIFACT_POLICY,
                 "database_integrity": "ok",
                 "analyzer": {"sha256": "analyzer"},
             }
@@ -875,8 +886,8 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
             "database_provenance",
         ),
         (
-            lambda baseline: baseline["gates"][0].update(database_file_sha256="different"),
-            "database_file_sha256",
+            lambda baseline: baseline["gates"][0].update(database_artifact_sha256="different"),
+            "database_artifact_sha256",
         ),
         (
             lambda baseline: baseline["gates"][0].update(database_integrity="different"),
@@ -912,7 +923,8 @@ def test_baseline_comparison_requires_exact_provenance_and_gate_set(
                 "rankings": {"query": ["symbol"]},
                 "public_orderings": {"query": {"digest": "ordered"}},
                 "database_provenance": {"coverage": "complete"},
-                "database_file_sha256": "database",
+                "database_artifact_sha256": "database",
+                "database_sidecar_policy": kicad_canary.DATABASE_ARTIFACT_POLICY,
                 "database_integrity": "ok",
                 "analyzer": {"sha256": "analyzer"},
             }
@@ -1002,7 +1014,11 @@ def test_baseline_mismatch_never_publishes_gate_success(
         lambda *_args: (_ for _ in ()).throw(RuntimeError("parity mismatch")),
     )
     monkeypatch.setattr(kicad_canary, "_revalidate_final_artifacts", lambda **_kwargs: None)
-    monkeypatch.setattr(kicad_canary, "_confirm_validated_artifacts_unchanged", lambda *_args: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_validated_artifact_publication",
+        lambda *_args: kicad_canary.contextlib.nullcontext(),
+    )
     output = tmp_path / "output"
 
     with pytest.raises(RuntimeError, match="parity mismatch"):
@@ -1132,7 +1148,16 @@ def test_missing_analyzer_telemetry_never_publishes_gate_success(
 
 
 @pytest.mark.parametrize(
-    "tamper", [None, "child-result", "database-after-hash", "subset-after-hash"]
+    "tamper",
+    [
+        None,
+        "child-result",
+        "database-after-hash",
+        "subset-after-hash",
+        "wal-after-child-hash",
+        "active-writer",
+        "writer-before-publish",
+    ],
 )
 def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
     tamper: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1149,10 +1174,16 @@ def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
     analyzer = tmp_path / "analyzer"
     analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
     analyzer.chmod(0o755)
+    open_connections: list[sqlite3.Connection] = []
 
     def supervised(_spec_path, gate_directory, _limits, _total_tus):
         database = gate_directory / "index.db"
         _write_final_canary_database(database)
+        writer: sqlite3.Connection | None = None
+        if tamper in {"wal-after-child-hash", "active-writer"}:
+            writer = sqlite3.connect(database)
+            assert writer.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
+            open_connections.append(writer)
         result = {
             "completed_translation_units": 1,
             "process_group_clean": True,
@@ -1165,7 +1196,8 @@ def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
             "public_orderings": {},
             "semantic_snapshot": semantic_snapshot(database),
             "database_provenance": database_provenance(database),
-            "database_file_sha256": kicad_canary._sha256(database),
+            "database_artifact_sha256": kicad_canary._database_artifact_digest(database).sha256,
+            "database_sidecar_policy": kicad_canary.DATABASE_ARTIFACT_POLICY,
             "database_integrity": "ok",
             "analyzer": {"sha256": kicad_canary._sha256(analyzer)},
         }
@@ -1177,12 +1209,37 @@ def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
         elif tamper == "subset-after-hash":
             subset = gate_directory / "compile_commands.json"
             subset.write_text(subset.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        elif tamper == "wal-after-child-hash":
+            assert writer is not None
+            writer.execute("UPDATE translation_units SET indexed_at = 'after'")
+            writer.commit()
+        elif tamper == "active-writer":
+            assert writer is not None
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE translation_units SET indexed_at = 'after'")
         return result
 
     monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
     monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
     monkeypatch.setattr(kicad_canary, "_ranking_canaries", lambda *_args: ({}, {}))
     output = tmp_path / "output"
+    if tamper == "writer-before-publish":
+        original_sha256 = kicad_canary._sha256
+        source_hash_count = 0
+
+        def sha256_with_late_writer(path: Path) -> str:
+            nonlocal source_hash_count
+            result = original_sha256(path)
+            if path.resolve() == cdb.resolve():
+                source_hash_count += 1
+                if source_hash_count == 3:
+                    writer = sqlite3.connect(output / "gate-1" / "index.db")
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute("UPDATE translation_units SET indexed_at = 'after'")
+                    open_connections.append(writer)
+            return result
+
+        monkeypatch.setattr(kicad_canary, "_sha256", sha256_with_late_writer)
 
     def run() -> dict[str, object]:
         return kicad_canary.run_canary(
@@ -1202,13 +1259,18 @@ def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
             no_progress_seconds=1,
         )
 
-    if tamper is None:
-        run()
-        assert (output / "gate-1" / "SUCCESS").is_file()
-        return
+    try:
+        if tamper is None:
+            run()
+            assert (output / "gate-1" / "SUCCESS").is_file()
+            return
 
-    with pytest.raises(RuntimeError, match="parent artifact revalidation"):
-        run()
+        with pytest.raises(RuntimeError, match="parent artifact revalidation"):
+            run()
+    finally:
+        for connection in open_connections:
+            connection.rollback()
+            connection.close()
 
     failed = output / ".gate-1.failed"
     assert failed.is_dir()
@@ -1230,6 +1292,155 @@ def test_limits_fail_immediately_on_swap_or_resource_growth() -> None:
     assert "database" in (
         limits.violation(elapsed=1, rss=1, swap=0, database=limits.database_bytes + 1, disk=1) or ""
     )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "field",
+    ["wall_seconds", "rss_bytes", "database_bytes", "disk_bytes", "no_progress_seconds"],
+)
+def test_canary_limits_reject_nonfinite_values(field: str, value: float) -> None:
+    arguments = {
+        "wall_seconds": 1.0,
+        "rss_bytes": 1,
+        "database_bytes": 1,
+        "disk_bytes": 1,
+        "no_progress_seconds": 1.0,
+    }
+    arguments[field] = value
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        CanaryLimits(**arguments)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_timeout_parser_rejects_nonfinite_values(value: str) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        kicad_canary._parse_timeouts(f"1:{value}")
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_cli_rejects_nonfinite_limits_before_run(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(
+        kicad_canary,
+        "run_canary",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("run must not start")),
+    )
+
+    assert (
+        kicad_canary.main(
+            [
+                "--project-root",
+                str(project),
+                "--compile-commands",
+                str(tmp_path / "compile_commands.json"),
+                "--clang-analyzer",
+                str(tmp_path / "analyzer"),
+                "--output-directory",
+                str(tmp_path / "output"),
+                f"--rss-limit-mib={value}",
+            ]
+        )
+        == 2
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("workers", 0),
+        ("analyzer_timeout_seconds", float("nan")),
+        ("embedding_dimensions", 0),
+        ("rss_bytes", 0),
+        ("database_bytes", 0),
+        ("disk_bytes", 0),
+        ("no_progress_seconds", float("inf")),
+        ("gate_timeouts", {"1": float("-inf")}),
+    ],
+)
+def test_run_configuration_rejects_invalid_numbers_before_supervisor(
+    field: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    arguments: dict[str, object] = {
+        "project_root": project,
+        "compilation_database": cdb,
+        "analyzer": analyzer,
+        "output_directory": tmp_path / "output",
+        "gates": (1,),
+        "gate_timeouts": {"1": 1.0},
+        "workers": 1,
+        "analyzer_timeout_seconds": 1.0,
+        "embedding_dimensions": 1,
+        "queries": (),
+        "rss_bytes": 1,
+        "database_bytes": 1,
+        "disk_bytes": 1,
+        "no_progress_seconds": 1.0,
+    }
+    arguments[field] = value
+    monkeypatch.setattr(
+        kicad_canary,
+        "_run_supervised",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("supervisor must not start")),
+    )
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        kicad_canary.run_canary(**arguments)
+
+
+def test_database_integrity_uses_full_check_and_preserves_foreign_key_check() -> None:
+    class Cursor:
+        def __init__(self, rows: list[tuple[object, ...]]) -> None:
+            self._rows = rows
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    class Connection:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def execute(self, command: str) -> Cursor:
+            self.commands.append(command)
+            if command == "PRAGMA integrity_check":
+                return Cursor([("index entry missing",)])
+            return Cursor([])
+
+    connection = Connection()
+    with pytest.raises(RuntimeError, match="integrity"):
+        kicad_canary._validate_database_integrity(connection)
+
+    assert connection.commands == ["PRAGMA integrity_check", "PRAGMA foreign_key_check"]
+    assert "PRAGMA quick_check" not in connection.commands
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-unexpected"])
+def test_database_artifact_rejects_forbidden_sidecars(tmp_path: Path, suffix: str) -> None:
+    database = tmp_path / "index.db"
+    _write_final_canary_database(database)
+    Path(f"{database}{suffix}").write_bytes(b"unsafe")
+
+    with pytest.raises(RuntimeError, match="rollback journal|unexpected SQLite sidecar"):
+        kicad_canary._database_artifact_digest(database)
 
 
 def test_process_group_cleanup_reaps_worker_descendants() -> None:
