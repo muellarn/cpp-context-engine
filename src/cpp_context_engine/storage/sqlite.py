@@ -172,6 +172,11 @@ def _request_interrupted(control: Any, stage: str) -> bool:
     return False
 
 
+def _check_index_cancelled(cancelled: threading.Event | None) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError("indexing was cancelled")
+
+
 @dataclass(frozen=True, slots=True)
 class TranslationUnitState:
     translation_unit_id: str
@@ -2477,6 +2482,7 @@ class SQLiteStore:
     ) -> int:
         """Atomically stage and retire TU-sized batches before global finalization."""
 
+        _check_index_cancelled(cancelled)
         root = str(project_root.resolve(strict=False))
         selected_variant = build_variant or BuildVariant(DEFAULT_BUILD_VARIANT, Path("."))
         # Canonical symbols are derived once from the newly inserted variants at
@@ -2492,6 +2498,7 @@ class SQLiteStore:
                 # observable or survive a failed fresh generation.
                 self._connection.execute("BEGIN IMMEDIATE")
                 self._connection.execute("PRAGMA defer_foreign_keys = ON")
+                _check_index_cancelled(cancelled)
                 if fresh_generation:
                     deferred_indexes = self._drop_fresh_generation_indexes()
                     self._defer_variant_fts = True
@@ -2528,6 +2535,7 @@ class SQLiteStore:
                     self._delete_translation_units(project_id, replaced_ids)
 
                 for batch in batches:
+                    _check_index_cancelled(cancelled)
                     batch_unit_ids = {unit.id for unit in batch.translation_units}
                     if remaining_changed_ids is not None:
                         unexpected = batch_unit_ids - remaining_changed_ids
@@ -2543,6 +2551,7 @@ class SQLiteStore:
                         )
                         self._delete_translation_units(project_id, batch_unit_ids)
                     self._stage_ingestion_batch(project_id, batch, index_profile, selected_variant)
+                    _check_index_cancelled(cancelled)
                     # Release TU-local tuples before requesting the next batch;
                     # Python for-loops otherwise retain the previous loop value.
                     del batch
@@ -2550,6 +2559,7 @@ class SQLiteStore:
                 if remaining_changed_ids:
                     raise ValueError("ingestion stream ended before every changed translation unit")
 
+                _check_index_cancelled(cancelled)
                 if fresh_generation:
                     self._restore_fresh_generation_indexes(deferred_indexes)
                 self._refresh_indexed_override_candidates(project_id, selected_variant.name)
@@ -2594,6 +2604,7 @@ class SQLiteStore:
                 self._clear_ingestion_tracking()
                 if fresh_generation:
                     self._validate_fresh_generation()
+                _check_index_cancelled(cancelled)
                 return invalidated_summaries
         finally:
             self._defer_variant_fts = False
@@ -4896,8 +4907,7 @@ class SQLiteStore:
             return 0
 
         def check_cancelled() -> None:
-            if cancelled is not None and cancelled.is_set():
-                raise RuntimeError("summary refresh was cancelled")
+            _check_index_cancelled(cancelled)
 
         spool = _SummaryPayloadSpool(check_cancelled)
         try:

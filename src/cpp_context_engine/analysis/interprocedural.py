@@ -462,10 +462,14 @@ def _solve_variant(
                 current_origins[caller.id],
                 current_reasons[caller.id],
             )
+            if changed and limits.max_scc_iterations == 1:
+                # The skipped equality pass used to hit the configured iteration cap.
+                # Retain that externally visible incompleteness and iteration count.
+                next_reasons.add("scc_iteration_cap_exceeded")
             current_effects[caller.id] = next_effects
             current_origins[caller.id] = next_origins
             current_reasons[caller.id] = next_reasons
-            iteration_counts[caller.id] = 2 if changed else 1
+            iteration_counts[caller.id] = 2 if changed and limits.max_scc_iterations > 1 else 1
         else:
             component_converged = False
             iteration_limit = (

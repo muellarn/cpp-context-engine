@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from cpp_context_engine.analysis import interprocedural
+from cpp_context_engine.analysis.interprocedural import InterproceduralLimits
 from cpp_context_engine.models import (
     CallDispatchKind,
     CallSite,
@@ -107,6 +108,21 @@ def test_acyclic_summary_transfer_runs_once_without_changing_solution(monkeypatc
         "e0",
         "summary_effect_0c341cde8221dc5d57170ea6f19bf7d7",
     )
+
+    limited = interprocedural.solve_interprocedural(
+        (callee, caller),
+        (effect,),
+        (),
+        (),
+        (),
+        (site,),
+        (target,),
+        limits=InterproceduralLimits(max_scc_iterations=1),
+    )
+    limited_caller = next(item for item in limited.summaries if item.id == "s1")
+    assert limited_caller.iteration_count == 1
+    assert limited_caller.incomplete_reasons == ("scc_iteration_cap_exceeded",)
+    assert limited_caller.solution_hash == "solution_e0c2fe81d048e208b8a00472baeb167f"
 
 
 def test_cancellable_chunked_payload_encoding_is_byte_exact() -> None:
@@ -461,7 +477,7 @@ def test_refresh_batch_failure_and_cancellation_roll_back_atomically(
             cancelled.set()
 
         monkeypatch.setattr(store, "_write_summary_solution_batch", cancel_after_batch)
-        with pytest.raises(RuntimeError, match="summary refresh was cancelled"), store._connection:  # noqa: SLF001
+        with pytest.raises(RuntimeError, match="indexing was cancelled"), store._connection:  # noqa: SLF001
             store._refresh_summary_solutions(  # noqa: SLF001
                 project_id,
                 "default",
@@ -802,7 +818,7 @@ def test_cancellation_during_solver_rolls_back_before_payload_publication(
             return original(*args, **kwargs)
 
         monkeypatch.setattr(interprocedural, "_propagate_effect", cancel_from_transfer)
-        with pytest.raises(RuntimeError, match="summary refresh was cancelled"), connection:
+        with pytest.raises(RuntimeError, match="indexing was cancelled"), connection:
             store._refresh_summary_solutions(  # noqa: SLF001
                 project_id, "default", {"f0", "f1"}, cancelled=cancelled
             )

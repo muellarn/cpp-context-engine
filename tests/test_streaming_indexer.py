@@ -410,3 +410,45 @@ def test_streamed_build_variants_remain_isolated_during_stale_cleanup(tmp_path: 
 
     assert variants == {"beta"}
     assert beta_after == beta_before
+
+
+def test_project_indexer_forwards_cancellation_and_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = _database(root, 1)
+    cancelled = threading.Event()
+    entered_store = threading.Event()
+    failures: list[BaseException] = []
+
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        original = store.apply_ingestion_batches
+
+        def blocked_apply(*args, **kwargs):
+            assert kwargs["cancelled"] is cancelled
+            entered_store.set()
+            assert cancelled.wait(2)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, "apply_ingestion_batches", blocked_apply)
+
+        def index() -> None:
+            try:
+                ProjectIndexer(_StreamingOnlyIngestor(), store).index(
+                    root, database, cancelled=cancelled
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=index)
+        worker.start()
+        assert entered_store.wait(2)
+        cancelled.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], RuntimeError)
+        assert "cancelled" in str(failures[0])
+        assert store.translation_unit_states(root) == {}
