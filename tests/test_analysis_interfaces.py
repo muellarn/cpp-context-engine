@@ -776,9 +776,11 @@ def test_navigation_coverage_returns_structured_deep_unavailable_even_with_stale
 
     assert cfg.available is False
     assert "control-flow facts" in cfg.unavailable_reason
+    assert cfg.required_action == "materialize_deep_analysis"
     assert {item.profile for item in cfg.coverage} == {"navigation"}
     assert flow.available is False
-    assert "data-flow and summary facts" in flow.unavailable_reason
+    assert "data-flow facts" in flow.unavailable_reason
+    assert flow.required_action == "materialize_deep_analysis"
     assert all(not item.data_flow and not item.summaries for item in flow.coverage)
     assert http.status_code == 200
     assert http.json()["available"] is False

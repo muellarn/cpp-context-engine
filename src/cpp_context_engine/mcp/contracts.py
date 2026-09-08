@@ -32,6 +32,11 @@ MAX_BUILD_NAME_CHARS = 128
 MAX_ANALYSIS_GRAPHS = 20
 MAX_ANALYSIS_BLOCKS = 500
 MAX_ANALYSIS_ITEMS = 2_000
+MAX_DEEP_TUS = 32
+MAX_DEEP_WALL_SECONDS = 300
+MAX_DEEP_DECODED_BYTES = 1024 * 1024 * 1024
+MAX_DEEP_SPOOL_BYTES = 1024 * 1024 * 1024
+MAX_DEEP_SPOOL_FILES = 512
 
 QueryText = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_QUERY_CHARS)
@@ -60,6 +65,11 @@ Builds = Annotated[
 AnalysisGraphs = Annotated[int, Field(ge=1, le=MAX_ANALYSIS_GRAPHS)]
 AnalysisBlocks = Annotated[int, Field(ge=1, le=MAX_ANALYSIS_BLOCKS)]
 AnalysisItems = Annotated[int, Field(ge=1, le=MAX_ANALYSIS_ITEMS)]
+DeepTus = Annotated[int, Field(ge=1, le=MAX_DEEP_TUS)]
+DeepWallSeconds = Annotated[int, Field(ge=1, le=MAX_DEEP_WALL_SECONDS)]
+DeepDecodedBytes = Annotated[int, Field(ge=1, le=MAX_DEEP_DECODED_BYTES)]
+DeepSpoolBytes = Annotated[int, Field(ge=1, le=MAX_DEEP_SPOOL_BYTES)]
+DeepSpoolFiles = Annotated[int, Field(ge=1, le=MAX_DEEP_SPOOL_FILES)]
 
 
 class ToolOutput(BaseModel):

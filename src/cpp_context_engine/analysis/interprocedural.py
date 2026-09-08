@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from cpp_context_engine.models import (
@@ -57,7 +58,11 @@ def _certainty(target: CallTargetCertainty, evidence: DataFlowCertainty) -> Data
     return DataFlowCertainty.POSSIBLE
 
 
-def _tarjan(nodes: tuple[str, ...], adjacency: dict[str, set[str]]) -> tuple[tuple[str, ...], ...]:
+def _tarjan(
+    nodes: tuple[str, ...],
+    adjacency: dict[str, set[str]],
+    check_callback: Callable[[], None] | None = None,
+) -> tuple[tuple[str, ...], ...]:
     index = 0
     stack: list[str] = []
     on_stack: set[str] = set()
@@ -67,6 +72,8 @@ def _tarjan(nodes: tuple[str, ...], adjacency: dict[str, set[str]]) -> tuple[tup
 
     def visit(node: str) -> None:
         nonlocal index
+        if check_callback is not None:
+            check_callback()
         indexes[node] = lows[node] = index
         index += 1
         stack.append(node)
@@ -89,6 +96,8 @@ def _tarjan(nodes: tuple[str, ...], adjacency: dict[str, set[str]]) -> tuple[tup
         result.append(tuple(sorted(component)))
 
     for node in sorted(nodes):
+        if check_callback is not None:
+            check_callback()
         if node not in indexes:
             visit(node)
     return tuple(result)
@@ -104,9 +113,12 @@ def solve_interprocedural(
     call_targets: tuple[CallTarget, ...],
     *,
     limits: InterproceduralLimits | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> InterproceduralSolution:
     """Solve per-build summaries; an omitted fact always reduces completeness."""
 
+    if check_cancelled is not None:
+        check_cancelled()
     selected_limits = limits or InterproceduralLimits()
     solved_summaries: list[FunctionSummary] = []
     solved_effects: list[SummaryEffect] = []
@@ -114,6 +126,8 @@ def solve_interprocedural(
     solved_flows: list[InterproceduralFlow] = []
     variants = sorted({item.build_variant for item in summaries})
     for variant in variants:
+        if check_cancelled is not None:
+            check_cancelled()
         variant_summaries = tuple(item for item in summaries if item.build_variant == variant)
         solution = _solve_variant(
             variant_summaries,
@@ -124,11 +138,14 @@ def solve_interprocedural(
             tuple(item for item in callsites if item.build_variant == variant),
             tuple(item for item in call_targets if item.build_variant == variant),
             selected_limits,
+            check_cancelled,
         )
         solved_summaries.extend(solution.summaries)
         solved_effects.extend(solution.effects)
         solved_origins.extend(solution.return_origins)
         solved_flows.extend(solution.flows)
+    if check_cancelled is not None:
+        check_cancelled()
     return InterproceduralSolution(
         tuple(sorted(solved_summaries, key=lambda item: item.id)),
         tuple(sorted(solved_effects, key=lambda item: item.id)),
@@ -146,10 +163,13 @@ def _solve_variant(
     callsites: tuple[CallSite, ...],
     targets: tuple[CallTarget, ...],
     limits: InterproceduralLimits,
+    check_callback: Callable[[], None] | None = None,
 ) -> InterproceduralSolution:
     summary_by_id = {item.id: item for item in summaries}
     summaries_by_function: dict[str, list[FunctionSummary]] = defaultdict(list)
     for summary in summaries:
+        if check_callback is not None:
+            check_callback()
         summaries_by_function[summary.function_symbol_id].append(summary)
     for bodies in summaries_by_function.values():
         bodies.sort(key=lambda item: item.id)
@@ -198,13 +218,15 @@ def _solve_variant(
         list
     )
     for caller in summaries:
+        if check_callback is not None:
+            check_callback()
         for site in owner_sites(caller):
             for target in targets_by_site.get(site.id, ()):
                 callees, body_ambiguous = callee_bodies(caller, target)
                 for callee in callees:
                     adjacency[caller.id].add(callee.id)
                     call_edges[caller.id].append((site, target, callee, body_ambiguous))
-    components = _tarjan(tuple(summary_by_id), adjacency)
+    components = _tarjan(tuple(summary_by_id), adjacency, check_callback)
     recursive_ids = {
         member for component in components if len(component) > 1 for member in component
     } | {node for node in summary_by_id if node in adjacency.get(node, set())}
@@ -238,12 +260,16 @@ def _solve_variant(
     def transfer(
         caller: FunctionSummary,
     ) -> tuple[tuple[SummaryEffect, ...], tuple[SummaryReturnOrigin, ...], set[str]]:
+        if check_callback is not None:
+            check_callback()
         reasons = set(caller.local_incomplete_reasons)
         if caller.id in oversized_ids:
             reasons.add("scc_size_cap_exceeded")
         effects = {item.id: item for item in local_effect_map[caller.id]}
         origins = {item.id: item for item in local_origin_map[caller.id]}
         for site in owner_sites(caller):
+            if check_callback is not None:
+                check_callback()
             site_targets = targets_by_site.get(site.id, ())
             if not site.target_set_complete or not site_targets:
                 reasons.add("unknown_or_external_call_target")
@@ -303,12 +329,16 @@ def _solve_variant(
     # Tarjan emits callees before callers for this caller-to-callee graph, so each
     # component consumes stable downstream summaries and iterates only its recursive SCC.
     for component in components:
+        if check_callback is not None:
+            check_callback()
         members = tuple(summary_by_id[summary_id] for summary_id in component)
         component_converged = False
         iteration_limit = (
             1 if any(item.id in oversized_ids for item in members) else limits.max_scc_iterations
         )
         for iteration_count in range(1, iteration_limit + 1):
+            if check_callback is not None:
+                check_callback()
             next_values = {caller.id: transfer(caller) for caller in members}
             if all(
                 next_values[caller.id]
@@ -335,6 +365,8 @@ def _solve_variant(
 
     final_summaries: list[FunctionSummary] = []
     for summary in summaries:
+        if check_callback is not None:
+            check_callback()
         reasons = tuple(sorted(current_reasons[summary.id]))
         fingerprint = _solution_hash(
             current_effects[summary.id], current_origins[summary.id], reasons
@@ -355,6 +387,8 @@ def _solve_variant(
 
     flows: dict[str, InterproceduralFlow] = {}
     for caller in summaries:
+        if check_callback is not None:
+            check_callback()
         for site, target, callee, body_ambiguous in call_edges.get(caller.id, ()):
             for index, callee_location in enumerate(callee.parameter_location_ids):
                 binding = bindings_by_pair.get((caller.id, site.id, index))

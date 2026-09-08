@@ -10,11 +10,12 @@ import re
 import sqlite3
 import struct
 import threading
+import time
 import zlib
 from collections import deque
-from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -69,7 +70,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 VECTOR_ENCODING_RAW_F64LE_V1 = 0
 VECTOR_ENCODING_ZLIB_F64LE_V1 = 1
 DEFAULT_EMBEDDING_TEXT_CHARS = 32_000
@@ -81,6 +82,8 @@ MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES = 16 * 1024 * 1024
 MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_SUMMARY_PAYLOAD_RECORDS = 65_536
 _TRANSLATION_UNIT_DELETE_ORDER = (
+    "deep_materialization_units",
+    "deep_tu_cache",
     "interprocedural_flows",
     "call_argument_bindings",
     "call_result_bindings",
@@ -102,6 +105,22 @@ _TRANSLATION_UNIT_DELETE_ORDER = (
     "symbol_variants",
     "translation_unit_symbols",
     "dependencies",
+)
+_DEEP_TRANSLATION_UNIT_TABLES = (
+    "interprocedural_flows",
+    "call_argument_bindings",
+    "call_result_bindings",
+    "summary_effects",
+    "summary_return_origins",
+    "data_flow_evidence",
+    "data_accesses",
+    "function_summaries",
+    "memory_locations",
+    "data_flow_analyses",
+    "cfg_edges",
+    "cfg_elements",
+    "cfg_blocks",
+    "cfg_graphs",
 )
 _BULK_INGESTION_TABLES = frozenset(
     {
@@ -140,6 +159,14 @@ def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _request_interrupted(control: Any, stage: str) -> bool:
+    try:
+        control.check(stage)
+    except (RuntimeError, TimeoutError):
+        return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class TranslationUnitState:
     translation_unit_id: str
@@ -167,6 +194,40 @@ class AnalysisCoverageState:
     cfg_facts_complete: bool
     data_flow_facts_complete: bool
     summary_facts_complete: bool
+    binding_facts_complete: bool = False
+    closure_complete: bool = False
+    materialization_id: str | None = None
+    limit_reason: str = ""
+    distance: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DeepTranslationUnitTarget:
+    translation_unit_id: str
+    build_configuration_id: str
+    build_variant: str
+    command_hash: str
+    source_path: Path
+    content_hash: str
+    dependencies: tuple[tuple[Path, str], ...]
+    distance: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DeepCacheState:
+    translation_unit_id: str
+    identity_hash: str
+    cfg_complete: bool
+    data_flow_complete: bool
+    summaries_complete: bool
+    bindings_complete: bool
+    closure_generation_id: str = ""
+    analyzer_identity: str = ""
+    analyzer_version: str = ""
+    protocol: str = ""
+    protocol_version: int = 0
+    fact_schema_version: int = 0
+    profile: IndexProfile = IndexProfile.FULL
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,6 +635,110 @@ class SQLiteStore:
             self._migrate_v13_and_v14()
         elif current == 13:
             self._migrate_v14()
+        if current <= 14:
+            self._migrate_v15()
+
+    def _migrate_v15(self) -> None:
+        """Add content-addressed, TU-scoped deep-analysis overlay metadata."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            _execute_script(
+                self._connection,
+                """
+                CREATE TABLE IF NOT EXISTS deep_materializations (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    root_symbol_id TEXT NOT NULL,
+                    closure_generation_id TEXT NOT NULL,
+                    build_scope_json TEXT NOT NULL,
+                    closure_complete INTEGER NOT NULL,
+                    unit_count INTEGER NOT NULL,
+                    known_tus INTEGER NOT NULL,
+                    omitted_tus INTEGER NOT NULL,
+                    limit_reason TEXT NOT NULL,
+                    analyzer_identity TEXT NOT NULL,
+                    analyzer_version TEXT NOT NULL,
+                    protocol TEXT NOT NULL,
+                    protocol_version INTEGER NOT NULL,
+                    fact_schema_version INTEGER NOT NULL,
+                    profile TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (project_id, id),
+                    FOREIGN KEY (project_id, root_symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS deep_tu_cache (
+                    project_id INTEGER NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    identity_hash TEXT NOT NULL,
+                    closure_generation_id TEXT NOT NULL,
+                    analyzer_identity TEXT NOT NULL,
+                    analyzer_version TEXT NOT NULL,
+                    protocol TEXT NOT NULL,
+                    protocol_version INTEGER NOT NULL,
+                    fact_schema_version INTEGER NOT NULL,
+                    profile TEXT NOT NULL,
+                    cfg_complete INTEGER NOT NULL,
+                    data_flow_complete INTEGER NOT NULL,
+                    summaries_complete INTEGER NOT NULL,
+                    bindings_complete INTEGER NOT NULL,
+                    PRIMARY KEY (project_id, translation_unit_id),
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS deep_materialization_units (
+                    project_id INTEGER NOT NULL,
+                    materialization_id TEXT NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    identity_hash TEXT NOT NULL,
+                    distance INTEGER NOT NULL,
+                    PRIMARY KEY (project_id, materialization_id, translation_unit_id),
+                    FOREIGN KEY (project_id, materialization_id)
+                        REFERENCES deep_materializations(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id, translation_unit_id)
+                        REFERENCES deep_tu_cache(project_id, translation_unit_id) ON DELETE CASCADE
+                );
+                """,
+            )
+            self._deep_migration_checkpoint("tables")
+            _execute_script(
+                self._connection,
+                """
+                CREATE INDEX IF NOT EXISTS deep_tu_cache_identity
+                    ON deep_tu_cache(project_id, build_variant, identity_hash);
+                CREATE INDEX IF NOT EXISTS deep_tu_cache_generation
+                    ON deep_tu_cache(project_id, closure_generation_id, translation_unit_id);
+                CREATE INDEX IF NOT EXISTS deep_tu_cache_materialization
+                    ON deep_materialization_units(project_id, materialization_id);
+                CREATE INDEX IF NOT EXISTS deep_materialization_units_tu
+                    ON deep_materialization_units(project_id, translation_unit_id);
+                CREATE INDEX IF NOT EXISTS deep_materializations_root
+                    ON deep_materializations(project_id, root_symbol_id);
+                """,
+            )
+            self._deep_migration_checkpoint("indexes")
+            for table in (
+                "deep_materializations",
+                "deep_tu_cache",
+                "deep_materialization_units",
+            ):
+                if rows := self._connection.execute(
+                    f"PRAGMA foreign_key_check({table})"
+                ).fetchall():
+                    raise RuntimeError(f"deep overlay migration foreign-key failure: {rows[0]}")
+            self._deep_migration_checkpoint("publication")
+            self._connection.execute("PRAGMA user_version = 15")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _deep_migration_checkpoint(self, _stage: str) -> None:
+        """Failure-injection hook for atomic deep-overlay schema publication."""
 
     def _migrate_v13_and_v14(self) -> None:
         try:
@@ -2131,6 +2296,9 @@ class SQLiteStore:
                     self._defer_variant_fts = True
                 project_id = self._ensure_project(root)
                 self._put_build_variant(project_id, selected_variant, index_profile)
+                override_candidates_before = self._indexed_override_candidate_snapshot(
+                    project_id, selected_variant.name
+                )
                 existing: set[str] = set()
                 if current_translation_unit_ids is not None:
                     existing = {
@@ -2184,12 +2352,18 @@ class SQLiteStore:
                 if fresh_generation:
                     self._restore_fresh_generation_indexes(deferred_indexes)
                 self._refresh_indexed_override_candidates(project_id, selected_variant.name)
+                override_affected_functions = self._invalidate_changed_override_callers(
+                    project_id,
+                    selected_variant.name,
+                    override_candidates_before,
+                )
                 affected_functions = {
                     row[0]
                     for row in self._connection.execute(
                         "SELECT id FROM temp._ingestion_affected_functions ORDER BY id"
                     )
                 }
+                affected_functions |= override_affected_functions
                 affected_functions |= self._reverse_summary_callers(
                     project_id, selected_variant.name, affected_functions
                 )
@@ -2221,6 +2395,450 @@ class SQLiteStore:
             self._defer_variant_fts = False
             if self._connection.in_transaction:
                 self._connection.rollback()
+
+    def apply_deep_overlay(
+        self,
+        project_root: Path,
+        batches: Iterable[IngestionBatch],
+        *,
+        root_symbol_id: str,
+        materialization_id: str,
+        identities: Mapping[str, str],
+        command_hashes: Mapping[str, str],
+        distances: Mapping[str, int],
+        deadline_monotonic: float | None = None,
+        cancelled: threading.Event | None = None,
+        request_control: Any | None = None,
+        analyzer_identity: str,
+        protocol_version: int,
+        closure_complete: bool,
+        closure_generation_id: str = "",
+        analyzer_version: str = "unknown",
+        protocol: str = "cpp-context-clang-facts",
+        profile: IndexProfile = IndexProfile.FULL,
+        known_tus: int | None = None,
+        omitted_tus: int = 0,
+        limit_reason: str = "",
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> None:
+        """Atomically replace only deep facts for an already indexed TU set."""
+
+        selected = tuple(batches)
+        unit_ids = tuple(sorted(unit.id for batch in selected for unit in batch.translation_units))
+        if (
+            not unit_ids
+            or set(unit_ids) != set(identities)
+            or set(unit_ids) != set(command_hashes)
+            or set(unit_ids) != set(distances)
+        ):
+            raise ValueError("deep overlay batches do not match their declared identities")
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        generation_id = closure_generation_id or _stable_id(
+            "deep-closure",
+            *(f"{unit_id}:{identities[unit_id]}" for unit_id in sorted(identities)),
+        )
+        known_count = len(unit_ids) if known_tus is None else known_tus
+
+        def interrupted() -> bool:
+            return (cancelled is not None and cancelled.is_set()) or (
+                deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
+            )
+
+        self._connection.set_progress_handler(lambda: int(interrupted()), 1_000)
+        try:
+            if interrupted():
+                raise TimeoutError("deep overlay publication was cancelled or timed out")
+            self._connection.execute("BEGIN IMMEDIATE")
+            # Repeat retained-fact validation under the publication lock so a
+            # concurrent navigation generation cannot race the outer analysis.
+            self.validate_deep_navigation_parity(project_root, selected)
+            existing = self.translation_unit_states(
+                project_root,
+                build_scope=names,
+                translation_unit_ids=unit_ids,
+            )
+            for batch in selected:
+                for unit in batch.translation_units:
+                    state = existing.get(unit.id)
+                    if (
+                        state is None
+                        or state.build_configuration_id != unit.build_configuration_id
+                        or state.command_hash != command_hashes[unit.id]
+                        or state.content_hash != unit.content_hash
+                        or state.dependencies != unit.dependencies
+                    ):
+                        raise RuntimeError("navigation index changed during deep materialization")
+            stale_caller_units: set[str] = set()
+            changed_by_variant: dict[str, set[str]] = {}
+            for batch in selected:
+                for summary in batch.function_summaries:
+                    changed_by_variant.setdefault(summary.build_variant, set()).add(
+                        summary.function_symbol_id
+                    )
+            for variant, changed_functions in changed_by_variant.items():
+                callers = self._reverse_summary_callers(
+                    project_id,
+                    variant,
+                    changed_functions,
+                    check_cancelled=(
+                        request_control.check if request_control is not None else None
+                    ),
+                )
+                if not callers:
+                    continue
+                caller_placeholders = ",".join("?" for _ in callers)
+                stale_caller_units.update(
+                    row[0]
+                    for row in self._connection.execute(
+                        f"""
+                        SELECT DISTINCT translation_unit_id FROM function_summaries
+                        WHERE project_id = ? AND build_variant = ?
+                          AND function_symbol_id IN ({caller_placeholders})
+                        """,
+                        (project_id, variant, *sorted(callers)),
+                    )
+                )
+            stale_caller_units.difference_update(unit_ids)
+            if stale_caller_units:
+                stale_placeholders = ",".join("?" for _ in stale_caller_units)
+                self._connection.execute(
+                    f"DELETE FROM deep_tu_cache WHERE project_id = ? "
+                    f"AND translation_unit_id IN ({stale_placeholders})",
+                    (project_id, *sorted(stale_caller_units)),
+                )
+            placeholders = ",".join("?" for _ in unit_ids)
+            self._connection.execute(
+                f"DELETE FROM deep_tu_cache WHERE project_id = ? "
+                f"AND translation_unit_id IN ({placeholders})",
+                (project_id, *unit_ids),
+            )
+            for table in _DEEP_TRANSLATION_UNIT_TABLES:
+                self._connection.execute(
+                    f"DELETE FROM {table} WHERE project_id = ? "
+                    f"AND translation_unit_id IN ({placeholders})",
+                    (project_id, *unit_ids),
+                )
+            self._connection.execute(
+                """
+                INSERT INTO deep_materializations(
+                    project_id, id, root_symbol_id, closure_generation_id,
+                    build_scope_json, closure_complete, unit_count, known_tus,
+                    omitted_tus, limit_reason, analyzer_identity, analyzer_version,
+                    protocol, protocol_version, fact_schema_version, profile
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    materialization_id,
+                    root_symbol_id,
+                    generation_id,
+                    json.dumps(names),
+                    int(closure_complete),
+                    len(unit_ids),
+                    known_count,
+                    omitted_tus,
+                    limit_reason,
+                    analyzer_identity,
+                    analyzer_version,
+                    protocol,
+                    protocol_version,
+                    SCHEMA_VERSION,
+                    IndexProfile(profile).value,
+                ),
+            )
+            for batch in selected:
+                self._put_cfg_facts(
+                    project_id,
+                    batch.cfg_graphs,
+                    batch.cfg_blocks,
+                    batch.cfg_elements,
+                    batch.cfg_edges,
+                )
+                self._put_data_flow_facts(
+                    project_id,
+                    batch.data_flow_analyses,
+                    batch.memory_locations,
+                    batch.data_accesses,
+                    batch.data_flow_evidence,
+                )
+                self._put_summary_facts(
+                    project_id,
+                    batch.function_summaries,
+                    batch.summary_effects,
+                    batch.summary_return_origins,
+                    batch.call_argument_bindings,
+                    batch.call_result_bindings,
+                    batch.interprocedural_flows,
+                )
+                self._put_summary_solution_payloads(
+                    project_id,
+                    {summary.id for summary in batch.function_summaries},
+                    batch.summary_effects,
+                    batch.summary_return_origins,
+                )
+                for unit in batch.translation_units:
+                    self._connection.execute(
+                        """
+                        INSERT INTO deep_tu_cache(
+                            project_id, translation_unit_id, build_variant,
+                            build_configuration_id, identity_hash, closure_generation_id,
+                            analyzer_identity, analyzer_version, protocol,
+                            protocol_version, fact_schema_version, profile, cfg_complete,
+                            data_flow_complete, summaries_complete, bindings_complete
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            unit.id,
+                            unit.build_variant,
+                            unit.build_configuration_id,
+                            identities[unit.id],
+                            generation_id,
+                            analyzer_identity,
+                            analyzer_version,
+                            protocol,
+                            protocol_version,
+                            SCHEMA_VERSION,
+                            IndexProfile(profile).value,
+                            int(unit.cfg_facts_complete),
+                            int(unit.data_flow_facts_complete),
+                            int(unit.summary_facts_complete),
+                            int(unit.summary_facts_complete),
+                        ),
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO deep_materialization_units(
+                            project_id, materialization_id, translation_unit_id,
+                            identity_hash, distance
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            materialization_id,
+                            unit.id,
+                            identities[unit.id],
+                            distances[unit.id],
+                        ),
+                    )
+            if rows := self._connection.execute(
+                "PRAGMA foreign_key_check(deep_tu_cache)"
+            ).fetchall():
+                raise RuntimeError(f"deep overlay foreign-key failure: {rows[0]}")
+            self._delete_invalid_deep_materializations(project_id)
+            self._deep_publication_checkpoint("pre-commit")
+            guard = (
+                request_control.publication_guard()
+                if request_control is not None
+                else nullcontext()
+            )
+            with guard:
+                if request_control is not None:
+                    request_control.check("publication commit")
+                elif interrupted():
+                    raise TimeoutError("deep overlay publication was cancelled or timed out")
+                self._connection.commit()
+        except sqlite3.OperationalError as error:
+            self._connection.rollback()
+            if interrupted() and "interrupt" in str(error).lower():
+                raise TimeoutError("deep overlay publication was cancelled or timed out") from error
+            raise
+        except BaseException:
+            self._connection.rollback()
+            raise
+        finally:
+            self._connection.set_progress_handler(None, 0)
+
+    def _deep_publication_checkpoint(self, _stage: str) -> None:
+        """Failure/cancellation injection hook immediately before durable publication."""
+
+    def validate_deep_navigation_parity(
+        self,
+        project_root: Path,
+        batches: Iterable[IngestionBatch],
+        *,
+        request_control: Any | None = None,
+    ) -> None:
+        """Reject FULL analyzer output when retained navigation facts changed."""
+        if request_control is not None:
+            request_control.check("navigation parity")
+        project_id = self._project_id(project_root)
+        if request_control is not None:
+            self._connection.set_progress_handler(
+                lambda: int(_request_interrupted(request_control, "navigation parity")),
+                1_000,
+            )
+        try:
+            for batch in batches:
+                if request_control is not None:
+                    request_control.check("navigation parity")
+                for unit in batch.translation_units:
+                    if request_control is not None:
+                        request_control.check("navigation parity")
+                    self._validate_deep_navigation_unit(project_id, batch, unit.id, request_control)
+        except sqlite3.OperationalError as error:
+            if request_control is not None and "interrupt" in str(error).lower():
+                raise TimeoutError("deep navigation parity was cancelled or timed out") from error
+            raise
+        finally:
+            if request_control is not None:
+                self._connection.set_progress_handler(None, 0)
+
+    def _validate_deep_navigation_unit(
+        self,
+        project_id: int,
+        batch: IngestionBatch,
+        tu_id: str,
+        request_control: Any | None,
+    ) -> None:
+        expected_symbols = []
+        for symbol in batch.symbols:
+            if symbol.translation_unit_id != tu_id:
+                continue
+            variant_id = symbol.variant_id or _stable_id(
+                "variant", symbol.build_variant, symbol.translation_unit_id, symbol.id
+            )
+            normalized = replace(symbol, variant_id=variant_id)
+            expected_symbols.append((variant_id, self._symbol_snapshot(normalized)))
+        checks: tuple[tuple[str, list[tuple[object, ...]], str], ...] = (
+            (
+                "symbol_variants",
+                expected_symbols,
+                "SELECT id, snapshot_json FROM symbol_variants "
+                "WHERE project_id = ? AND translation_unit_id = ? ORDER BY id",
+            ),
+            (
+                "occurrences",
+                [
+                    (
+                        item.id,
+                        item.symbol_id,
+                        item.enclosing_symbol_id,
+                        item.kind.value,
+                        str(item.span.path),
+                        item.span.start_line,
+                        item.span.end_line,
+                        item.span.start_column,
+                        item.span.end_column,
+                        item.build_configuration_id,
+                        item.build_variant,
+                        json.dumps(dict(item.metadata), sort_keys=True),
+                    )
+                    for item in batch.occurrences
+                    if item.translation_unit_id == tu_id
+                ],
+                "SELECT id, symbol_id, enclosing_symbol_id, kind, path, start_line, "
+                "end_line, start_column, end_column, build_configuration_id, "
+                "build_variant, metadata_json FROM occurrences WHERE project_id = ? "
+                "AND translation_unit_id = ? ORDER BY id",
+            ),
+            (
+                "edges",
+                [
+                    (
+                        item.id
+                        or _stable_id(
+                            "edge",
+                            item.build_variant,
+                            item.translation_unit_id,
+                            item.source_id,
+                            item.target_id,
+                            item.relation.value,
+                        ),
+                        item.source_id,
+                        item.target_id,
+                        item.relation.value,
+                        item.build_configuration_id,
+                        item.build_variant,
+                    )
+                    for item in batch.edges
+                    if item.translation_unit_id == tu_id
+                ],
+                "SELECT id, source_id, target_id, relation, build_configuration_id, "
+                "build_variant FROM edges WHERE project_id = ? AND translation_unit_id = ? "
+                "ORDER BY id",
+            ),
+            (
+                "callsites",
+                [
+                    self._callsite_parity_row(item)
+                    for item in batch.callsites
+                    if item.translation_unit_id == tu_id
+                ],
+                "SELECT id, owner_symbol_id, dispatch_kind, spelling_span_json, "
+                "expansion_span_json, expansion_stack_json, static_target_symbol_id, "
+                "target_set_complete, unresolved_reason, callee_text, "
+                "build_configuration_id, build_variant FROM callsites WHERE project_id = ? "
+                "AND translation_unit_id = ? ORDER BY id",
+            ),
+            (
+                "call_targets",
+                [
+                    self._call_target_parity_row(item)
+                    for item in batch.call_targets
+                    if item.translation_unit_id == tu_id
+                ],
+                "SELECT id, callsite_id, target_symbol_id, certainty, confidence, "
+                "confidence_reason, derivation, evidence_span_json, "
+                "build_configuration_id, build_variant FROM call_targets "
+                "WHERE project_id = ? AND translation_unit_id = ? "
+                "ORDER BY id",
+            ),
+        )
+        for family, expected, statement in checks:
+            if request_control is not None:
+                request_control.check("navigation parity")
+            actual = [
+                tuple(row) for row in self._connection.execute(statement, (project_id, tu_id))
+            ]
+            if sorted(expected) != actual:
+                raise RuntimeError(
+                    f"navigation index is stale: {family} differ for translation unit {tu_id}"
+                )
+
+    @staticmethod
+    def _callsite_parity_row(site: CallSite) -> tuple[object, ...]:
+        return (
+            site.id,
+            site.owner_symbol_id,
+            site.dispatch_kind.value,
+            _span_json(site.spelling_span) or "null",
+            _span_json(site.expansion_span),
+            json.dumps(
+                [
+                    {
+                        "macro_symbol_id": frame.macro_symbol_id,
+                        "name": frame.name,
+                        "spelling_span": _span_payload(frame.spelling_span),
+                        "expansion_span": _span_payload(frame.expansion_span),
+                    }
+                    for frame in site.expansion_stack
+                ],
+                sort_keys=True,
+            ),
+            site.static_target_symbol_id,
+            int(site.target_set_complete),
+            site.unresolved_reason,
+            site.callee_text,
+            site.build_configuration_id,
+            site.build_variant,
+        )
+
+    @staticmethod
+    def _call_target_parity_row(target: CallTarget) -> tuple[object, ...]:
+        return (
+            target.id,
+            target.callsite_id,
+            target.target_symbol_id,
+            target.certainty.value,
+            target.confidence,
+            target.confidence_reason,
+            target.derivation,
+            _span_json(target.evidence_span),
+            target.build_configuration_id,
+            target.build_variant,
+        )
 
     def _reset_ingestion_tracking(self) -> None:
         self._connection.execute(
@@ -2630,6 +3248,7 @@ class SQLiteStore:
         }
 
     def _delete_orphans(self, project_id: int) -> None:
+        self._delete_invalid_deep_materializations(project_id)
         self._connection.execute(
             """
             DELETE FROM symbols
@@ -2648,6 +3267,26 @@ class SQLiteStore:
                 SELECT 1 FROM translation_units units
                 WHERE units.project_id = build_configurations.project_id
                   AND units.build_configuration_id = build_configurations.id
+            )
+            """,
+            (project_id,),
+        )
+
+    def _delete_invalid_deep_materializations(self, project_id: int) -> None:
+        """Drop tokens as soon as any exact closure-cache mapping disappears."""
+
+        self._connection.execute(
+            """
+            DELETE FROM deep_materializations
+            WHERE project_id = ? AND unit_count != (
+                SELECT count(*) FROM deep_materialization_units mapped
+                JOIN deep_tu_cache cache
+                  ON cache.project_id = mapped.project_id
+                 AND cache.translation_unit_id = mapped.translation_unit_id
+                 AND cache.identity_hash = mapped.identity_hash
+                 AND cache.closure_generation_id = deep_materializations.closure_generation_id
+                WHERE mapped.project_id = deep_materializations.project_id
+                  AND mapped.materialization_id = deep_materializations.id
             )
             """,
             (project_id,),
@@ -3655,11 +4294,17 @@ class SQLiteStore:
         )
 
     def _reverse_summary_callers(
-        self, project_id: int, build_variant: str, function_ids: set[str]
+        self,
+        project_id: int,
+        build_variant: str,
+        function_ids: set[str],
+        check_cancelled: Callable[[], None] | None = None,
     ) -> set[str]:
         closure = set(function_ids)
         frontier = set(function_ids)
         while frontier:
+            if check_cancelled is not None:
+                check_cancelled()
             placeholders = ",".join("?" for _ in frontier)
             callers = {
                 row[0]
@@ -4069,11 +4714,107 @@ class SQLiteStore:
             ),
         )
 
+    def _indexed_override_candidate_snapshot(
+        self, project_id: int, build_variant: str
+    ) -> dict[str, tuple[str, str, tuple[tuple[object, ...], ...]]]:
+        """Capture build-wide virtual candidates before an incremental TU replacement."""
+
+        rows = self._connection.execute(
+            """
+            SELECT targets.callsite_id, sites.owner_symbol_id,
+                   sites.translation_unit_id AS caller_translation_unit_id,
+                   targets.target_symbol_id, targets.certainty, targets.confidence,
+                   targets.confidence_reason, targets.evidence_span_json
+            FROM call_targets targets
+            JOIN callsites sites
+              ON sites.project_id = targets.project_id
+             AND sites.id = targets.callsite_id
+            WHERE targets.project_id = ? AND targets.build_variant = ?
+              AND targets.derivation = 'indexed_override_candidate'
+            ORDER BY targets.callsite_id, targets.target_symbol_id, targets.id
+            """,
+            (project_id, build_variant),
+        ).fetchall()
+        snapshot: dict[str, tuple[str, str, tuple[tuple[object, ...], ...]]] = {}
+        for row in rows:
+            callsite_id = row["callsite_id"]
+            candidate = (
+                row["target_symbol_id"],
+                row["certainty"],
+                row["confidence"],
+                row["confidence_reason"],
+                row["evidence_span_json"],
+            )
+            previous = snapshot.get(callsite_id)
+            candidates = () if previous is None else previous[2]
+            snapshot[callsite_id] = (
+                row["owner_symbol_id"],
+                row["caller_translation_unit_id"],
+                (*candidates, candidate),
+            )
+        return snapshot
+
+    def _invalidate_changed_override_callers(
+        self,
+        project_id: int,
+        build_variant: str,
+        before: Mapping[str, tuple[str, str, tuple[tuple[object, ...], ...]]],
+    ) -> set[str]:
+        """Invalidate cached caller closures when build-wide virtual targets change."""
+
+        after = self._indexed_override_candidate_snapshot(project_id, build_variant)
+        changed_callsites = {
+            callsite_id
+            for callsite_id in before.keys() | after.keys()
+            if before.get(callsite_id) != after.get(callsite_id)
+        }
+        if not changed_callsites:
+            return set()
+        affected_functions: set[str] = set()
+        stale_units: set[str] = set()
+        for callsite_id in changed_callsites:
+            for snapshot in (before, after):
+                item = snapshot.get(callsite_id)
+                if item is not None:
+                    affected_functions.add(item[0])
+                    stale_units.add(item[1])
+        affected_functions |= self._reverse_summary_callers(
+            project_id, build_variant, affected_functions
+        )
+        if affected_functions:
+            placeholders = ",".join("?" for _ in affected_functions)
+            stale_units.update(
+                row[0]
+                for row in self._connection.execute(
+                    f"""
+                    SELECT DISTINCT translation_unit_id FROM function_summaries
+                    WHERE project_id = ? AND build_variant = ?
+                      AND function_symbol_id IN ({placeholders})
+                    """,
+                    (project_id, build_variant, *sorted(affected_functions)),
+                )
+            )
+        if stale_units:
+            placeholders = ",".join("?" for _ in stale_units)
+            # A derived target belongs logically to the unchanged caller, not to
+            # the TU whose override edge triggered this build-wide recomputation.
+            self._connection.execute(
+                f"""
+                DELETE FROM deep_tu_cache
+                WHERE project_id = ? AND build_variant = ?
+                  AND translation_unit_id IN ({placeholders})
+                """,
+                (project_id, build_variant, *sorted(stale_units)),
+            )
+        return affected_functions
+
     def translation_unit_states(
         self,
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        translation_unit_ids: tuple[str, ...] | None = None,
+        request_control: Any | None = None,
     ) -> dict[str, TranslationUnitState]:
         try:
             project_id = self._project_id(project_root)
@@ -4081,8 +4822,23 @@ class SQLiteStore:
             return {}
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
-        rows = self._connection.execute(
-            f"""
+        unit_sql = ""
+        parameters: list[object] = [project_id, *names]
+        if translation_unit_ids is not None:
+            if not translation_unit_ids:
+                return {}
+            unit_placeholders = ",".join("?" for _ in translation_unit_ids)
+            unit_sql = f" AND units.id IN ({unit_placeholders})"
+            parameters.extend(translation_unit_ids)
+        if request_control is not None:
+            request_control.check("translation-unit state lookup")
+            self._connection.set_progress_handler(
+                lambda: int(_request_interrupted(request_control, "translation-unit state lookup")),
+                1_000,
+            )
+        try:
+            rows = self._connection.execute(
+                f"""
             SELECT units.id, units.build_configuration_id, configs.command_hash,
                    units.content_hash, units.build_variant, units.analysis_backend,
                    units.advanced_facts_complete, units.index_profile,
@@ -4092,12 +4848,21 @@ class SQLiteStore:
             JOIN build_configurations configs
               ON configs.project_id = units.project_id
              AND configs.id = units.build_configuration_id
-            WHERE units.project_id = ? AND units.build_variant IN ({placeholders})
+            WHERE units.project_id = ? AND units.build_variant IN ({placeholders}){unit_sql}
             """,
-            (project_id, *names),
-        ).fetchall()
+                parameters,
+            ).fetchall()
+        except sqlite3.OperationalError as error:
+            if request_control is not None and "interrupt" in str(error).lower():
+                raise TimeoutError("translation-unit state lookup was cancelled") from error
+            raise
+        finally:
+            if request_control is not None:
+                self._connection.set_progress_handler(None, 0)
         result: dict[str, TranslationUnitState] = {}
         for row in rows:
+            if request_control is not None:
+                request_control.check("translation-unit dependency lookup")
             dependencies = tuple(
                 (Path(dependency[0]), dependency[1])
                 for dependency in self._connection.execute(
@@ -4131,6 +4896,7 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        materialization_id: str | None = None,
     ) -> tuple[AnalysisCoverageState, ...]:
         """Return explicit TU coverage for every selected variant of one symbol."""
 
@@ -4140,21 +4906,73 @@ class SQLiteStore:
             return ()
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
+        if materialization_id is None:
+            cache_joins = ""
+            cfg_expression = "units.cfg_facts_complete"
+            data_flow_expression = "units.data_flow_facts_complete"
+            summary_expression = "units.summary_facts_complete"
+            bindings_expression = "units.summary_facts_complete"
+            closure_expression = "units.summary_facts_complete"
+            materialization_expression = "NULL"
+            limit_expression = "''"
+            distance_expression = "0"
+            parameters: tuple[object, ...] = (project_id, symbol_id, *names)
+        else:
+            cache_joins = (
+                "JOIN deep_materialization_units mapped "
+                "ON mapped.project_id = units.project_id "
+                "AND mapped.translation_unit_id = units.id "
+                "AND mapped.materialization_id = ? "
+                "JOIN deep_tu_cache cache "
+                "ON cache.project_id = mapped.project_id "
+                "AND cache.translation_unit_id = mapped.translation_unit_id "
+                "AND cache.identity_hash = mapped.identity_hash "
+                "JOIN deep_materializations materialization "
+                "ON materialization.project_id = mapped.project_id "
+                "AND materialization.id = mapped.materialization_id "
+                "AND materialization.closure_generation_id = cache.closure_generation_id "
+                "AND materialization.unit_count = ("
+                "SELECT count(*) FROM deep_materialization_units all_mapped "
+                "JOIN deep_tu_cache all_cache "
+                "ON all_cache.project_id = all_mapped.project_id "
+                "AND all_cache.translation_unit_id = all_mapped.translation_unit_id "
+                "AND all_cache.identity_hash = all_mapped.identity_hash "
+                "AND all_cache.closure_generation_id = materialization.closure_generation_id "
+                "WHERE all_mapped.project_id = materialization.project_id "
+                "AND all_mapped.materialization_id = materialization.id)"
+            )
+            cfg_expression = "cache.cfg_complete"
+            data_flow_expression = "cache.data_flow_complete"
+            summary_expression = "cache.summaries_complete AND materialization.closure_complete"
+            bindings_expression = "cache.bindings_complete AND materialization.closure_complete"
+            closure_expression = "materialization.closure_complete"
+            materialization_expression = "materialization.id"
+            limit_expression = "materialization.limit_reason"
+            distance_expression = "mapped.distance"
+            parameters = (materialization_id, project_id, symbol_id, *names)
         rows = self._connection.execute(
             f"""
             SELECT DISTINCT units.build_variant, units.id, units.analysis_backend,
                    units.index_profile, units.navigation_facts_complete,
-                   units.cfg_facts_complete, units.data_flow_facts_complete,
-                   units.summary_facts_complete
-            FROM symbol_variants variants
+                   {cfg_expression} cfg_facts_complete,
+                   {data_flow_expression} data_flow_facts_complete,
+                   {summary_expression} summary_facts_complete,
+                   {bindings_expression} binding_facts_complete,
+                   {closure_expression} closure_complete,
+                   {materialization_expression} materialization_id,
+                   {limit_expression} limit_reason,
+                   {distance_expression} distance
+            FROM translation_unit_symbols membership
             JOIN translation_units units
-              ON units.project_id = variants.project_id
-             AND units.id = variants.translation_unit_id
-            WHERE variants.project_id = ? AND variants.symbol_id = ?
-              AND variants.build_variant IN ({placeholders})
+              ON units.project_id = membership.project_id
+             AND units.id = membership.translation_unit_id
+            {cache_joins}
+            WHERE membership.project_id = ? AND membership.symbol_id = ?
+              AND membership.is_definition = 1
+              AND units.build_variant IN ({placeholders})
             ORDER BY units.build_variant, units.id
             """,
-            (project_id, symbol_id, *names),
+            parameters,
         ).fetchall()
         return tuple(
             AnalysisCoverageState(
@@ -4166,8 +4984,623 @@ class SQLiteStore:
                 cfg_facts_complete=bool(row["cfg_facts_complete"]),
                 data_flow_facts_complete=bool(row["data_flow_facts_complete"]),
                 summary_facts_complete=bool(row["summary_facts_complete"]),
+                binding_facts_complete=bool(row["binding_facts_complete"]),
+                closure_complete=bool(row["closure_complete"]),
+                materialization_id=row["materialization_id"],
+                limit_reason=row["limit_reason"],
+                distance=row["distance"],
             )
             for row in rows
+        )
+
+    def deep_definition_targets(
+        self,
+        symbol_id: str,
+        project_root: Path | None = None,
+        *,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        request_control: Any | None = None,
+    ) -> tuple[DeepTranslationUnitTarget, ...]:
+        """Resolve every distinct definition TU for a canonical symbol in scope."""
+
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        if request_control is not None:
+            request_control.check("definition closure lookup")
+            self._connection.set_progress_handler(
+                lambda: int(_request_interrupted(request_control, "definition closure lookup")),
+                1_000,
+            )
+        try:
+            rows = self._connection.execute(
+                f"""
+            SELECT DISTINCT units.id, units.build_configuration_id, units.build_variant,
+                   configs.command_hash, units.source_path, units.content_hash
+            FROM translation_unit_symbols membership
+            JOIN translation_units units
+              ON units.project_id = membership.project_id
+             AND units.id = membership.translation_unit_id
+            JOIN build_configurations configs
+              ON configs.project_id = units.project_id
+             AND configs.id = units.build_configuration_id
+            WHERE membership.project_id = ? AND membership.symbol_id = ?
+              AND membership.is_definition = 1
+              AND units.build_variant IN ({placeholders})
+            ORDER BY units.build_variant, units.build_configuration_id, units.id
+            """,
+                (project_id, symbol_id, *names),
+            ).fetchall()
+            return tuple(
+                self._deep_target(project_id, row, request_control=request_control) for row in rows
+            )
+        except sqlite3.OperationalError as error:
+            if request_control is not None and "interrupt" in str(error).lower():
+                raise TimeoutError("definition closure lookup was cancelled") from error
+            raise
+        finally:
+            if request_control is not None:
+                self._connection.set_progress_handler(None, 0)
+
+    def deep_symbol_callees(
+        self,
+        target: DeepTranslationUnitTarget,
+        owner_symbol_ids: tuple[str, ...],
+        project_root: Path | None = None,
+        *,
+        request_control: Any | None = None,
+    ) -> tuple[tuple[str, DeepTranslationUnitTarget], ...]:
+        """Resolve known same-build definition TUs called by selected functions."""
+
+        project_id = self._project_id(project_root)
+        if not owner_symbol_ids:
+            return ()
+        placeholders = ",".join("?" for _ in owner_symbol_ids)
+        if request_control is not None:
+            request_control.check("callee closure lookup")
+            self._connection.set_progress_handler(
+                lambda: int(_request_interrupted(request_control, "callee closure lookup")),
+                1_000,
+            )
+        try:
+            rows = self._connection.execute(
+                f"""
+            SELECT DISTINCT targets.target_symbol_id, units.id,
+                   units.build_configuration_id, units.build_variant,
+                   configs.command_hash, units.source_path, units.content_hash
+            FROM callsites calls
+            JOIN call_targets targets
+              ON targets.project_id = calls.project_id AND targets.callsite_id = calls.id
+            JOIN translation_unit_symbols membership
+              ON membership.project_id = targets.project_id
+             AND membership.symbol_id = targets.target_symbol_id
+             AND membership.is_definition = 1
+            JOIN translation_units units
+              ON units.project_id = membership.project_id
+             AND units.id = membership.translation_unit_id
+             AND units.build_variant = calls.build_variant
+            JOIN build_configurations configs
+              ON configs.project_id = units.project_id
+             AND configs.id = units.build_configuration_id
+            WHERE calls.project_id = ? AND calls.translation_unit_id = ?
+              AND calls.build_variant = ?
+              AND calls.owner_symbol_id IN ({placeholders})
+            ORDER BY units.build_variant, units.build_configuration_id, units.id
+            """,
+                (
+                    project_id,
+                    target.translation_unit_id,
+                    target.build_variant,
+                    *owner_symbol_ids,
+                ),
+            ).fetchall()
+            return tuple(
+                (
+                    row["target_symbol_id"],
+                    self._deep_target(
+                        project_id,
+                        row,
+                        target.distance + 1,
+                        request_control=request_control,
+                    ),
+                )
+                for row in rows
+            )
+        except sqlite3.OperationalError as error:
+            if request_control is not None and "interrupt" in str(error).lower():
+                raise TimeoutError("callee closure lookup was cancelled") from error
+            raise
+        finally:
+            if request_control is not None:
+                self._connection.set_progress_handler(None, 0)
+
+    def deep_navigation_derived_targets(
+        self,
+        translation_unit_ids: tuple[str, ...],
+        project_root: Path | None = None,
+        *,
+        request_control: Any | None = None,
+    ) -> tuple[CallTarget, ...]:
+        """Return build-wide targets derived after TU ingestion for selected callsites."""
+
+        if not translation_unit_ids:
+            return ()
+        project_id = self._project_id(project_root)
+        placeholders = ",".join("?" for _ in translation_unit_ids)
+        if request_control is not None:
+            request_control.check("navigation target lookup")
+            self._connection.set_progress_handler(
+                lambda: int(_request_interrupted(request_control, "navigation target lookup")),
+                1_000,
+            )
+        try:
+            rows = self._connection.execute(
+                f"""
+            SELECT * FROM call_targets
+            WHERE project_id = ? AND derivation = 'indexed_override_candidate'
+              AND translation_unit_id IN ({placeholders})
+            ORDER BY callsite_id, target_symbol_id, id
+            """,
+                (project_id, *translation_unit_ids),
+            ).fetchall()
+            return tuple(self._row_to_call_target(row) for row in rows)
+        except sqlite3.OperationalError as error:
+            if request_control is not None and "interrupt" in str(error).lower():
+                raise TimeoutError("navigation target lookup was cancelled") from error
+            raise
+        finally:
+            if request_control is not None:
+                self._connection.set_progress_handler(None, 0)
+
+    def _deep_target(
+        self,
+        project_id: int,
+        row: sqlite3.Row,
+        distance: int = 0,
+        *,
+        request_control: Any | None = None,
+    ) -> DeepTranslationUnitTarget:
+        if request_control is not None:
+            request_control.check("dependency closure lookup")
+        dependencies = tuple(
+            (Path(item[0]), item[1])
+            for item in self._connection.execute(
+                """
+                SELECT path, content_hash FROM dependencies
+                WHERE project_id = ? AND translation_unit_id = ? ORDER BY path
+                """,
+                (project_id, row["id"]),
+            )
+        )
+        return DeepTranslationUnitTarget(
+            translation_unit_id=row["id"],
+            build_configuration_id=row["build_configuration_id"],
+            build_variant=row["build_variant"],
+            command_hash=row["command_hash"],
+            source_path=Path(row["source_path"]),
+            content_hash=row["content_hash"],
+            dependencies=dependencies,
+            distance=distance,
+        )
+
+    def deep_cache_states(self, project_root: Path | None = None) -> dict[str, DeepCacheState]:
+        project_id = self._project_id(project_root)
+        return {
+            row["translation_unit_id"]: DeepCacheState(
+                translation_unit_id=row["translation_unit_id"],
+                identity_hash=row["identity_hash"],
+                cfg_complete=bool(row["cfg_complete"]),
+                data_flow_complete=bool(row["data_flow_complete"]),
+                summaries_complete=bool(row["summaries_complete"]),
+                bindings_complete=bool(row["bindings_complete"]),
+                closure_generation_id=row["closure_generation_id"],
+                analyzer_identity=row["analyzer_identity"],
+                analyzer_version=row["analyzer_version"],
+                protocol=row["protocol"],
+                protocol_version=row["protocol_version"],
+                fact_schema_version=row["fact_schema_version"],
+                profile=IndexProfile(row["profile"]),
+            )
+            for row in self._connection.execute(
+                "SELECT * FROM deep_tu_cache WHERE project_id = ?", (project_id,)
+            )
+        }
+
+    def deep_cached_closure(
+        self,
+        closure_generation_id: str,
+        identities: Mapping[str, str],
+        project_root: Path | None = None,
+    ) -> tuple[DeepCacheState, ...] | None:
+        """Return one exact, structurally complete persisted closure generation."""
+
+        if not identities:
+            return None
+        project_id = self._project_id(project_root)
+        placeholders = ",".join("?" for _ in identities)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM deep_tu_cache
+            WHERE project_id = ? AND closure_generation_id = ?
+              AND translation_unit_id IN ({placeholders})
+            ORDER BY translation_unit_id
+            """,
+            (project_id, closure_generation_id, *sorted(identities)),
+        ).fetchall()
+        generation_count = self._connection.execute(
+            """
+            SELECT count(*) FROM deep_tu_cache
+            WHERE project_id = ? AND closure_generation_id = ?
+            """,
+            (project_id, closure_generation_id),
+        ).fetchone()[0]
+        if len(rows) != len(identities) or generation_count != len(identities):
+            return None
+        if any(
+            row["identity_hash"] != identities[row["translation_unit_id"]]
+            or not row["cfg_complete"]
+            or not row["data_flow_complete"]
+            or not row["summaries_complete"]
+            or not row["bindings_complete"]
+            for row in rows
+        ):
+            return None
+        return tuple(
+            DeepCacheState(
+                translation_unit_id=row["translation_unit_id"],
+                identity_hash=row["identity_hash"],
+                cfg_complete=True,
+                data_flow_complete=True,
+                summaries_complete=True,
+                bindings_complete=True,
+                closure_generation_id=row["closure_generation_id"],
+                analyzer_identity=row["analyzer_identity"],
+                analyzer_version=row["analyzer_version"],
+                protocol=row["protocol"],
+                protocol_version=row["protocol_version"],
+                fact_schema_version=row["fact_schema_version"],
+                profile=IndexProfile(row["profile"]),
+            )
+            for row in rows
+        )
+
+    def publish_deep_materialization_alias(
+        self,
+        project_root: Path,
+        *,
+        root_symbol_id: str,
+        materialization_id: str,
+        closure_generation_id: str,
+        identities: Mapping[str, str],
+        distances: Mapping[str, int],
+        closure_complete: bool,
+        known_tus: int,
+        omitted_tus: int,
+        limit_reason: str,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        request_control: Any | None = None,
+    ) -> tuple[DeepCacheState, ...]:
+        """Atomically attach a root-specific token to one exact cached closure."""
+
+        if not identities or set(identities) != set(distances):
+            raise ValueError("deep materialization alias does not match its closure")
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+
+        def interrupted() -> bool:
+            if request_control is None:
+                return False
+            try:
+                request_control.check("cache alias publication")
+            except (RuntimeError, TimeoutError):
+                return True
+            return False
+
+        self._connection.set_progress_handler(lambda: int(interrupted()), 1_000)
+        try:
+            if request_control is not None:
+                request_control.check("cache alias lookup")
+            self._connection.execute("BEGIN IMMEDIATE")
+            cached = self.deep_cached_closure(closure_generation_id, identities, project_root)
+            if cached is None:
+                raise RuntimeError("deep cache generation changed before alias publication")
+            provenance = cached[0]
+            if any(
+                (
+                    item.analyzer_identity,
+                    item.analyzer_version,
+                    item.protocol,
+                    item.protocol_version,
+                    item.fact_schema_version,
+                    item.profile,
+                )
+                != (
+                    provenance.analyzer_identity,
+                    provenance.analyzer_version,
+                    provenance.protocol,
+                    provenance.protocol_version,
+                    provenance.fact_schema_version,
+                    provenance.profile,
+                )
+                for item in cached[1:]
+            ):
+                raise RuntimeError("deep cache generation has inconsistent provenance")
+            self._insert_deep_materialization_alias(
+                project_id=project_id,
+                root_symbol_id=root_symbol_id,
+                materialization_id=materialization_id,
+                closure_generation_id=closure_generation_id,
+                identities=identities,
+                distances=distances,
+                closure_complete=closure_complete,
+                known_tus=known_tus,
+                omitted_tus=omitted_tus,
+                limit_reason=limit_reason,
+                build_scope=names,
+                provenance=provenance,
+            )
+            self._deep_publication_checkpoint("pre-commit-alias")
+            guard = (
+                request_control.publication_guard()
+                if request_control is not None
+                else nullcontext()
+            )
+            with guard:
+                if request_control is not None:
+                    request_control.check("cache alias commit")
+                self._connection.commit()
+            return cached
+        except sqlite3.OperationalError as error:
+            self._connection.rollback()
+            if interrupted() and "interrupt" in str(error).lower():
+                raise TimeoutError("deep cache alias publication was cancelled") from error
+            raise
+        except BaseException:
+            self._connection.rollback()
+            raise
+        finally:
+            self._connection.set_progress_handler(None, 0)
+
+    def publish_full_profile_materialization(
+        self,
+        project_root: Path,
+        *,
+        root_symbol_id: str,
+        materialization_id: str,
+        closure_generation_id: str,
+        identities: Mapping[str, str],
+        distances: Mapping[str, int],
+        closure_complete: bool,
+        known_tus: int,
+        omitted_tus: int,
+        limit_reason: str,
+        analyzer_identity: str,
+        analyzer_version: str,
+        protocol: str,
+        protocol_version: int,
+        profile: IndexProfile,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+        request_control: Any | None = None,
+    ) -> tuple[DeepCacheState, ...]:
+        """Persist a usable deep token for TUs whose full facts already exist."""
+
+        if not identities or set(identities) != set(distances):
+            raise ValueError("full-profile materialization does not match its closure")
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        unit_ids = tuple(sorted(identities))
+
+        def interrupted() -> bool:
+            if request_control is None:
+                return False
+            try:
+                request_control.check("full-profile publication")
+            except (RuntimeError, TimeoutError):
+                return True
+            return False
+
+        self._connection.set_progress_handler(lambda: int(interrupted()), 1_000)
+        try:
+            if request_control is not None:
+                request_control.check("full-profile publication lookup")
+            self._connection.execute("BEGIN IMMEDIATE")
+            states = self.translation_unit_states(
+                project_root,
+                build_scope=names,
+                translation_unit_ids=unit_ids,
+            )
+            if set(states) != set(unit_ids) or any(
+                state.index_profile is not IndexProfile.FULL
+                or not state.cfg_facts_complete
+                or not state.data_flow_facts_complete
+                or not state.summary_facts_complete
+                for state in states.values()
+            ):
+                raise RuntimeError("full index changed before token publication")
+
+            placeholders = ",".join("?" for _ in unit_ids)
+            self._connection.execute(
+                f"DELETE FROM deep_tu_cache WHERE project_id = ? "
+                f"AND translation_unit_id IN ({placeholders})",
+                (project_id, *unit_ids),
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO deep_tu_cache(
+                    project_id, translation_unit_id, build_variant,
+                    build_configuration_id, identity_hash, closure_generation_id,
+                    analyzer_identity, analyzer_version, protocol,
+                    protocol_version, fact_schema_version, profile, cfg_complete,
+                    data_flow_complete, summaries_complete, bindings_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 1)
+                """,
+                (
+                    (
+                        project_id,
+                        unit_id,
+                        states[unit_id].build_variant,
+                        states[unit_id].build_configuration_id,
+                        identities[unit_id],
+                        closure_generation_id,
+                        analyzer_identity,
+                        analyzer_version,
+                        protocol,
+                        protocol_version,
+                        SCHEMA_VERSION,
+                        IndexProfile(profile).value,
+                    )
+                    for unit_id in unit_ids
+                ),
+            )
+            self._delete_invalid_deep_materializations(project_id)
+            provenance = DeepCacheState(
+                translation_unit_id=unit_ids[0],
+                identity_hash=identities[unit_ids[0]],
+                cfg_complete=True,
+                data_flow_complete=True,
+                summaries_complete=True,
+                bindings_complete=True,
+                closure_generation_id=closure_generation_id,
+                analyzer_identity=analyzer_identity,
+                analyzer_version=analyzer_version,
+                protocol=protocol,
+                protocol_version=protocol_version,
+                fact_schema_version=SCHEMA_VERSION,
+                profile=IndexProfile(profile),
+            )
+            self._insert_deep_materialization_alias(
+                project_id=project_id,
+                root_symbol_id=root_symbol_id,
+                materialization_id=materialization_id,
+                closure_generation_id=closure_generation_id,
+                identities=identities,
+                distances=distances,
+                closure_complete=closure_complete,
+                known_tus=known_tus,
+                omitted_tus=omitted_tus,
+                limit_reason=limit_reason,
+                build_scope=names,
+                provenance=provenance,
+            )
+            cached = self.deep_cached_closure(closure_generation_id, identities, project_root)
+            if cached is None:
+                raise RuntimeError("full-profile cache changed before token publication")
+            self._deep_publication_checkpoint("pre-commit-full-profile")
+            guard = (
+                request_control.publication_guard()
+                if request_control is not None
+                else nullcontext()
+            )
+            with guard:
+                if request_control is not None:
+                    request_control.check("full-profile publication commit")
+                self._connection.commit()
+            return cached
+        except sqlite3.OperationalError as error:
+            self._connection.rollback()
+            if interrupted() and "interrupt" in str(error).lower():
+                raise TimeoutError("full-profile publication was cancelled") from error
+            raise
+        except BaseException:
+            self._connection.rollback()
+            raise
+        finally:
+            self._connection.set_progress_handler(None, 0)
+
+    def _insert_deep_materialization_alias(
+        self,
+        *,
+        project_id: int,
+        root_symbol_id: str,
+        materialization_id: str,
+        closure_generation_id: str,
+        identities: Mapping[str, str],
+        distances: Mapping[str, int],
+        closure_complete: bool,
+        known_tus: int,
+        omitted_tus: int,
+        limit_reason: str,
+        build_scope: tuple[str, ...],
+        provenance: DeepCacheState,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO deep_materializations(
+                project_id, id, root_symbol_id, closure_generation_id,
+                build_scope_json, closure_complete, unit_count, known_tus,
+                omitted_tus, limit_reason, analyzer_identity, analyzer_version,
+                protocol, protocol_version, fact_schema_version, profile
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                materialization_id,
+                root_symbol_id,
+                closure_generation_id,
+                json.dumps(build_scope),
+                int(closure_complete),
+                len(identities),
+                known_tus,
+                omitted_tus,
+                limit_reason,
+                provenance.analyzer_identity,
+                provenance.analyzer_version,
+                provenance.protocol,
+                provenance.protocol_version,
+                provenance.fact_schema_version,
+                provenance.profile.value,
+            ),
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO deep_materialization_units(
+                project_id, materialization_id, translation_unit_id,
+                identity_hash, distance
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    materialization_id,
+                    unit_id,
+                    identities[unit_id],
+                    distances[unit_id],
+                )
+                for unit_id in sorted(identities)
+            ),
+        )
+
+    def deep_materialization_matches(
+        self,
+        materialization_id: str,
+        identities: Mapping[str, str],
+        project_root: Path | None = None,
+    ) -> bool:
+        """Return whether one persisted token maps exactly to the requested cache identities."""
+        project_id = self._project_id(project_root)
+        rows = self._connection.execute(
+            """
+            SELECT mapped.translation_unit_id, mapped.identity_hash,
+                   materialization.unit_count
+            FROM deep_materialization_units mapped
+            JOIN deep_materializations materialization
+              ON materialization.project_id = mapped.project_id
+             AND materialization.id = mapped.materialization_id
+            JOIN deep_tu_cache cache
+              ON cache.project_id = mapped.project_id
+             AND cache.translation_unit_id = mapped.translation_unit_id
+             AND cache.identity_hash = mapped.identity_hash
+             AND cache.closure_generation_id = materialization.closure_generation_id
+            WHERE mapped.project_id = ? AND mapped.materialization_id = ?
+            ORDER BY mapped.translation_unit_id
+            """,
+            (project_id, materialization_id),
+        ).fetchall()
+        return (
+            bool(rows)
+            and rows[0]["unit_count"] == len(rows)
+            and {row["translation_unit_id"]: row["identity_hash"] for row in rows}
+            == dict(identities)
         )
 
     def get_symbol(
@@ -4360,6 +5793,7 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        translation_unit_ids: tuple[str, ...] | None = None,
         limit: int = 100,
     ) -> BoundedCfgResult[CfgGraph]:
         """Return build-specific function CFGs in stable order with explicit truncation."""
@@ -4373,11 +5807,18 @@ class SQLiteStore:
         if function_symbol_id is not None:
             function_sql = " AND function_symbol_id = ?"
             parameters.append(function_symbol_id)
+        unit_sql = ""
+        if translation_unit_ids is not None:
+            if not translation_unit_ids:
+                return BoundedCfgResult((), False)
+            unit_placeholders = ",".join("?" for _ in translation_unit_ids)
+            unit_sql = f" AND translation_unit_id IN ({unit_placeholders})"
+            parameters.extend(translation_unit_ids)
         parameters.append(limit + 1)
         rows = self._connection.execute(
             f"""
             SELECT * FROM cfg_graphs
-            WHERE project_id = ? AND build_variant IN ({placeholders}){function_sql}
+            WHERE project_id = ? AND build_variant IN ({placeholders}){function_sql}{unit_sql}
             ORDER BY build_variant, build_configuration_id, translation_unit_id,
                      function_symbol_id, id
             LIMIT ?
@@ -4714,20 +6155,31 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        translation_unit_ids: tuple[str, ...] | None = None,
         limit: int = 100,
     ) -> BoundedCfgResult[FunctionSummary]:
         limit = _cfg_limit(limit)
         project_id = self._project_id(project_root)
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
+        unit_sql = ""
+        parameters: list[object] = [project_id, function_symbol_id, *names]
+        if translation_unit_ids is not None:
+            if not translation_unit_ids:
+                return BoundedCfgResult((), False)
+            unit_placeholders = ",".join("?" for _ in translation_unit_ids)
+            unit_sql = f" AND translation_unit_id IN ({unit_placeholders})"
+            parameters.extend(translation_unit_ids)
+        parameters.append(limit + 1)
         rows = self._connection.execute(
             f"""
             SELECT * FROM function_summaries
             WHERE project_id = ? AND function_symbol_id = ?
               AND build_variant IN ({placeholders})
+              {unit_sql}
             ORDER BY build_variant, build_configuration_id, translation_unit_id, id LIMIT ?
             """,
-            (project_id, function_symbol_id, *names, limit + 1),
+            parameters,
         ).fetchall()
         return BoundedCfgResult(
             tuple(self._row_to_function_summary(row) for row in rows[:limit]), len(rows) > limit
@@ -4834,23 +6286,34 @@ class SQLiteStore:
         project_root: Path | None = None,
         *,
         build_scope: BuildScope | tuple[str, ...] | None = None,
+        translation_unit_ids: tuple[str, ...] | None = None,
         limit: int = 1_000,
     ) -> BoundedCfgResult[InterproceduralFlow]:
         limit = _cfg_limit(limit)
         project_id = self._project_id(project_root)
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
+        unit_sql = ""
+        parameters: list[object] = [project_id, summary_id, summary_id, *names]
+        if translation_unit_ids is not None:
+            if not translation_unit_ids:
+                return BoundedCfgResult((), False)
+            unit_placeholders = ",".join("?" for _ in translation_unit_ids)
+            unit_sql = f" AND translation_unit_id IN ({unit_placeholders})"
+            parameters.extend(translation_unit_ids)
+        parameters.append(limit + 1)
         rows = self._connection.execute(
             f"""
             SELECT * FROM interprocedural_flows
             WHERE project_id = ?
               AND (caller_summary_id = ? OR callee_summary_id = ?)
               AND build_variant IN ({placeholders})
+              {unit_sql}
             ORDER BY CASE certainty WHEN 'certain' THEN 0 ELSE 1 END,
                      CASE target_certainty WHEN 'certain' THEN 0 ELSE 1 END,
                      kind, callsite_id, id LIMIT ?
             """,
-            (project_id, summary_id, summary_id, *names, limit + 1),
+            parameters,
         ).fetchall()
         return BoundedCfgResult(
             tuple(self._row_to_interprocedural_flow(row) for row in rows[:limit]),

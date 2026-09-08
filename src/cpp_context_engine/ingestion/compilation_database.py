@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +16,11 @@ class CompilationDatabaseError(ValueError):
     """Raised when a compilation database cannot be used safely."""
 
 
-def _digest(parts: Iterable[str]) -> str:
+def _digest(parts: Iterable[str], check_cancelled: Callable[[], None] | None = None) -> str:
     digest = hashlib.sha256()
     for part in parts:
+        if check_cancelled is not None:
+            check_cancelled()
         digest.update(part.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
     return digest.hexdigest()
@@ -39,14 +41,30 @@ class CompilationDatabase:
         self.configurations = configurations
 
     @classmethod
-    def load(cls, path: Path, *, build_variant: str = DEFAULT_BUILD_VARIANT) -> CompilationDatabase:
+    def load(
+        cls,
+        path: Path,
+        *,
+        build_variant: str = DEFAULT_BUILD_VARIANT,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> CompilationDatabase:
         path = path.resolve(strict=False)
         try:
-            payload: Any = json.loads(path.read_text(encoding="utf-8"))
+            chunks: list[bytes] = []
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    if check_cancelled is not None:
+                        check_cancelled()
+                    chunks.append(chunk)
+            payload: Any = json.loads(b"".join(chunks).decode("utf-8"))
+            if check_cancelled is not None:
+                check_cancelled()
         except FileNotFoundError as error:
             raise CompilationDatabaseError(
                 f"compilation database does not exist: {path}"
             ) from error
+        except TimeoutError:
+            raise
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise CompilationDatabaseError(
                 f"cannot read compilation database {path}: {error}"
@@ -60,14 +78,25 @@ class CompilationDatabase:
         configurations: list[BuildConfiguration] = []
         seen: set[str] = set()
         for position, raw in enumerate(payload):
-            configuration = cls._parse_entry(path, position, raw, build_variant)
+            if check_cancelled is not None:
+                check_cancelled()
+            configuration = cls._parse_entry(
+                path, position, raw, build_variant, check_cancelled=check_cancelled
+            )
             if configuration.id not in seen:
                 configurations.append(configuration)
                 seen.add(configuration.id)
         return cls(path, tuple(configurations))
 
     @staticmethod
-    def _parse_entry(path: Path, position: int, raw: Any, build_variant: str) -> BuildConfiguration:
+    def _parse_entry(
+        path: Path,
+        position: int,
+        raw: Any,
+        build_variant: str,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> BuildConfiguration:
         prefix = f"{path}: entry {position}"
         if not isinstance(raw, dict):
             raise CompilationDatabaseError(f"{prefix} must be an object")
@@ -122,10 +151,11 @@ class CompilationDatabase:
             raise CompilationDatabaseError(f"{prefix} 'output' must be a string when present")
         output = _absolute(output_raw, directory) if output_raw else None
         command_hash = _digest(
-            [str(directory), str(source_path), *arguments, str(output) if output else ""]
+            [str(directory), str(source_path), *arguments, str(output) if output else ""],
+            check_cancelled,
         )
         return BuildConfiguration(
-            id=f"build_{_digest([build_variant, command_hash])[:32]}",
+            id=f"build_{_digest([build_variant, command_hash], check_cancelled)[:32]}",
             source_path=source_path,
             directory=directory,
             arguments=arguments,

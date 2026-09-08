@@ -9,6 +9,12 @@ from cpp_context_engine.ingestion.compilation_database import (
     CompilationDatabase,
     CompilationDatabaseError,
 )
+from cpp_context_engine.ingestion.deep import (
+    DeepCancellation,
+    DeepMaterializer,
+    MaterializeDeepRequest,
+    MaterializeDeepResult,
+)
 from cpp_context_engine.ingestion.indexer import IndexingResult, ProjectIndexer
 from cpp_context_engine.ingestion.native import (
     AnalyzerInfo,
@@ -25,6 +31,8 @@ __all__ = [
     "ClangUnavailableError",
     "CompilationDatabase",
     "CompilationDatabaseError",
+    "DeepMaterializer",
+    "DeepCancellation",
     "IndexingResult",
     "IngestionBatch",
     "Ingestor",
@@ -34,6 +42,8 @@ __all__ = [
     "AnalyzerUnavailableError",
     "NativeAnalyzerClient",
     "NativeClangIngestor",
+    "MaterializeDeepRequest",
+    "MaterializeDeepResult",
     "ProjectIndexer",
     "TranslationUnitError",
 ]

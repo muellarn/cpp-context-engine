@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager, redirect_stdout
 from dataclasses import dataclass, replace
@@ -29,6 +30,11 @@ from cpp_context_engine.api import (
     QueryRequest,
 )
 from cpp_context_engine.config import AppConfig
+from cpp_context_engine.ingestion import (
+    DeepCancellation,
+    MaterializeDeepRequest,
+    MaterializeDeepResult,
+)
 from cpp_context_engine.models import (
     CodeSymbol,
     GraphDirection,
@@ -57,6 +63,11 @@ from .contracts import (
     AskCodeResult,
     Builds,
     ContextTokens,
+    DeepDecodedBytes,
+    DeepSpoolBytes,
+    DeepSpoolFiles,
+    DeepTus,
+    DeepWallSeconds,
     GraphDepth,
     GraphEdgeResult,
     GraphFanout,
@@ -78,6 +89,12 @@ from .contracts import (
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+def _new_event() -> threading.Event:
+    return threading.Event()
+
 
 CMAKE_COMPILATION_DATABASE_COMMAND = (
     "cmake -S <project> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
@@ -112,6 +129,8 @@ class ProjectServerState:
     config: AppConfig
     lock: anyio.Lock
     runtime: Runtime | None = None
+    materialization_poisoned: bool = False
+    _materialization_done: threading.Event | None = None
 
     async def open(self) -> None:
         assert self.config.database_path is not None
@@ -134,20 +153,70 @@ class ProjectServerState:
         async with self.lock:
             runtime, self.runtime = self.runtime, None
             if runtime is not None:
-                await anyio.to_thread.run_sync(runtime.close, abandon_on_cancel=False)
+                done = self._materialization_done
+                if done is not None and not done.is_set():
+                    # An uncooperative worker must finish before its SQLite runtime
+                    # can be closed.  Keep shutdown bounded while still arranging
+                    # eventual cleanup without racing that worker.
+                    threading.Thread(
+                        target=lambda: (done.wait(), runtime.close()),
+                        name="cpp-context-poisoned-runtime-cleanup",
+                        daemon=True,
+                    ).start()
+                else:
+                    await anyio.to_thread.run_sync(runtime.close, abandon_on_cancel=False)
 
     async def execute(self, operation: Callable[[], T]) -> T:
         """Serialize SQLite/index work and never abandon a cancelled worker thread."""
 
         async with self.lock:
+            self._require_healthy()
             return await anyio.to_thread.run_sync(operation, abandon_on_cancel=False)
 
+    async def execute_materialization(self, operation: Callable[[DeepCancellation], T]) -> T:
+        """Propagate cancellation to Clang and wait for bounded process cleanup."""
+        cancelled = DeepCancellation()
+        done = _new_event()
+
+        def run() -> T:
+            try:
+                return operation(cancelled)
+            finally:
+                done.set()
+
+        async with self.lock:
+            self._require_healthy()
+            try:
+                return await anyio.to_thread.run_sync(run, abandon_on_cancel=True)
+            except anyio.get_cancelled_exc_class():
+                cancelled.set()
+                with anyio.CancelScope(shield=True):
+                    finished = await anyio.to_thread.run_sync(
+                        done.wait,
+                        MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS,
+                        abandon_on_cancel=False,
+                    )
+                if not finished:
+                    # Never allow another operation to reuse SQLite or analyzer
+                    # state while cleanup remains unverified.
+                    self.materialization_poisoned = True
+                    self._materialization_done = done
+                raise
+
     def require_runtime(self) -> Runtime:
+        self._require_healthy()
         if self.runtime is None:
             raise PublicToolFailure(
                 "The configured project has no usable index; call index_project first."
             )
         return self.runtime
+
+    def _require_healthy(self) -> None:
+        if self.materialization_poisoned:
+            raise PublicToolFailure(
+                "Deep-analysis cleanup could not be verified; restart the MCP server before "
+                "using this project index again."
+            )
 
 
 def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
@@ -165,6 +234,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         idempotent=True,
         open_world=hosted_embeddings,
     )
+    local_write = _annotations(read_only=False, idempotent=True, open_world=False)
     llm_read = _annotations(
         read_only=True,
         idempotent=False,
@@ -230,6 +300,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     async def control_flow(
         symbol_id: SymbolId,
         ctx: Context[ProjectServerState],
+        materialization_id: SymbolId | None = None,
         builds: Builds = None,
         max_graphs: AnalysisGraphs = 5,
         max_blocks: AnalysisBlocks = 100,
@@ -243,6 +314,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             lambda: state.require_runtime().analysis_service.control_flow(
                 CfgRequest(
                     function_symbol_id=symbol_id,
+                    materialization_id=materialization_id,
                     builds=builds,
                     max_graphs=max_graphs,
                     max_blocks=max_blocks,
@@ -264,6 +336,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
     async def data_flow(
         symbol_id: SymbolId,
         ctx: Context[ProjectServerState],
+        materialization_id: SymbolId | None = None,
         builds: Builds = None,
         max_analyses: AnalysisGraphs = 5,
         max_locations: AnalysisItems = 200,
@@ -277,6 +350,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             lambda: state.require_runtime().analysis_service.data_flow(
                 FlowRequest(
                     function_symbol_id=symbol_id,
+                    materialization_id=materialization_id,
                     builds=builds,
                     max_analyses=max_analyses,
                     max_locations=max_locations,
@@ -342,6 +416,48 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             operation,
             "Indexing failed; verify the server's project and compilation database configuration.",
         )
+
+    @server.tool(
+        title="Materialize bounded deep compiler analysis",
+        description=(
+            "Explicitly run bounded Clang analysis for the minimal known TU closure of one "
+            "indexed symbol. This is the only deep read-path operation that launches Clang."
+        ),
+        annotations=local_write,
+    )
+    async def materialize_deep_analysis(
+        symbol_id: SymbolId,
+        ctx: Context[ProjectServerState],
+        builds: Builds = None,
+        max_tus: DeepTus = 4,
+        max_wall_seconds: DeepWallSeconds = 120,
+        max_decoded_bytes: DeepDecodedBytes = 512 * 1024 * 1024,
+        max_spool_bytes: DeepSpoolBytes = 512 * 1024 * 1024,
+        max_spool_files: DeepSpoolFiles = 128,
+    ) -> MaterializeDeepResult:
+        state = _state(ctx)
+        request = MaterializeDeepRequest(
+            symbol_id=symbol_id,
+            builds=builds,
+            max_tus=max_tus,
+            max_wall_seconds=max_wall_seconds,
+            max_decoded_bytes=max_decoded_bytes,
+            max_spool_bytes=max_spool_bytes,
+            max_spool_files=max_spool_files,
+        )
+        try:
+            return await state.execute_materialization(
+                lambda cancelled: state.require_runtime().materialize_deep(request, cancelled)
+            )
+        except PublicToolFailure as exc:
+            raise ToolError(str(exc)) from None
+        except anyio.get_cancelled_exc_class():
+            raise
+        except Exception as exc:
+            logger.error("MCP tool materialize_deep_analysis failed (%s)", type(exc).__name__)
+            raise ToolError(
+                "Deep materialization failed for the configured project index."
+            ) from None
 
     @server.tool(
         title="Search connected C++ code",

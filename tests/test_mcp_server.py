@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +20,7 @@ from mcp import Client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from cpp_context_engine.config import AppConfig
-from cpp_context_engine.ingestion import IndexingResult
+from cpp_context_engine.ingestion import IndexingResult, MaterializeDeepResult
 from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.llm import DeterministicFakeProvider
 from cpp_context_engine.models import (
@@ -228,6 +232,46 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
 
     monkeypatch.setattr(mcp_server, "run_project_index", _fake_index)
     monkeypatch.setattr(mcp_server, "build_runtime", tracked_runtime)
+    materialize_requests = []
+
+    def materialize(_runtime: Runtime, request, _cancelled=None):
+        materialize_requests.append(request)
+        return MaterializeDeepResult(
+            status="complete",
+            materialization_id="deep-generation",
+            root_symbol_id=request.symbol_id,
+            units=[
+                {
+                    "build_variant": "default",
+                    "translation_unit_id": "tu-fixture",
+                    "build_configuration_id": "config-fixture",
+                    "identity_hash": "identity-fixture",
+                    "distance": 0,
+                    "cache_hit": False,
+                    "control_flow": True,
+                    "data_flow": True,
+                    "summaries": True,
+                    "bindings": True,
+                }
+            ],
+            closure_complete=True,
+            known_tus=0,
+            omitted_tus=0,
+            cache_hit=False,
+            elapsed_seconds=0.01,
+            provenance={
+                "analyzer_identity": "fixture",
+                "analyzer_version": "fixture",
+                "protocol": "cpp-context-clang-facts",
+                "protocol_version": 5,
+                "fact_schema_version": 15,
+                "profile": "full",
+                "build_scope": ["default"],
+                "closure_generation_id": "fixture",
+            },
+        )
+
+    monkeypatch.setattr(Runtime, "materialize_deep", materialize)
     server = mcp_server.create_mcp_server(config)
 
     async def scenario() -> None:
@@ -239,6 +283,7 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
                 "list_builds",
                 "control_flow",
                 "data_flow",
+                "materialize_deep_analysis",
                 "search_code",
                 "read_symbol",
                 "neighbors",
@@ -259,6 +304,11 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
                 assert forbidden.isdisjoint(tool.input_schema.get("properties", {}))
             assert tools["search_code"].input_schema["properties"]["query"]["maxLength"] == 2048
             assert tools["neighbors"].input_schema["properties"]["depth"]["maximum"] == 3
+            materialize_schema = tools["materialize_deep_analysis"].input_schema["properties"]
+            assert materialize_schema["max_tus"]["default"] == 4
+            assert materialize_schema["max_tus"]["maximum"] == 32
+            assert materialize_schema["max_wall_seconds"]["maximum"] == 300
+            assert tools["materialize_deep_analysis"].annotations.read_only_hint is False
             assert tools["search_code"].annotations.open_world_hint is False
 
             missing = await client.call_tool("search_code", {"query": "callee"})
@@ -287,6 +337,27 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
             }
             assert str(project) not in json.dumps(searched.structured_content)
 
+            materialized = await client.call_tool(
+                "materialize_deep_analysis", {"symbol_id": "cxx:caller", "max_tus": 2}
+            )
+            assert not materialized.is_error
+            assert materialized.structured_content["materialization_id"] == "deep-generation"
+            assert materialized.structured_content["provenance"] == {
+                "analyzer_identity": "fixture",
+                "analyzer_version": "fixture",
+                "protocol": "cpp-context-clang-facts",
+                "protocol_version": 5,
+                "fact_schema_version": 15,
+                "profile": "full",
+                "build_scope": ["default"],
+                "closure_generation_id": "fixture",
+            }
+            assert materialized.structured_content["units"][0]["identity_hash"] == (
+                "identity-fixture"
+            )
+            assert materialize_requests[-1].symbol_id == "cxx:caller"
+            assert materialize_requests[-1].max_tus == 2
+
             read = await client.call_tool("read_symbol", {"symbol_id": "cxx:caller"})
             assert not read.is_error
             assert read.structured_content["source_text"] == "int caller() { return callee(); }"
@@ -314,6 +385,145 @@ def test_in_memory_mcp_missing_index_then_index_search_read_and_graph(
     assert runtimes
     with pytest.raises(sqlite3.ProgrammingError):
         runtimes[-1].store.get_symbol("cxx:callee")
+
+
+def test_materialization_executor_propagates_cancel_and_waits_cleanup(tmp_path: Path) -> None:
+    from cpp_context_engine.mcp.server import ProjectServerState
+
+    state = ProjectServerState(_config(tmp_path, tmp_path / "index.db"), anyio.Lock())
+    started = threading.Event()
+    cleaned = threading.Event()
+
+    def operation(cancelled: threading.Event) -> None:
+        started.set()
+        while not cancelled.wait(0.01):
+            pass
+        cleaned.set()
+
+    async def scenario() -> None:
+        with anyio.move_on_after(0.1) as scope:
+            await state.execute_materialization(operation)
+        assert scope.cancel_called
+        assert started.is_set()
+        assert cleaned.wait(1)
+
+    anyio.run(scenario)
+
+
+def test_materialization_cancellation_wait_has_no_blind_cleanup_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cpp_context_engine.mcp import server as mcp_server
+
+    real_event = threading.Event
+    cleanup_wait_timeouts: list[float | None] = []
+
+    class ObservedDoneEvent:
+        def __init__(self) -> None:
+            self._event = real_event()
+
+        def set(self) -> None:
+            self._event.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            cleanup_wait_timeouts.append(timeout)
+            return self._event.wait(timeout)
+
+    monkeypatch.setattr(mcp_server, "_new_event", ObservedDoneEvent)
+    state = mcp_server.ProjectServerState(_config(tmp_path, tmp_path / "index.db"), anyio.Lock())
+
+    def operation(cancelled: threading.Event) -> None:
+        assert cancelled.wait(1)
+
+    async def scenario() -> None:
+        with anyio.move_on_after(0.01):
+            await state.execute_materialization(operation)
+
+    anyio.run(scenario)
+    assert cleanup_wait_timeouts == [mcp_server.MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS]
+
+
+def test_unverified_materialization_cleanup_poisons_runtime_until_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cpp_context_engine.mcp import server as mcp_server
+
+    monkeypatch.setattr(mcp_server, "MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    state = mcp_server.ProjectServerState(_config(tmp_path, tmp_path / "index.db"), anyio.Lock())
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def operation(_cancelled: object) -> None:
+        started.set()
+        release.wait(1)
+        finished.set()
+
+    async def scenario() -> None:
+        with anyio.move_on_after(0.01):
+            await state.execute_materialization(operation)
+        assert started.is_set()
+        assert state.materialization_poisoned
+        with pytest.raises(mcp_server.PublicToolFailure, match="restart the MCP server"):
+            await state.execute(lambda: None)
+        release.set()
+        assert finished.wait(1)
+
+    anyio.run(scenario)
+
+
+def test_cancelled_materialization_verifies_process_group_and_spool_cleanup(
+    tmp_path: Path,
+) -> None:
+    if os.name == "nt" or not Path("/proc").is_dir():
+        pytest.skip("process-group cleanup assertion requires Linux procfs")
+    from cpp_context_engine.mcp.server import ProjectServerState
+
+    state = ProjectServerState(_config(tmp_path, tmp_path / "index.db"), anyio.Lock())
+    started = threading.Event()
+    spool = tmp_path / "decoded-facts.spool"
+    child_pid_file = tmp_path / "child.pid"
+    process_pid: list[int] = []
+
+    def operation(cancelled: object) -> None:
+        spool.write_bytes(b"decoded facts")
+        process = subprocess.Popen(  # noqa: S603 - local deterministic fake process
+            [
+                sys.executable,
+                "-c",
+                "import pathlib, subprocess, sys, time; "
+                "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
+                "time.sleep(30)",
+            ],
+            start_new_session=True,
+        )
+        process_pid.append(process.pid)
+        started.set()
+        try:
+            assert cancelled.wait(2)  # type: ignore[attr-defined]
+        finally:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+            spool.unlink(missing_ok=True)
+
+    async def scenario() -> None:
+        began = time.monotonic()
+        with anyio.move_on_after(0.1):
+            await state.execute_materialization(operation)
+        assert time.monotonic() - began < 5
+
+    anyio.run(scenario)
+    assert started.is_set()
+    assert not spool.exists()
+    assert process_pid and not Path(f"/proc/{process_pid[0]}").exists()
+    if child_pid_file.exists():
+        child_pid = int(child_pid_file.read_text())
+        deadline = time.monotonic() + 1
+        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not Path(f"/proc/{child_pid}").exists()
 
 
 def test_mcp_rejects_indexed_source_outside_project_without_leaking_path(tmp_path: Path) -> None:
