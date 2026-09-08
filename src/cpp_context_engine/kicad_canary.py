@@ -212,9 +212,7 @@ def inspect_compilation_database(project_root: Path, compilation_database: Path)
             source = directory / source
         source = source.resolve(strict=False)
         if not source.is_file():
-            raise ValueError(
-                f"compilation database entry {raw_index} source file does not exist"
-            )
+            raise ValueError(f"compilation database entry {raw_index} source file does not exist")
         if _within(source, root):
             classification = "project_source"
             display = source.relative_to(root).as_posix()
@@ -598,8 +596,7 @@ def _linux_supervisor_available() -> bool:
 def _require_supervisor_platform() -> None:
     if not _linux_supervisor_available():
         raise RuntimeError(
-            "the KiCad canary requires Linux /proc process metrics; "
-            "no analyzer was started"
+            "the KiCad canary requires Linux /proc process metrics; no analyzer was started"
         )
 
 
@@ -1017,9 +1014,7 @@ def _compare_baseline_header(report: Mapping[str, Any], baseline: Mapping[str, A
         raise RuntimeError("baseline gate set or order differs")
 
 
-def _compare_baseline_gate(
-    gate: Mapping[str, Any], baseline_gate: Mapping[str, Any]
-) -> None:
+def _compare_baseline_gate(gate: Mapping[str, Any], baseline_gate: Mapping[str, Any]) -> None:
     key = str(gate.get("gate"))
     for field in (
         "selection",
@@ -1110,12 +1105,9 @@ def run_canary(
         running_marker = running / ".running"
         _write_report_atomic(running_marker, "incomplete\n")
         subset = running / "compile_commands.json"
-        subset_metadata = write_subset_database(
-            inspection.compilation_database, selected, subset
-        )
+        subset_metadata = write_subset_database(inspection.compilation_database, selected, subset)
         if gate != "all" and (
-            subset_metadata.normalized_configuration_count
-            != subset_metadata.raw_entry_count
+            subset_metadata.normalized_configuration_count != subset_metadata.raw_entry_count
         ):
             raise RuntimeError("numeric gate did not select unique compiler configurations")
         expected_translation_units = subset_metadata.normalized_configuration_count
@@ -1141,9 +1133,7 @@ def run_canary(
             no_progress_seconds=no_progress_seconds,
         )
         try:
-            measured = _run_supervised(
-                spec_path, running, limits, expected_translation_units
-            )
+            measured = _run_supervised(spec_path, running, limits, expected_translation_units)
             # Never publish success while an analyzer descendant observed by the supervisor lives.
             if measured.get("process_group_clean") is not True:
                 raise RuntimeError("canary worker process tree was not cleaned up")
