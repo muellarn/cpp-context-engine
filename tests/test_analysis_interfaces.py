@@ -14,6 +14,8 @@ from cpp_context_engine.api.http import create_app
 from cpp_context_engine.cli import main
 from cpp_context_engine.config import AppConfig
 from cpp_context_engine.ingestion.protocols import IngestionBatch
+from cpp_context_engine.llm import DeterministicFakeProvider
+from cpp_context_engine.mcp import server as mcp_server
 from cpp_context_engine.mcp.server import create_mcp_server
 from cpp_context_engine.models import (
     BuildConfiguration,
@@ -718,7 +720,7 @@ def test_mcp_build_filters_do_not_leak_and_call_evidence_is_ranked(tmp_path: Pat
 
 
 def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -746,6 +748,8 @@ def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
         build_variants=tuple(variants),
         build_scope=BuildScope(("alpha", "beta")),
         embedding_dimensions=16,
+        llm_base_url="https://provider.invalid/v1",
+        llm_model="fixture-chat",
     )
     _seed(config, sources=sources)
     alpha_only = CodeSymbol(
@@ -787,6 +791,27 @@ def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
                 ),
             )
         )
+    fake = DeterministicFakeProvider(
+        tuple(
+            json.dumps(
+                {
+                    "action": "answer",
+                    "answer": "fixture",
+                    "source_ids": [symbol_id],
+                }
+            )
+            for symbol_id in (
+                "cxx:analyze",
+                alpha_only.id,
+                beta_with_alpha_location.id,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "build_runtime",
+        lambda selected: build_runtime(selected, llm=fake),
+    )
 
     async def scenario() -> None:
         arguments = {"symbol_id": "cxx:analyze", "builds": ["beta"]}
@@ -810,10 +835,19 @@ def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
                     "max_context_tokens": 1_000,
                 },
             )
+            asked = await mcp.call_tool(
+                "ask_code",
+                {
+                    "query": "analyze",
+                    "builds": ["beta"],
+                    "max_context_tokens": 1_000,
+                    "max_steps": 1,
+                },
+            )
 
             assert all(
                 not result.is_error
-                for result in (cfg, flow, neighbors, callees, callers, read, searched)
+                for result in (cfg, flow, neighbors, callees, callers, read, searched, asked)
             )
             expected_path = "@generated/0/beta.cpp"
             assert cfg.structured_content["graphs"][0]["elements"][0]["location"]["path"] == (
@@ -831,6 +865,9 @@ def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
             assert read.structured_content["symbol"]["location"]["path"] == expected_path
             assert {
                 item["symbol"]["location"]["path"] for item in searched.structured_content["items"]
+            } == {expected_path}
+            assert {
+                source["location"]["path"] for source in asked.structured_content["sources"]
             } == {expected_path}
 
             for tool in (
@@ -859,6 +896,17 @@ def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
                 item["symbol"]["symbol_id"] != alpha_only.id
                 for item in alpha_search.structured_content["items"]
             )
+            alpha_answer = await mcp.call_tool(
+                "ask_code",
+                {
+                    "query": alpha_only.qualified_name,
+                    "builds": ["beta"],
+                    "max_context_tokens": 1_000,
+                    "max_steps": 1,
+                },
+            )
+            assert not alpha_answer.is_error
+            assert alpha_answer.structured_content["sources"] == []
             for tool in ("neighbors", "callees", "read_symbol"):
                 rejected = await mcp.call_tool(
                     tool,
@@ -866,6 +914,17 @@ def test_mcp_single_build_uses_one_generated_source_boundary_for_every_tool(
                 )
                 assert rejected.is_error
                 assert str(tmp_path) not in rejected.content[0].text
+            forged_answer = await mcp.call_tool(
+                "ask_code",
+                {
+                    "query": beta_with_alpha_location.qualified_name,
+                    "builds": ["beta"],
+                    "max_context_tokens": 1_000,
+                    "max_steps": 1,
+                },
+            )
+            assert not forged_answer.is_error
+            assert forged_answer.structured_content["sources"] == []
 
     anyio.run(scenario)
 
