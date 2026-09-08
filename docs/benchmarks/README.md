@@ -8,6 +8,10 @@ Git; do not commit them.
 The separate [large-TU transport benchmark](large-tu.md) reproduces the KiCad
 Clipper case used to verify bounded streaming, compression, and cancellation.
 
+The [KiCad navigation canary](kicad-canary.md) consumes an already prepared real
+compilation database and enforces progressive 1/4/16/32-TU gates before any
+complete-project run.
+
 ## Reproduction
 
 Build the pinned Clang 18 companion in Release mode, activate an installed project
