@@ -25,6 +25,7 @@ from cpp_context_engine.ingestion.protocols import IngestionBatch
 from cpp_context_engine.llm import DeterministicFakeProvider
 from cpp_context_engine.models import (
     BuildConfiguration,
+    BuildVariant,
     CodeSymbol,
     GraphEdge,
     GraphRelation,
@@ -147,11 +148,14 @@ def test_mcp_client_discovers_compilation_database_setup_guidance(tmp_path: Path
             assert "normal user authorization" in instructions
             assert "never runs these commands implicitly" in instructions
             assert "separate compilation database" in instructions
+            assert "--generated-source-root" in instructions
+            assert "CPP_CONTEXT_GENERATED_SOURCE_ROOTS" in instructions
 
             assert "build/compile_commands.json" in index_description
             assert "--compile-commands" in index_description
             assert "CPP_CONTEXT_COMPILE_COMMANDS" in index_description
             assert "No caller-controlled path" in index_description
+            assert "--generated-source-root" in index_description
 
     anyio.run(scenario)
 
@@ -524,6 +528,88 @@ def test_cancelled_materialization_verifies_process_group_and_spool_cleanup(
         while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert not Path(f"/proc/{child_pid}").exists()
+
+
+def test_mcp_reads_only_persisted_generated_sources_with_safe_aliases(tmp_path: Path) -> None:
+    from cpp_context_engine.mcp.server import create_mcp_server
+
+    project = tmp_path / "project"
+    project.mkdir()
+    build_directory = tmp_path / "build"
+    generated = build_directory / "generated"
+    generated.mkdir(parents=True)
+    source = generated / "messages.pb.cc"
+    source.write_text("int generated_entry() { return 1; }\n", encoding="utf-8")
+    neighbor = generated / "private.txt"
+    neighbor.write_text("not indexed\n", encoding="utf-8")
+    compilation_database = build_directory / "compile_commands.json"
+    compilation_database.write_text("[]", encoding="utf-8")
+    variant = BuildVariant("default", compilation_database, generated_source_roots=(generated,))
+    config = replace(
+        _config(project, tmp_path / "index.db"),
+        compilation_database=compilation_database,
+        build_variants=(variant,),
+    )
+    configuration = BuildConfiguration(
+        id="generated-build",
+        source_path=source,
+        directory=build_directory,
+        arguments=("clang++", "-c", str(source)),
+        command_hash="generated-command",
+        generated_source_roots=(generated,),
+    )
+    unit = TranslationUnit(
+        id="generated-unit",
+        build_configuration_id=configuration.id,
+        source_path=source,
+        content_hash="generated-content",
+    )
+    generated_symbol = CodeSymbol(
+        id="generated-symbol",
+        qualified_name="generated_entry",
+        kind=SymbolKind.FUNCTION,
+        span=SourceSpan(source, 1, 1),
+        source_hash="generated-symbol-hash",
+        build_configuration_id=configuration.id,
+        translation_unit_id=unit.id,
+        metadata={"is_definition": True},
+    )
+    forged_neighbor = replace(
+        generated_symbol,
+        id="forged-neighbor",
+        qualified_name="forged_neighbor",
+        span=SourceSpan(neighbor, 1, 1),
+        source_hash="forged-neighbor-hash",
+    )
+    with SQLiteStore(config.database_path, project_root=project) as store:
+        store.apply_ingestion(
+            project,
+            IngestionBatch(
+                (configuration,),
+                (unit,),
+                (generated_symbol, forged_neighbor),
+                (),
+                (),
+            ),
+            build_variant=variant,
+        )
+
+    async def scenario() -> None:
+        async with Client(create_mcp_server(config), mode="legacy") as client:
+            read = await client.call_tool("read_symbol", {"symbol_id": generated_symbol.id})
+            assert not read.is_error
+            assert read.structured_content is not None
+            assert read.structured_content["symbol"]["location"]["path"] == (
+                "@generated/0/messages.pb.cc"
+            )
+            assert "generated_entry" in read.structured_content["source_text"]
+
+            rejected = await client.call_tool("read_symbol", {"symbol_id": forged_neighbor.id})
+            assert rejected.is_error
+            assert str(tmp_path) not in rejected.content[0].text
+            assert "private.txt" not in rejected.content[0].text
+
+    anyio.run(scenario)
 
 
 def test_mcp_rejects_indexed_source_outside_project_without_leaking_path(tmp_path: Path) -> None:

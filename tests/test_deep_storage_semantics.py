@@ -1217,7 +1217,7 @@ def test_restart_reuses_exact_closure_generation_across_root_symbols_without_spa
                     analyzer_identity,
                     "cpp-context-clang-facts",
                     "5",
-                    "15",
+                    "16",
                     "full",
                 ],
                 control,
@@ -1309,7 +1309,7 @@ def test_restart_reuses_exact_closure_generation_across_root_symbols_without_spa
             "fixture-1",
             "cpp-context-clang-facts",
             5,
-            15,
+            16,
             "full",
             closure_generation_id,
             2,
@@ -1466,7 +1466,7 @@ def test_restart_reuses_exact_closure_generation_across_root_symbols_without_spa
     assert result.provenance.analyzer_version == "fixture-1"
     assert result.provenance.protocol == "cpp-context-clang-facts"
     assert result.provenance.protocol_version == 5
-    assert result.provenance.fact_schema_version == 15
+    assert result.provenance.fact_schema_version == 16
     assert result.provenance.profile is IndexProfile.FULL
     assert result.provenance.build_scope == ["default"]
     assert result.provenance.closure_generation_id == closure_generation_id

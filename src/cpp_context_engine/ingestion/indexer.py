@@ -74,7 +74,12 @@ class ProjectIndexer:
         variant = build_variant or BuildVariant(DEFAULT_BUILD_VARIANT, compilation_database)
         if variant.compilation_database != compilation_database.resolve(strict=False):
             raise ValueError("build variant compilation database does not match index request")
-        database = CompilationDatabase.load(compilation_database, build_variant=variant.name)
+        database = CompilationDatabase.load(
+            compilation_database,
+            build_variant=variant.name,
+            project_root=project_root,
+            generated_source_roots=variant.generated_source_roots,
+        )
         previous = self._store.translation_unit_states(project_root, build_scope=(variant.name,))
         current_ids = frozenset(translation_unit_id(config) for config in database.configurations)
         changed = [

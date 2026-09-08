@@ -79,9 +79,13 @@ class ToolOutput(BaseModel):
 
 
 class SourceLocation(ToolOutput):
-    """A project-relative, POSIX source location with one-based lines."""
+    """A safe source alias with one-based lines."""
 
-    path: str = Field(description="Project-relative POSIX path; never an absolute host path.")
+    path: str = Field(
+        description=(
+            "Project-relative POSIX path or @generated/N alias; never an absolute host path."
+        )
+    )
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
 

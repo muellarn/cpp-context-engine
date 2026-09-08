@@ -60,6 +60,7 @@ class Runtime:
     retrieval_service: ContextRetrievalService
     answer_service: IterativeAnswerService | None
     analysis_service: AnalysisQueryService
+    source_reader: FilesystemSourceReader
     deep_materializer: DeepMaterializer
 
     def close(self) -> None:
@@ -238,10 +239,40 @@ def build_runtime(
         if not store.has_project(config.project_root):
             # Public CLI/API composition must not reveal the operator's absolute database path.
             raise ValueError("project is not indexed; run 'cpp-context index' first")
-        available = {variant.name for variant in store.build_variants(config.project_root)}
+        persisted_variants = {
+            variant.name: variant for variant in store.build_variants(config.project_root)
+        }
+        available = set(persisted_variants)
         missing_builds = set(config.build_scope.variants) - available
         if missing_builds:
             raise ValueError("build scope is not indexed: " + ", ".join(sorted(missing_builds)))
+        configured_variants = {variant.name: variant for variant in config.build_variants}
+        for name in config.build_scope.variants:
+            configured = configured_variants.get(name)
+            persisted_roots = persisted_variants[name].generated_source_roots
+            # Legacy source-root-only builds did not require their CDB to be
+            # repeated on read commands. External roots always require an exact
+            # operator binding before any host file can be opened.
+            if configured is None and persisted_roots:
+                raise ValueError(
+                    f"generated-source roots are not configured for indexed build variant: {name}"
+                )
+            if configured is not None and configured.generated_source_roots != persisted_roots:
+                raise ValueError(
+                    f"generated-source roots do not match the indexed build variant: {name}"
+                )
+        generated_roots = tuple(
+            dict.fromkeys(
+                root
+                for name in config.build_scope.variants
+                for root in persisted_variants[name].generated_source_roots
+            )
+        )
+        source_reader = FilesystemSourceReader(
+            config.project_root,
+            generated_source_roots=generated_roots,
+            allowed_paths=store.source_paths(config.project_root, config.build_scope),
+        )
         provider = embedding_provider(config)
         vector = SQLiteVectorSearch(
             store,
@@ -254,7 +285,7 @@ def build_runtime(
             symbol_search=SQLiteSymbolSearch(store, config.project_root, config.build_scope),
             vector_search=vector,
             symbol_store=store,
-            source_reader=FilesystemSourceReader(config.project_root),
+            source_reader=source_reader,
             graph=store,
             config=RetrievalConfig(
                 search_limit=config.retrieval_limit,
@@ -274,7 +305,9 @@ def build_runtime(
         if selected_llm is None and (require_llm or (config.llm_base_url and config.llm_model)):
             selected_llm = llm_provider(config)
         answer = IterativeAnswerService(retrieval, selected_llm) if selected_llm else None
-        analysis = AnalysisQueryService(store, config.project_root, config.build_scope)
+        analysis = AnalysisQueryService(
+            store, config.project_root, config.build_scope, source_reader
+        )
         return Runtime(
             config,
             store,
@@ -282,6 +315,7 @@ def build_runtime(
             retrieval,
             answer,
             analysis,
+            source_reader,
             DeepMaterializer(config, store),
         )
     except Exception:

@@ -60,7 +60,8 @@ const std::vector<std::string> kCapabilities = {
     "uses_type",          "callsites_v1",     "dispatch_targets_v1",
     "macro_expansion_stack", "template_relationships_v1",
     "intraprocedural_dataflow_v1", "points_to_v1", "function_summaries_v1",
-    "interprocedural_bindings_v1", "gzip_jsonl_v1", "analysis_profiles_v1"};
+    "interprocedural_bindings_v1", "gzip_jsonl_v1", "analysis_profiles_v1",
+    "generated_source_roots_v1"};
 
 class OutputWriter {
 public:
@@ -202,9 +203,13 @@ struct MacroExpansionRecord {
 class SourceFacts {
 public:
   SourceFacts(clang::SourceManager &sourceManager, const clang::LangOptions &langOptions,
-              std::filesystem::path projectRoot)
+              std::filesystem::path projectRoot,
+              std::vector<std::filesystem::path> generatedSourceRoots)
       : sourceManager_(sourceManager), langOptions_(langOptions),
-        projectRoot_(pathCache_.canonical(projectRoot)) {}
+        projectRoot_(pathCache_.canonical(projectRoot)) {
+    for (const auto &root : generatedSourceRoots)
+      generatedSourceRoots_.push_back(pathCache_.canonical(root));
+  }
 
   std::filesystem::path canonicalPath(const std::filesystem::path &path) const {
     return pathCache_.canonical(path);
@@ -223,16 +228,26 @@ public:
   }
 
   bool isProjectPath(const std::filesystem::path &candidate) const {
-    auto relative = canonicalPath(candidate).lexically_relative(projectRoot_);
-    return !relative.empty() && *relative.begin() != "..";
+    return relativePath(candidate).has_value();
+  }
+
+  std::optional<std::string> relativePath(const std::filesystem::path &candidate) const {
+    const auto canonical = canonicalPath(candidate);
+    auto relative = canonical.lexically_relative(projectRoot_);
+    if (!relative.empty() && *relative.begin() != "..")
+      return relative.generic_string();
+    for (std::size_t index = 0; index < generatedSourceRoots_.size(); ++index) {
+      relative = canonical.lexically_relative(generatedSourceRoots_[index]);
+      if (!relative.empty() && *relative.begin() != "..")
+        return "@generated/" + std::to_string(index) + "/" + relative.generic_string();
+    }
+    return std::nullopt;
   }
 
   std::optional<std::string> relative(clang::SourceLocation location,
                                       bool spelling = true) const {
     auto candidate = path(location, spelling);
-    if (!candidate || !isProjectPath(*candidate))
-      return std::nullopt;
-    return canonicalPath(*candidate).lexically_relative(projectRoot_).generic_string();
+    return candidate ? relativePath(*candidate) : std::nullopt;
   }
 
   std::optional<llvm::json::Object> span(clang::SourceRange range,
@@ -356,7 +371,7 @@ public:
   }
 
   std::string fileKey(const std::filesystem::path &path) const {
-    return "file:" + canonicalPath(path).lexically_relative(projectRoot_).generic_string();
+    return "file:" + relativePath(path).value_or("unknown");
   }
 
   std::string declKey(const clang::NamedDecl *decl, llvm::StringRef kind) const {
@@ -437,6 +452,7 @@ private:
   const clang::LangOptions &langOptions_;
   cpp_context::CanonicalPathCache pathCache_;
   std::filesystem::path projectRoot_;
+  std::vector<std::filesystem::path> generatedSourceRoots_;
 };
 
 class Collector;
@@ -2793,12 +2809,15 @@ private:
 
 class Action final : public clang::ASTFrontendAction {
 public:
-  Action(FactSink &sink, std::filesystem::path root, bool navigationOnly)
-      : sink_(sink), root_(std::move(root)), navigationOnly_(navigationOnly) {}
+  Action(FactSink &sink, std::filesystem::path root,
+         std::vector<std::filesystem::path> generatedSourceRoots, bool navigationOnly)
+      : sink_(sink), root_(std::move(root)),
+        generatedSourceRoots_(std::move(generatedSourceRoots)),
+        navigationOnly_(navigationOnly) {}
 
   bool BeginSourceFileAction(clang::CompilerInstance &compiler) override {
     source_ = std::make_unique<SourceFacts>(compiler.getSourceManager(), compiler.getLangOpts(),
-                                            root_);
+                                            root_, generatedSourceRoots_);
     compiler.getPreprocessor().addPPCallbacks(
         std::make_unique<PreprocessorCollector>(sink_, *source_, macroExpansions_));
     return true;
@@ -2813,6 +2832,7 @@ public:
 private:
   FactSink &sink_;
   std::filesystem::path root_;
+  std::vector<std::filesystem::path> generatedSourceRoots_;
   std::unique_ptr<SourceFacts> source_;
   std::vector<MacroExpansionRecord> macroExpansions_;
   bool navigationOnly_;
@@ -2820,15 +2840,20 @@ private:
 
 class ActionFactory final : public clang::tooling::FrontendActionFactory {
 public:
-  ActionFactory(FactSink &sink, std::filesystem::path root, bool navigationOnly)
-      : sink_(sink), root_(std::move(root)), navigationOnly_(navigationOnly) {}
+  ActionFactory(FactSink &sink, std::filesystem::path root,
+                std::vector<std::filesystem::path> generatedSourceRoots,
+                bool navigationOnly)
+      : sink_(sink), root_(std::move(root)),
+        generatedSourceRoots_(std::move(generatedSourceRoots)),
+        navigationOnly_(navigationOnly) {}
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<Action>(sink_, root_, navigationOnly_);
+    return std::make_unique<Action>(sink_, root_, generatedSourceRoots_, navigationOnly_);
   }
 
 private:
   FactSink &sink_;
   std::filesystem::path root_;
+  std::vector<std::filesystem::path> generatedSourceRoots_;
   bool navigationOnly_;
 };
 
@@ -2862,6 +2887,7 @@ bool handleAnalyze(const llvm::json::Object &request) {
   auto source = requiredString(request, "source_path");
   auto directory = requiredString(request, "directory");
   const auto *argumentsValue = request.getArray("arguments");
+  const auto *generatedRootsValue = request.getArray("generated_source_roots");
   const auto profile = request.getString("profile");
   if (!requestId || !root || !source || !directory || !argumentsValue) {
     emitError("invalid_request", "analyze requires bounded project and compiler inputs");
@@ -2880,13 +2906,76 @@ bool handleAnalyze(const llvm::json::Object &request) {
     }
     arguments.push_back(argument->str());
   }
+  std::vector<std::filesystem::path> generatedSourceRoots;
+  if (generatedRootsValue) {
+    for (const auto &entry : *generatedRootsValue) {
+      auto raw = entry.getAsString();
+      if (!raw) {
+        emitError("invalid_request", "generated source roots must be strings");
+        return false;
+      }
+      if (!std::filesystem::path(raw->str()).is_absolute()) {
+        emitError("invalid_request", "generated source roots must be absolute");
+        return false;
+      }
+      std::error_code error;
+      auto canonical = std::filesystem::canonical(std::filesystem::path(raw->str()), error);
+      if (error || !std::filesystem::is_directory(canonical) ||
+          canonical == canonical.root_path()) {
+        emitError("invalid_request", "generated source root must be a bounded directory");
+        return false;
+      }
+      generatedSourceRoots.push_back(std::move(canonical));
+    }
+    std::sort(generatedSourceRoots.begin(), generatedSourceRoots.end());
+    generatedSourceRoots.erase(
+        std::unique(generatedSourceRoots.begin(), generatedSourceRoots.end()),
+        generatedSourceRoots.end());
+  }
+  const std::filesystem::path requestedRoot(root->str());
+  const std::filesystem::path requestedSource(source->str());
+  const std::filesystem::path requestedDirectory(directory->str());
+  if (!requestedRoot.is_absolute() || !requestedSource.is_absolute() ||
+      !requestedDirectory.is_absolute()) {
+    emitError("invalid_request", "project, source, and compiler directory must be absolute");
+    return false;
+  }
+  std::error_code rootError;
+  const auto canonicalRoot = std::filesystem::canonical(requestedRoot, rootError);
+  std::error_code sourceError;
+  const auto canonicalSource = std::filesystem::canonical(requestedSource, sourceError);
+  std::error_code directoryError;
+  const auto canonicalDirectory =
+      std::filesystem::canonical(requestedDirectory, directoryError);
+  if (rootError || !std::filesystem::is_directory(canonicalRoot) ||
+      canonicalRoot == canonicalRoot.root_path() || sourceError ||
+      !std::filesystem::is_regular_file(canonicalSource) || directoryError ||
+      !std::filesystem::is_directory(canonicalDirectory)) {
+    emitError("invalid_request", "project, source, or compiler directory is unavailable");
+    return false;
+  }
+  const auto isWithin = [](const std::filesystem::path &candidate,
+                           const std::filesystem::path &boundary) {
+    const auto relative = candidate.lexically_relative(boundary);
+    return !relative.empty() && *relative.begin() != "..";
+  };
+  const bool sourceAuthorized =
+      isWithin(canonicalSource, canonicalRoot) ||
+      std::any_of(generatedSourceRoots.begin(), generatedSourceRoots.end(),
+                  [&](const auto &generatedRoot) {
+                    return isWithin(canonicalSource, generatedRoot);
+                  });
+  if (!sourceAuthorized) {
+    emitError("invalid_request", "source is outside the authorized source roots");
+    return false;
+  }
   emit({{"type", "begin"}, {"request_id", *requestId}});
   const bool navigationOnly = profile && *profile == "navigation";
   FactSink sink(navigationOnly);
-  clang::tooling::FixedCompilationDatabase database(*directory, arguments);
-  std::vector<std::string> sources{*source};
+  clang::tooling::FixedCompilationDatabase database(canonicalDirectory.string(), arguments);
+  std::vector<std::string> sources{canonicalSource.string()};
   clang::tooling::ClangTool tool(database, sources);
-  ActionFactory factory(sink, *root, navigationOnly);
+  ActionFactory factory(sink, canonicalRoot, std::move(generatedSourceRoots), navigationOnly);
   const int result = tool.run(&factory);
   if (result != 0) {
     emitError("analysis_failed", "Clang rejected the translation unit");

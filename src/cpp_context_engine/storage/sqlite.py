@@ -70,7 +70,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 VECTOR_ENCODING_RAW_F64LE_V1 = 0
 VECTOR_ENCODING_ZLIB_F64LE_V1 = 1
 DEFAULT_EMBEDDING_TEXT_CHARS = 32_000
@@ -637,6 +637,8 @@ class SQLiteStore:
             self._migrate_v14()
         if current <= 14:
             self._migrate_v15()
+        if current <= 15:
+            self._migrate_v16()
 
     def _migrate_v15(self) -> None:
         """Add content-addressed, TU-scoped deep-analysis overlay metadata."""
@@ -739,6 +741,31 @@ class SQLiteStore:
 
     def _deep_migration_checkpoint(self, _stage: str) -> None:
         """Failure-injection hook for atomic deep-overlay schema publication."""
+
+    def _migrate_v16(self) -> None:
+        """Persist the generated-source boundary owned by each build variant."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row["name"] for row in self._connection.execute("PRAGMA table_info(build_variants)")
+            }
+            if columns and "generated_source_roots_json" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE build_variants ADD COLUMN "
+                    "generated_source_roots_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            self._generated_roots_migration_checkpoint("column")
+            self._generated_roots_migration_checkpoint("publication")
+            self._connection.execute("PRAGMA user_version = 16")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _generated_roots_migration_checkpoint(self, _stage: str) -> None:
+        """Failure-injection hook for atomic generated-root schema publication."""
 
     def _migrate_v13_and_v14(self) -> None:
         try:
@@ -2341,7 +2368,7 @@ class SQLiteStore:
                             project_id, selected_variant.name, batch_unit_ids
                         )
                         self._delete_translation_units(project_id, batch_unit_ids)
-                    self._stage_ingestion_batch(project_id, batch, index_profile)
+                    self._stage_ingestion_batch(project_id, batch, index_profile, selected_variant)
                     # Release TU-local tuples before requesting the next batch;
                     # Python for-loops otherwise retain the previous loop value.
                     del batch
@@ -2879,9 +2906,20 @@ class SQLiteStore:
             )
 
     def _stage_ingestion_batch(
-        self, project_id: int, batch: IngestionBatch, index_profile: IndexProfile
+        self,
+        project_id: int,
+        batch: IngestionBatch,
+        index_profile: IndexProfile,
+        selected_variant: BuildVariant,
     ) -> None:
         for configuration in batch.build_configurations:
+            if (
+                configuration.build_variant != selected_variant.name
+                or configuration.generated_source_roots != selected_variant.generated_source_roots
+            ):
+                raise ValueError(
+                    "build configuration source boundary does not match its build variant"
+                )
             self._connection.execute(
                 """
                 INSERT INTO build_configurations(
@@ -2907,6 +2945,8 @@ class SQLiteStore:
                 ),
             )
         for unit in batch.translation_units:
+            if unit.build_variant != selected_variant.name:
+                raise ValueError("translation unit does not match its build variant")
             if unit.index_profile is not IndexProfile(index_profile):
                 raise ValueError("translation-unit profile does not match ingestion profile")
             navigation_complete = (
@@ -3035,13 +3075,14 @@ class SQLiteStore:
             """
             INSERT INTO build_variants(
                 project_id, name, compilation_database, target, platform,
-                metadata_json, reindex_required, index_profile
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                metadata_json, generated_source_roots_json, reindex_required, index_profile
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
             ON CONFLICT(project_id, name) DO UPDATE SET
                 compilation_database = excluded.compilation_database,
                 target = excluded.target,
                 platform = excluded.platform,
                 metadata_json = excluded.metadata_json,
+                generated_source_roots_json = excluded.generated_source_roots_json,
                 index_profile = excluded.index_profile
             """,
             (
@@ -3051,6 +3092,7 @@ class SQLiteStore:
                 variant.target,
                 variant.platform,
                 json.dumps(dict(variant.metadata), sort_keys=True),
+                json.dumps([str(path) for path in variant.generated_source_roots]),
                 IndexProfile(index_profile).value,
             ),
         )
@@ -3073,12 +3115,40 @@ class SQLiteStore:
                 row["target"],
                 row["platform"],
                 json.loads(row["metadata_json"]),
+                tuple(Path(path) for path in json.loads(row["generated_source_roots_json"])),
             )
             for row in self._connection.execute(
                 "SELECT * FROM build_variants WHERE project_id = ? ORDER BY name" + limit_sql,
                 parameters,
             )
         )
+
+    def source_paths(
+        self,
+        project_root: Path | None = None,
+        build_scope: BuildScope | tuple[str, ...] | None = None,
+    ) -> frozenset[Path]:
+        """Return exact CDB-owned and ingested include paths for one build scope."""
+
+        project_id = self._project_id(project_root)
+        names = self._scope_names(build_scope)
+        placeholders = ",".join("?" for _ in names)
+        rows = self._connection.execute(
+            f"""
+            SELECT source_path AS path FROM translation_units
+            WHERE project_id = ? AND build_variant IN ({placeholders})
+            UNION
+            SELECT dependencies.path AS path
+            FROM dependencies
+            JOIN translation_units
+              ON translation_units.project_id = dependencies.project_id
+             AND translation_units.id = dependencies.translation_unit_id
+            WHERE dependencies.project_id = ?
+              AND translation_units.build_variant IN ({placeholders})
+            """,
+            (project_id, *names, project_id, *names),
+        )
+        return frozenset(Path(row["path"]).resolve(strict=False) for row in rows)
 
     def reindex_required_variants(self, project_root: Path | None = None) -> tuple[str, ...]:
         project_id = self._project_id(project_root)

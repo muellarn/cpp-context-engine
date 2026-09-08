@@ -141,6 +141,112 @@ else:
     )
 
 
+def test_native_analyzer_indexes_explicit_out_of_tree_generated_translation_unit(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    include = project / "include"
+    source = project / "src"
+    include.mkdir(parents=True)
+    source.mkdir()
+    header = include / "api.hpp"
+    header.write_text(
+        "int project_target(int value);\nint generated_entry(int value);\n",
+        encoding="utf-8",
+    )
+    project_source = source / "api.cpp"
+    project_source.write_text(
+        '#include "api.hpp"\n'
+        "int project_target(int value) { return value + 1; }\n"
+        "int project_bridge(int value) { return generated_entry(value); }\n",
+        encoding="utf-8",
+    )
+    build = tmp_path / "build"
+    generated = build / "generated"
+    generated.mkdir(parents=True)
+    generated_source = generated / "messages.pb.cc"
+    generated_source.write_text(
+        '#include "api.hpp"\nint generated_entry(int value) { return project_target(value); }\n',
+        encoding="utf-8",
+    )
+    database = build / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(build),
+                    "file": str(path),
+                    "arguments": [
+                        "clang++",
+                        "-std=c++20",
+                        f"-I{include}",
+                        "-c",
+                        str(path),
+                    ],
+                }
+                for path in (project_source, generated_source)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    variant = BuildVariant(
+        "generated",
+        database,
+        generated_source_roots=(Path("generated"),),
+    )
+
+    batch = NativeClangIngestor(fresh_native_client(analyzer_binary(), timeout_seconds=30)).ingest(
+        project,
+        database,
+        build_variant=variant.name,
+        generated_source_roots=variant.generated_source_roots,
+    )
+
+    generated_symbol = next(
+        symbol for symbol in batch.symbols if symbol.qualified_name == "generated_entry"
+    )
+    target_symbol = next(
+        symbol for symbol in batch.symbols if symbol.qualified_name == "project_target"
+    )
+    bridge_symbol = next(
+        symbol for symbol in batch.symbols if symbol.qualified_name == "project_bridge"
+    )
+    assert generated_symbol.span.path == generated_source.resolve()
+    assert any(
+        symbol.kind is SymbolKind.FILE and symbol.qualified_name == "@generated/0/messages.pb.cc"
+        for symbol in batch.symbols
+    )
+    assert any(
+        edge.relation is GraphRelation.INCLUDES
+        and edge.source_id
+        == next(
+            symbol.id
+            for symbol in batch.symbols
+            if symbol.qualified_name == "@generated/0/messages.pb.cc"
+        )
+        for edge in batch.edges
+    )
+    callsites = [site for site in batch.callsites if site.owner_symbol_id == generated_symbol.id]
+    assert callsites
+    assert any(
+        target.callsite_id in {site.id for site in callsites}
+        and target.target_symbol_id == target_symbol.id
+        for target in batch.call_targets
+    )
+    bridge_callsites = {
+        site.id for site in batch.callsites if site.owner_symbol_id == bridge_symbol.id
+    }
+    assert any(
+        target.callsite_id in bridge_callsites and target.target_symbol_id == generated_symbol.id
+        for target in batch.call_targets
+    )
+    graphs = [
+        graph for graph in batch.cfg_graphs if graph.function_symbol_id == generated_symbol.id
+    ]
+    assert graphs
+    assert any(analysis.graph_id == graphs[0].id for analysis in batch.data_flow_analyses)
+
+
 def test_fact_builder_and_native_cache_cover_all_semantic_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

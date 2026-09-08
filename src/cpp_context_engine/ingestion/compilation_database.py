@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cpp_context_engine.models import DEFAULT_BUILD_VARIANT, BuildConfiguration
+from cpp_context_engine.source_paths import SourceBoundary, canonical_generated_source_roots
 
 
 class CompilationDatabaseError(ValueError):
@@ -46,9 +47,19 @@ class CompilationDatabase:
         path: Path,
         *,
         build_variant: str = DEFAULT_BUILD_VARIANT,
+        project_root: Path | None = None,
+        generated_source_roots: tuple[Path, ...] = (),
         check_cancelled: Callable[[], None] | None = None,
     ) -> CompilationDatabase:
         path = path.resolve(strict=False)
+        generated_source_roots = canonical_generated_source_roots(
+            path, tuple(generated_source_roots)
+        )
+        boundary = (
+            SourceBoundary(project_root, generated_source_roots)
+            if project_root is not None
+            else None
+        )
         try:
             chunks: list[bytes] = []
             with path.open("rb") as stream:
@@ -81,7 +92,13 @@ class CompilationDatabase:
             if check_cancelled is not None:
                 check_cancelled()
             configuration = cls._parse_entry(
-                path, position, raw, build_variant, check_cancelled=check_cancelled
+                path,
+                position,
+                raw,
+                build_variant,
+                boundary=boundary,
+                generated_source_roots=generated_source_roots,
+                check_cancelled=check_cancelled,
             )
             if configuration.id not in seen:
                 configurations.append(configuration)
@@ -95,6 +112,8 @@ class CompilationDatabase:
         raw: Any,
         build_variant: str,
         *,
+        boundary: SourceBoundary | None,
+        generated_source_roots: tuple[Path, ...],
         check_cancelled: Callable[[], None] | None = None,
     ) -> BuildConfiguration:
         prefix = f"{path}: entry {position}"
@@ -119,6 +138,10 @@ class CompilationDatabase:
         source_path = _absolute(file_raw, directory)
         if not source_path.is_file():
             raise CompilationDatabaseError(f"{prefix} source file does not exist: {source_path}")
+        if boundary is not None and not boundary.contains(source_path):
+            raise CompilationDatabaseError(
+                f"{prefix} source file is outside the authorized source roots"
+            )
 
         has_arguments = "arguments" in raw
         has_command = "command" in raw
@@ -150,10 +173,15 @@ class CompilationDatabase:
         if output_raw is not None and not isinstance(output_raw, str):
             raise CompilationDatabaseError(f"{prefix} 'output' must be a string when present")
         output = _absolute(output_raw, directory) if output_raw else None
-        command_hash = _digest(
-            [str(directory), str(source_path), *arguments, str(output) if output else ""],
-            check_cancelled,
-        )
+        identity = [str(directory), str(source_path), *arguments, str(output) if output else ""]
+        if generated_source_roots:
+            identity.extend(
+                (
+                    "generated-source-roots-v1",
+                    *(str(root) for root in generated_source_roots),
+                )
+            )
+        command_hash = _digest(identity, check_cancelled)
         return BuildConfiguration(
             id=f"build_{_digest([build_variant, command_hash], check_cancelled)[:32]}",
             source_path=source_path,
@@ -162,6 +190,7 @@ class CompilationDatabase:
             command_hash=command_hash,
             output=output,
             build_variant=build_variant,
+            generated_source_roots=generated_source_roots,
         )
 
 

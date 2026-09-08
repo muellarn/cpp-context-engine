@@ -43,6 +43,23 @@ Keep a separate compilation database for each materially different build configu
 register each one as a named build.
 Do not hand-write a database for a non-trivial project.
 
+Out-of-source builds may put generated translation units outside the project root. Authorize
+only their narrow generated directory after configure/build has created it:
+
+```bash
+cpp-context index /path/to/project \
+  --compile-commands /path/to/build/compile_commands.json \
+  --generated-source-root /path/to/build/generated
+```
+
+The directory must exist and is canonicalized before use. A relative root is resolved against
+the compilation database's directory. The allowlist never implicitly includes neighboring build
+files or system headers: source reads remain limited to exact main files and includes persisted
+for the selected build. Traversal, symlink escapes, filesystem root `/`, and CDB main files outside
+both the project and configured generated roots are rejected.
+Repeat the same root binding on later search, analysis, and MCP commands. The index persists it as
+provenance, but persisted paths never grant a restarted process filesystem access by themselves.
+
 If libclang is not discovered automatically, select the native library explicitly:
 
 ```bash
@@ -115,7 +132,9 @@ Index each relevant compilation database under a stable operator-owned name:
 ```bash
 cpp-context index /path/to/project \
   --build debug=/path/to/project/build-debug/compile_commands.json \
-  --build release=/path/to/project/build-release/compile_commands.json
+  --build release=/path/to/project/build-release/compile_commands.json \
+  --generated-source-root debug=generated \
+  --generated-source-root release=/path/to/project/build-release/generated
 
 cpp-context search "feature handler" --project /path/to/project --build debug
 cpp-context search "feature handler" --project /path/to/project \
@@ -149,6 +168,8 @@ non-local jumps, and build-specific limitations.
 
 For a long-running MCP operator, configure paths with repeated `--build NAME=PATH`
 or `CPP_CONTEXT_BUILDS=debug=/path/debug/compile_commands.json,release=/path/release/compile_commands.json`.
+Bind external generated directories with repeated `--generated-source-root NAME=PATH`
+or `CPP_CONTEXT_GENERATED_SOURCE_ROOTS=debug=generated,release=/path/release/generated`.
 `CPP_CONTEXT_BUILD_SCOPE=debug,release` selects the server-visible union. MCP callers
 can select neither filesystem paths nor unconfigured builds.
 
@@ -228,6 +249,7 @@ path. Configure those values when launching the process, then use stdio (the def
 export CPP_CONTEXT_PROJECT_ROOT=/path/to/project
 export CPP_CONTEXT_DATABASE=/path/to/project/.cpp-context/index.db
 export CPP_CONTEXT_COMPILE_COMMANDS=/path/to/project/build/compile_commands.json
+export CPP_CONTEXT_GENERATED_SOURCE_ROOTS=/path/to/project/build/generated
 cpp-context-mcp
 ```
 
@@ -237,7 +259,8 @@ The equivalent main CLI command accepts non-secret operator options:
 cpp-context mcp \
   --project /path/to/project \
   --db /path/to/project/.cpp-context/index.db \
-  --compile-commands /path/to/project/build/compile_commands.json
+  --compile-commands /path/to/project/build/compile_commands.json \
+  --generated-source-root /path/to/project/build/generated
 ```
 
 The server may start before an index exists. An MCP client can call `index_project`,
@@ -245,10 +268,11 @@ then `list_builds`, `search_code`, `read_symbol`, `neighbors`, `callers`, `calle
 `control_flow`, and `data_flow`. `ask_code` is available when an LLM endpoint is
 configured. Existing tool names remain unchanged. Every tool has a Pydantic structured
 output schema. Locations contain exact symbol/callsite IDs, project-relative POSIX
-paths, and one-based line ranges. Query length, build count, result/evidence count,
-graph depth/fanout, packed context, source size, and answer steps all have hard
-server-side limits. A tool may select only a subset of the operator-enabled build
-scope; omitting `builds` returns that scope and labels multi-build results as a union.
+paths or safe `@generated/N` aliases, and one-based line ranges. Query length,
+build count, result/evidence count, graph depth/fanout, packed context, source size,
+and answer steps all have hard server-side limits. A tool may select only a subset
+of the operator-enabled build scope; omitting `builds` returns that scope and labels
+multi-build results as a union.
 For MCP call edges, interpret `certainty`, `confidence`, and `target_set_complete`
 with the evidence semantics above; in particular, confidence is ranking-only and
 an incomplete target set must not be treated as exhaustive.
@@ -313,6 +337,7 @@ flag so they do not accidentally appear in shell history or process listings.
 | `CPP_CONTEXT_DATABASE` | SQLite file | `<index-directory>/index.db` |
 | `CPP_CONTEXT_COMPILE_COMMANDS` | compilation database | `<project>/build/compile_commands.json` |
 | `CPP_CONTEXT_BUILDS` | comma-separated named databases (`NAME=PATH`) | unset |
+| `CPP_CONTEXT_GENERATED_SOURCE_ROOTS` | generated roots (`[NAME=]PATH`, comma-separated) | unset |
 | `CPP_CONTEXT_BUILD_SCOPE` | comma-separated query/MCP build names | `default` |
 | `CPP_CONTEXT_INDEX_PROFILE` | indexing profile: `full` or opt-in `navigation` | `full` |
 | `LIBCLANG_LIBRARY_FILE` | exact compatible native libclang | auto-discovered |

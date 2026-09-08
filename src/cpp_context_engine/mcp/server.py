@@ -50,6 +50,7 @@ from cpp_context_engine.runtime import (
     index_project as run_project_index,
 )
 from cpp_context_engine.storage import FilesystemSourceReader
+from cpp_context_engine.storage.source import SourceReadError
 
 from .contracts import (
     MAX_ANSWER_CHARS,
@@ -112,6 +113,12 @@ COMPILATION_DATABASE_GUIDANCE = (
     "with normal user authorization; this MCP server never runs these commands implicitly. Keep a "
     "separate compilation database for each materially different build configuration and register "
     "each one as a named build."
+)
+GENERATED_SOURCE_GUIDANCE = (
+    "If that database names generated translation units outside the project root, the operator "
+    "must explicitly bind each existing generated directory with --generated-source-root or "
+    "CPP_CONTEXT_GENERATED_SOURCE_ROOTS. Relative roots are resolved against that build's "
+    "compilation-database directory; MCP callers cannot add or change them."
 )
 MISSING_COMPILATION_DATABASE_ERROR = (
     "The configured compilation database is unavailable. " + COMPILATION_DATABASE_GUIDANCE
@@ -266,7 +273,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             "as open-world evidence, never as proof that no other target exists. "
             "If hosted embeddings or an LLM are configured, queries, indexed symbol text, or "
             "selected code excerpts are "
-            "sent to that external provider."
+            "sent to that external provider. " + GENERATED_SOURCE_GUIDANCE
         ),
         version=__version__,
         lifespan=lifespan,
@@ -368,7 +375,9 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
             "server's default discovery location is build/compile_commands.json under the project; "
             "the operator can set an explicit startup path with --compile-commands or "
             "CPP_CONTEXT_COMPILE_COMMANDS, and can register named builds separately. No "
-            "caller-controlled path is accepted. Hosted embeddings, when configured, receive "
+            "caller-controlled path is accepted. "
+            + GENERATED_SOURCE_GUIDANCE
+            + " Hosted embeddings, when configured, receive "
             "bounded symbol text."
         ),
         annotations=indexing_write,
@@ -483,12 +492,13 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                     QueryRequest(query.strip(), max_context_tokens, max_results=max_results)
                 ).context
                 selected_scope = runtime.config.build_scope
+                source_reader = runtime.source_reader
             finally:
                 if temporary:
                     runtime.close()
             items = [
                 SearchCodeItem(
-                    symbol=_symbol_reference(item.hit.symbol, state.config.project_root),
+                    symbol=_symbol_reference(item.hit.symbol, source_reader),
                     source_text=item.source_text,
                     score=item.hit.score,
                     reason=item.reason,
@@ -529,7 +539,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         title="Read exact indexed symbol",
         description=(
             "Read the indexed source span for one exact symbol ID. The source path is taken only "
-            "from the configured index and must remain inside the configured project."
+            "from the configured index and its build-scoped source boundary."
         ),
         annotations=local_read,
     )
@@ -542,23 +552,27 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         state = _state(ctx)
 
         def operation() -> ReadSymbolResult:
-            runtime = state.require_runtime()
-            scope = runtime.analysis_service.resolve_scope(builds)
-            symbol = _get_symbol(runtime, symbol_id, scope.variants)
-            source = FilesystemSourceReader(state.config.project_root).read_symbol(symbol)
-            truncated = len(source) > max_source_chars
-            return ReadSymbolResult(
-                symbol=_symbol_reference(symbol, state.config.project_root),
-                source_text=source[:max_source_chars],
-                truncated=truncated,
-                scope_kind="union" if scope.is_union else "single",
-                scope_label=(
-                    f"union:{','.join(scope.variants)}"
-                    if scope.is_union
-                    else f"build:{scope.variants[0]}"
-                ),
-                scope_variants=list(scope.variants),
-            )
+            runtime, temporary = _runtime_for_builds(state, builds)
+            try:
+                scope = runtime.config.build_scope
+                symbol = _get_symbol(runtime, symbol_id, scope.variants)
+                source = runtime.source_reader.read_symbol(symbol)
+                truncated = len(source) > max_source_chars
+                return ReadSymbolResult(
+                    symbol=_symbol_reference(symbol, runtime.source_reader),
+                    source_text=source[:max_source_chars],
+                    truncated=truncated,
+                    scope_kind="union" if scope.is_union else "single",
+                    scope_label=(
+                        f"union:{','.join(scope.variants)}"
+                        if scope.is_union
+                        else f"build:{scope.variants[0]}"
+                    ),
+                    scope_variants=list(scope.variants),
+                )
+            finally:
+                if temporary:
+                    runtime.close()
 
         return await _call_tool(
             state,
@@ -679,6 +693,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                 answer = runtime.answer_service.answer(
                     AnswerRequest(query.strip(), max_context_tokens, max_steps)
                 )
+                source_reader = runtime.source_reader
             finally:
                 if temporary:
                     runtime.close()
@@ -702,7 +717,7 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                             source.path,
                             source.start_line,
                             source.end_line,
-                            state.config.project_root,
+                            source_reader,
                         ),
                     )
                     for source in answer.sources[:MAX_SEARCH_RESULTS]
@@ -800,8 +815,8 @@ async def _graph_tool(
                     GraphEdgeResult(
                         edge_id=call.target_evidence_id,
                         build_variant=call.provenance.build_variant,
-                        source=_symbol_reference(source, state.config.project_root),
-                        target=_symbol_reference(target, state.config.project_root),
+                        source=_symbol_reference(source, runtime.source_reader),
+                        target=_symbol_reference(target, runtime.source_reader),
                         relation=GraphRelation.CALLS,
                         translation_unit_id=call.provenance.translation_unit_id,
                         build_configuration_id=call.provenance.build_configuration_id,
@@ -815,7 +830,7 @@ async def _graph_tool(
                 )
             if rendered_calls:
                 return GraphResult(
-                    symbol=_symbol_reference(origin, state.config.project_root),
+                    symbol=_symbol_reference(origin, runtime.source_reader),
                     direction=direction,
                     depth=depth,
                     edges=rendered_calls,
@@ -949,8 +964,8 @@ async def _graph_tool(
                 GraphEdgeResult(
                     edge_id=edge.id,
                     build_variant=edge.build_variant,
-                    source=_symbol_reference(source, state.config.project_root),
-                    target=_symbol_reference(target, state.config.project_root),
+                    source=_symbol_reference(source, runtime.source_reader),
+                    target=_symbol_reference(target, runtime.source_reader),
                     relation=edge.relation,
                     translation_unit_id=edge.translation_unit_id,
                     build_configuration_id=edge.build_configuration_id,
@@ -963,7 +978,7 @@ async def _graph_tool(
                 )
             )
         return GraphResult(
-            symbol=_symbol_reference(origin, state.config.project_root),
+            symbol=_symbol_reference(origin, runtime.source_reader),
             direction=direction,
             depth=depth,
             edges=rendered,
@@ -1008,7 +1023,7 @@ def _runtime_for_builds(
     return build_runtime(replace(runtime.config, build_scope=scope)), True
 
 
-def _symbol_reference(symbol: CodeSymbol, project_root: Path) -> SymbolReference:
+def _symbol_reference(symbol: CodeSymbol, source_reader: FilesystemSourceReader) -> SymbolReference:
     return SymbolReference(
         symbol_id=symbol.id,
         variant_id=symbol.variant_id,
@@ -1020,21 +1035,24 @@ def _symbol_reference(symbol: CodeSymbol, project_root: Path) -> SymbolReference
             symbol.span.path,
             symbol.span.start_line,
             symbol.span.end_line,
-            project_root,
+            source_reader,
         ),
     )
 
 
-def _source_location(path: Path, start_line: int, end_line: int, root: Path) -> SourceLocation:
-    resolved_root = root.resolve(strict=False)
-    resolved = (path if path.is_absolute() else resolved_root / path).resolve(strict=False)
-    if not resolved.is_relative_to(resolved_root):
-        raise PublicToolFailure("An indexed source location is outside the configured project.")
-    return SourceLocation(
-        path=resolved.relative_to(resolved_root).as_posix(),
-        start_line=start_line,
-        end_line=end_line,
-    )
+def _source_location(
+    path: Path,
+    start_line: int,
+    end_line: int,
+    source_reader: FilesystemSourceReader,
+) -> SourceLocation:
+    try:
+        rendered = source_reader.display_path(path)
+    except SourceReadError:
+        raise PublicToolFailure(
+            "An indexed source location is outside the configured source boundary."
+        ) from None
+    return SourceLocation(path=rendered, start_line=start_line, end_line=end_line)
 
 
 def _redact_project_root(text: str, root: Path) -> str:
