@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +23,13 @@ from typing import Any, TextIO
 from cpp_context_engine.api import CallRequest, CfgRequest, FlowRequest, QueryRequest
 from cpp_context_engine.benchmark import _write_report_atomic
 from cpp_context_engine.config import AppConfig
-from cpp_context_engine.ingestion import NativeAnalyzerClient, NativeClangIngestor, ProjectIndexer
+from cpp_context_engine.ingestion import (
+    AnalyzerPipelineEvent,
+    AnalyzerSlotIdleGate,
+    NativeAnalyzerClient,
+    NativeClangIngestor,
+    ProjectIndexer,
+)
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
 from cpp_context_engine.models import BuildScope, BuildVariant, GraphDirection, IndexProfile
 from cpp_context_engine.runtime import build_runtime
@@ -157,6 +163,112 @@ class CanaryLimits:
         if elapsed > self.wall_seconds:
             return f"wall time exceeded {self.wall_seconds:g} seconds"
         return None
+
+
+class _AnalyzerTelemetryMonitor:
+    """Validate child telemetry and enforce the analyzer-slot acceptance gate."""
+
+    def __init__(
+        self,
+        *,
+        max_idle_seconds: float,
+        expected_configurations: int,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if expected_configurations < 1:
+            raise ValueError("expected analyzer configuration count must be positive")
+        self._max_idle_seconds = max_idle_seconds
+        self._expected_configurations = expected_configurations
+        self._gate = AnalyzerSlotIdleGate(
+            max_idle_seconds=max_idle_seconds,
+            clock=clock,
+        )
+        self._event_count = 0
+        self._started: set[int] = set()
+        self._finished: set[int] = set()
+
+    def observe_payload(self, payload: Mapping[str, Any]) -> None:
+        event = AnalyzerPipelineEvent.from_protocol_payload(payload)
+        if (
+            event.configuration_index is not None
+            and event.configuration_index >= self._expected_configurations
+        ):
+            raise ValueError("analyzer telemetry configuration index exceeds the workload")
+        if event.kind == "analyzer_started" and event.configuration_index in self._started:
+            raise ValueError("analyzer telemetry started one configuration more than once")
+        self._gate.observe(event)
+        if event.kind == "analyzer_started":
+            assert event.configuration_index is not None
+            self._started.add(event.configuration_index)
+        elif event.kind == "analyzer_finished":
+            assert event.configuration_index is not None
+            self._finished.add(event.configuration_index)
+        self._event_count += 1
+
+    def check(self) -> None:
+        self._gate.check()
+
+    def success_report(self) -> dict[str, Any]:
+        if self._event_count == 0:
+            raise RuntimeError("analyzer pipeline telemetry is missing")
+        slots = self._gate.report()
+        if any(slot["state"] == "active" for slot in slots):
+            raise RuntimeError("analyzer pipeline telemetry ended with an active slot")
+        expected = set(range(self._expected_configurations))
+        if self._started != expected or self._finished != expected:
+            raise RuntimeError("analyzer pipeline telemetry is missing lifecycle events")
+        if not slots or any(slot["outcome"] != "succeeded" for slot in slots):
+            raise RuntimeError("analyzer pipeline telemetry has no successful terminal slot state")
+        return {
+            "protocol": "analyzer_pipeline",
+            "clock": "monotonic",
+            "event_count": self._event_count,
+            "configuration_count": self._expected_configurations,
+            "max_idle_seconds": self._max_idle_seconds,
+            "slots": slots,
+        }
+
+
+def _validate_analyzer_pipeline_report(
+    report: object,
+    *,
+    expected_configurations: int,
+    expected_slots: int,
+    max_idle_seconds: float,
+) -> None:
+    if not isinstance(report, Mapping):
+        raise RuntimeError("analyzer pipeline telemetry report is missing")
+    if (
+        report.get("protocol") != "analyzer_pipeline"
+        or report.get("clock") != "monotonic"
+        or report.get("configuration_count") != expected_configurations
+        or report.get("max_idle_seconds") != max_idle_seconds
+        or type(report.get("event_count")) is not int
+        or report["event_count"] < expected_configurations * 2 + 1
+    ):
+        raise RuntimeError("analyzer pipeline telemetry provenance is invalid")
+    slots = report.get("slots")
+    if not isinstance(slots, list) or len(slots) != expected_slots:
+        raise RuntimeError("analyzer pipeline telemetry slot report is incomplete")
+    if [slot.get("slot_id") for slot in slots if isinstance(slot, Mapping)] != list(
+        range(expected_slots)
+    ):
+        raise RuntimeError("analyzer pipeline telemetry slot order is invalid")
+    for slot in slots:
+        if (
+            not isinstance(slot, Mapping)
+            or slot.get("state") != "idle"
+            or slot.get("outcome") != "succeeded"
+            or slot.get("idle_cause") is not None
+        ):
+            raise RuntimeError("analyzer pipeline telemetry has no clean terminal slot state")
+        maximum_idle = slot.get("maximum_idle_seconds")
+        if (
+            isinstance(maximum_idle, bool)
+            or not isinstance(maximum_idle, (int, float))
+            or not 0 <= maximum_idle <= max_idle_seconds
+        ):
+            raise RuntimeError("analyzer pipeline telemetry idle duration is invalid")
 
 
 def _sha256(path: Path) -> str:
@@ -642,6 +754,10 @@ def _run_supervised(
     stderr_tail: list[str] = []
     worker_result: dict[str, Any] | None = None
     violation: str | None = None
+    analyzer_telemetry = _AnalyzerTelemetryMonitor(
+        max_idle_seconds=limits.no_progress_seconds,
+        expected_configurations=total_tus,
+    )
     stdout_eof = stderr_eof = False
     observed_groups: set[_ProcessGroupIdentity] = set()
     observed_processes: set[_ProcessIdentity] = set()
@@ -665,12 +781,21 @@ def _run_supervised(
                 except json.JSONDecodeError:
                     violation = "worker emitted non-JSON protocol output"
                 else:
-                    if event.get("event") == "tu_staged":
+                    if not isinstance(event, Mapping):
+                        violation = "worker emitted a non-object protocol payload"
+                    elif event.get("event") == "analyzer_pipeline":
+                        try:
+                            analyzer_telemetry.observe_payload(event)
+                        except (RuntimeError, ValueError) as error:
+                            violation = f"invalid analyzer pipeline telemetry: {error}"
+                    elif event.get("event") == "tu_staged":
                         completed_tus = int(event["completed"])
                     elif event.get("event") == "result":
                         worker_result = event["result"]
                     elif event.get("event") == "error":
                         violation = str(event.get("message", "worker failed"))
+                    elif event.get("event") != "phase":
+                        violation = "worker emitted an unknown protocol event"
             elapsed = time.monotonic() - started
             tree = _process_tree_metrics(process.pid)
             # Descendants can reparent or create their own sessions before failure cleanup.
@@ -690,6 +815,13 @@ def _run_supervised(
             )
             if violation is None:
                 violation = current
+            if violation is None:
+                try:
+                    # Analyzer events are transition-based, so enforce open idle
+                    # intervals even while the child emits no protocol records.
+                    analyzer_telemetry.check()
+                except (RuntimeError, ValueError) as error:
+                    violation = f"analyzer slot idle gate failed: {error}"
             signature = (completed_tus, database_bytes, tree.cpu_ticks)
             if signature != last_signature:
                 last_signature = signature
@@ -737,8 +869,13 @@ def _run_supervised(
     if return_code != 0 or worker_result is None:
         detail = stderr_tail[-1] if stderr_tail else f"exit {return_code}"
         raise RuntimeError(f"canary worker failed: {detail}")
+    try:
+        analyzer_report = analyzer_telemetry.success_report()
+    except (RuntimeError, ValueError) as error:
+        raise RuntimeError(f"analyzer pipeline telemetry did not finish safely: {error}") from None
     return {
         **worker_result,
+        "analyzer_pipeline": analyzer_report,
         "elapsed_seconds": time.monotonic() - started,
         "peak_rss_bytes": peak_rss,
         "peak_swap_bytes": peak_swap,
@@ -768,8 +905,20 @@ class _ObservedIngestor:
             _worker_event("tu_staged", completed=completed, total=self.total)
 
 
+_WORKER_EVENT_LOCK = threading.Lock()
+
+
+def _write_worker_payload(payload: Mapping[str, Any]) -> None:
+    with _WORKER_EVENT_LOCK:
+        print(json.dumps(dict(payload), sort_keys=True), flush=True)
+
+
 def _worker_event(event: str, **fields: Any) -> None:
-    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
+    _write_worker_payload({"event": event, **fields})
+
+
+def _worker_analyzer_event(event: AnalyzerPipelineEvent) -> None:
+    _write_worker_payload(event.to_protocol_payload())
 
 
 def _ordered_public_result_digest(result: Any) -> str:
@@ -870,6 +1019,7 @@ def _run_worker(spec_path: Path) -> int:
             client,
             max_workers=int(spec["workers"]),
             profile=profile,
+            observer=_worker_analyzer_event,
         )
         variant = BuildVariant("default", cdb)
         scope = BuildScope((variant.name,))
@@ -1137,6 +1287,12 @@ def run_canary(
             # Never publish success while an analyzer descendant observed by the supervisor lives.
             if measured.get("process_group_clean") is not True:
                 raise RuntimeError("canary worker process tree was not cleaned up")
+            _validate_analyzer_pipeline_report(
+                measured.get("analyzer_pipeline"),
+                expected_configurations=expected_translation_units,
+                expected_slots=min(workers, expected_translation_units),
+                max_idle_seconds=limits.no_progress_seconds,
+            )
             if measured["completed_translation_units"] != expected_translation_units:
                 raise RuntimeError("worker did not stage every selected translation unit")
             _validate_profile_provenance(

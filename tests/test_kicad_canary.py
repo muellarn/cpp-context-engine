@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from cpp_context_engine import kicad_canary
+from cpp_context_engine.ingestion import AnalyzerPipelineEvent, AnalyzerSlotIdleError
 from cpp_context_engine.kicad_canary import (
     CanaryLimits,
     _compare_baseline,
@@ -28,6 +29,318 @@ from cpp_context_engine.models import IndexProfile
 def _write_cdb(path: Path, entries: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entries), encoding="utf-8")
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _pipeline_event(
+    sequence: int,
+    at: float,
+    kind: str,
+    *,
+    slot_id: int | None = None,
+    configuration_index: int | None = None,
+    outcome: str | None = None,
+    unscheduled_count: int = 4,
+    held_registries: int = 0,
+    max_spool_registries: int = 4,
+    slot_count: int = 2,
+) -> AnalyzerPipelineEvent:
+    return AnalyzerPipelineEvent(
+        sequence=sequence,
+        monotonic_seconds=at,
+        kind=kind,
+        slot_id=slot_id,
+        configuration_index=configuration_index,
+        outcome=outcome,
+        unscheduled_count=unscheduled_count,
+        held_registries=held_registries,
+        max_spool_registries=max_spool_registries,
+        slot_count=slot_count,
+    )
+
+
+def _successful_pipeline_report(
+    *, configuration_count: int, slot_count: int, max_idle_seconds: float
+) -> dict[str, object]:
+    return {
+        "protocol": "analyzer_pipeline",
+        "clock": "monotonic",
+        "event_count": configuration_count * 2 + 1,
+        "configuration_count": configuration_count,
+        "max_idle_seconds": max_idle_seconds,
+        "slots": [
+            {
+                "slot_id": slot_id,
+                "state": "idle",
+                "configuration_index": slot_id,
+                "outcome": "succeeded",
+                "maximum_idle_seconds": 0.0,
+                "maximum_idle_cause": None,
+                "idle_cause": None,
+            }
+            for slot_id in range(slot_count)
+        ],
+    }
+
+
+def test_canary_child_wires_exact_analyzer_protocol_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    event = _pipeline_event(1, 1.0, "scheduling_state")
+
+    class Client:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def probe(self) -> object:
+            return object()
+
+    def ingestor(*_args, observer=None, **_kwargs):
+        assert observer is not None
+        observer(event)
+        raise RuntimeError("stop after observer wiring")
+
+    monkeypatch.setattr(kicad_canary, "NativeAnalyzerClient", Client)
+    monkeypatch.setattr(kicad_canary, "NativeClangIngestor", ingestor)
+    spec = tmp_path / "worker.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "project_root": str(tmp_path),
+                "compilation_database": str(tmp_path / "compile_commands.json"),
+                "database": str(tmp_path / "index.db"),
+                "analyzer": str(tmp_path / "analyzer"),
+                "translation_units": 1,
+                "workers": 1,
+                "analyzer_timeout_seconds": 1,
+                "embedding_dimensions": 1,
+                "queries": [],
+                "profile": "navigation",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert kicad_canary._run_worker(spec) == 2
+    payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert payloads[0] == event.to_protocol_payload()
+    assert payloads[1]["event"] == "error"
+
+
+def test_canary_monitor_detects_hidden_idle_slot_from_child_protocol() -> None:
+    clock = _Clock()
+    monitor = kicad_canary._AnalyzerTelemetryMonitor(
+        max_idle_seconds=10.0, expected_configurations=4, clock=clock
+    )
+    events = (
+        _pipeline_event(1, 0.0, "scheduling_state"),
+        _pipeline_event(2, 0.0, "analyzer_started", slot_id=0, configuration_index=0),
+        _pipeline_event(3, 0.0, "analyzer_started", slot_id=1, configuration_index=1),
+        _pipeline_event(
+            4,
+            1.0,
+            "analyzer_finished",
+            slot_id=0,
+            configuration_index=0,
+            outcome="succeeded",
+        ),
+        _pipeline_event(
+            5,
+            5.0,
+            "analyzer_finished",
+            slot_id=1,
+            configuration_index=1,
+            outcome="succeeded",
+        ),
+        _pipeline_event(6, 5.0, "analyzer_started", slot_id=1, configuration_index=2),
+    )
+    for event in events:
+        monitor.observe_payload(event.to_protocol_payload())
+
+    clock.now = 12.0
+    with pytest.raises(AnalyzerSlotIdleError, match=r"slot 0.*11\.000"):
+        monitor.check()
+
+
+def test_canary_monitor_pauses_for_full_spool_and_fully_scheduled_work() -> None:
+    clock = _Clock()
+    monitor = kicad_canary._AnalyzerTelemetryMonitor(
+        max_idle_seconds=10.0, expected_configurations=1, clock=clock
+    )
+    monitor.observe_payload(
+        _pipeline_event(
+            1,
+            0.0,
+            "scheduling_state",
+            unscheduled_count=2,
+            held_registries=0,
+            max_spool_registries=2,
+            slot_count=1,
+        ).to_protocol_payload()
+    )
+    clock.now = 5.0
+    monitor.check()
+    monitor.observe_payload(
+        _pipeline_event(
+            2,
+            5.0,
+            "scheduling_state",
+            unscheduled_count=2,
+            held_registries=2,
+            max_spool_registries=2,
+            slot_count=1,
+        ).to_protocol_payload()
+    )
+    clock.now = 20.0
+    monitor.check()
+    monitor.observe_payload(
+        _pipeline_event(
+            3,
+            20.0,
+            "scheduling_state",
+            unscheduled_count=1,
+            held_registries=1,
+            max_spool_registries=2,
+            slot_count=1,
+        ).to_protocol_payload()
+    )
+    clock.now = 29.0
+    monitor.check()
+    monitor.observe_payload(
+        _pipeline_event(
+            4,
+            29.0,
+            "scheduling_state",
+            unscheduled_count=0,
+            held_registries=1,
+            max_spool_registries=2,
+            slot_count=1,
+        ).to_protocol_payload()
+    )
+    clock.now = 100.0
+    monitor.check()
+    monitor.observe_payload(
+        _pipeline_event(
+            5,
+            100.0,
+            "analyzer_started",
+            slot_id=0,
+            configuration_index=0,
+            unscheduled_count=0,
+            held_registries=1,
+            max_spool_registries=2,
+            slot_count=1,
+        ).to_protocol_payload()
+    )
+    monitor.observe_payload(
+        _pipeline_event(
+            6,
+            100.0,
+            "analyzer_finished",
+            slot_id=0,
+            configuration_index=0,
+            outcome="succeeded",
+            unscheduled_count=0,
+            held_registries=1,
+            max_spool_registries=2,
+            slot_count=1,
+        ).to_protocol_payload()
+    )
+
+    assert monitor.success_report()["slots"][0]["maximum_idle_seconds"] == 9.0
+
+
+def test_canary_monitor_rejects_missing_malformed_sequence_and_active_slot() -> None:
+    clock = _Clock()
+    missing = kicad_canary._AnalyzerTelemetryMonitor(
+        max_idle_seconds=10.0, expected_configurations=1, clock=clock
+    )
+    with pytest.raises(RuntimeError, match="missing"):
+        missing.success_report()
+    with pytest.raises(ValueError, match="missing fields"):
+        missing.observe_payload({"event": "analyzer_pipeline"})
+
+    sequence = kicad_canary._AnalyzerTelemetryMonitor(
+        max_idle_seconds=10.0, expected_configurations=1, clock=clock
+    )
+    sequence.observe_payload(_pipeline_event(1, 0.0, "scheduling_state").to_protocol_payload())
+    with pytest.raises(ValueError, match="sequence"):
+        sequence.observe_payload(_pipeline_event(3, 0.0, "scheduling_state").to_protocol_payload())
+
+    active = kicad_canary._AnalyzerTelemetryMonitor(
+        max_idle_seconds=10.0, expected_configurations=1, clock=clock
+    )
+    active.observe_payload(_pipeline_event(1, 0.0, "scheduling_state").to_protocol_payload())
+    active.observe_payload(
+        _pipeline_event(
+            2, 0.0, "analyzer_started", slot_id=0, configuration_index=0
+        ).to_protocol_payload()
+    )
+    with pytest.raises(RuntimeError, match="active slot"):
+        active.success_report()
+
+
+def test_canary_monitor_success_report_is_deterministic_and_has_provenance() -> None:
+    clock = _Clock()
+    events = (
+        _pipeline_event(1, 0.0, "scheduling_state", unscheduled_count=0),
+        _pipeline_event(
+            2,
+            0.0,
+            "analyzer_started",
+            slot_id=1,
+            configuration_index=1,
+            unscheduled_count=0,
+        ),
+        _pipeline_event(
+            3,
+            0.0,
+            "analyzer_started",
+            slot_id=0,
+            configuration_index=0,
+            unscheduled_count=0,
+        ),
+        _pipeline_event(
+            4,
+            1.0,
+            "analyzer_finished",
+            slot_id=1,
+            configuration_index=1,
+            outcome="succeeded",
+            unscheduled_count=0,
+        ),
+        _pipeline_event(
+            5,
+            2.0,
+            "analyzer_finished",
+            slot_id=0,
+            configuration_index=0,
+            outcome="succeeded",
+            unscheduled_count=0,
+        ),
+    )
+    reports = []
+    clock.now = 2.0
+    for _index in range(2):
+        monitor = kicad_canary._AnalyzerTelemetryMonitor(
+            max_idle_seconds=10.0, expected_configurations=2, clock=clock
+        )
+        for event in events:
+            monitor.observe_payload(event.to_protocol_payload())
+        reports.append(monitor.success_report())
+
+    assert reports[0] == reports[1]
+    assert reports[0]["protocol"] == "analyzer_pipeline"
+    assert reports[0]["event_count"] == len(events)
+    assert [slot["slot_id"] for slot in reports[0]["slots"]] == [0, 1]
+    assert all(slot["state"] == "idle" for slot in reports[0]["slots"])
 
 
 def test_preflight_classifies_out_of_tree_generated_sources_without_rejecting_them(
@@ -154,6 +467,11 @@ def test_all_gate_retains_raw_duplicates_but_counts_normalized_configurations(
         return {
             "completed_translation_units": 2,
             "process_group_clean": True,
+            "analyzer_pipeline": _successful_pipeline_report(
+                configuration_count=2,
+                slot_count=1,
+                max_idle_seconds=1,
+            ),
             "database_provenance": {
                 "translation_unit_groups": [
                     {
@@ -447,6 +765,11 @@ def test_baseline_mismatch_never_publishes_gate_success(
         lambda *_args: {
             "completed_translation_units": 1,
             "process_group_clean": True,
+            "analyzer_pipeline": _successful_pipeline_report(
+                configuration_count=1,
+                slot_count=1,
+                max_idle_seconds=1,
+            ),
             "database_provenance": provenance,
         },
     )
@@ -510,6 +833,57 @@ def test_unclean_process_tree_never_publishes_gate_success(
     output = tmp_path / "output"
 
     with pytest.raises(RuntimeError, match="process tree"):
+        kicad_canary.run_canary(
+            project_root=project,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=output,
+            gates=(1,),
+            gate_timeouts={"1": 1.0},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            embedding_dimensions=1,
+            queries=("main",),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=1,
+        )
+
+    failed = output / ".gate-1.failed"
+    assert failed.is_dir()
+    assert not (failed / "SUCCESS").exists()
+
+
+def test_missing_analyzer_telemetry_never_publishes_gate_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(kicad_canary, "_validate_profile_provenance", lambda *_args: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_run_supervised",
+        lambda *_args: {
+            "completed_translation_units": 1,
+            "process_group_clean": True,
+            "database_provenance": {},
+        },
+    )
+    output = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="telemetry"):
         kicad_canary.run_canary(
             project_root=project,
             compilation_database=cdb,
