@@ -78,9 +78,7 @@ def test_idle_gate_detects_one_hidden_idle_slot_while_another_progresses() -> No
             outcome="succeeded",
         )
     )
-    gate.observe(
-        _event(6, 5.0, "analyzer_started", slot_id=1, configuration_index=2)
-    )
+    gate.observe(_event(6, 5.0, "analyzer_started", slot_id=1, configuration_index=2))
 
     clock.now = 12.0
     with pytest.raises(AnalyzerSlotIdleError, match=r"slot 0.*11\.000"):
@@ -221,9 +219,7 @@ class _EmptyClient:
     def probe(self) -> object:
         return object()
 
-    def analyze(
-        self, _root: Path, _configuration: BuildConfiguration
-    ) -> list[dict[str, object]]:
+    def analyze(self, _root: Path, _configuration: BuildConfiguration) -> list[dict[str, object]]:
         return []
 
 
@@ -265,9 +261,7 @@ def test_optional_observer_preserves_results_and_emits_balanced_sanitized_lifecy
     assert set(callback_threads) == {"cpp-context-telemetry"}
     assert str(tmp_path) not in "".join(str(event.to_protocol_payload()) for event in events)
     starts = {
-        event.configuration_index: event
-        for event in events
-        if event.kind == "analyzer_started"
+        event.configuration_index: event for event in events if event.kind == "analyzer_started"
     }
     finishes = {
         event.configuration_index: event for event in events if event.kind == "analyzer_finished"

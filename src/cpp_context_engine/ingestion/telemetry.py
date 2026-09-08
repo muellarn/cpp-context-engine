@@ -114,8 +114,7 @@ class AnalyzerPipelineEvent:
         missing = _PROTOCOL_FIELDS - set(payload)
         if unexpected:
             raise ValueError(
-                "analyzer telemetry payload has unexpected fields: "
-                + ", ".join(sorted(unexpected))
+                "analyzer telemetry payload has unexpected fields: " + ", ".join(sorted(unexpected))
             )
         if missing:
             raise ValueError(
@@ -245,10 +244,7 @@ class AnalyzerSlotIdleGate:
         ]
 
     def _idle_is_actionable(self) -> bool:
-        return (
-            self._unscheduled_count > 0
-            and self._held_registries < self._max_spool_registries
-        )
+        return self._unscheduled_count > 0 and self._held_registries < self._max_spool_registries
 
     def _apply_current_idle_state(self, now: float) -> None:
         assert self._slots is not None
