@@ -95,6 +95,7 @@ MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS = 5.0
 def _new_event() -> threading.Event:
     return threading.Event()
 
+
 CMAKE_COMPILATION_DATABASE_COMMAND = (
     "cmake -S <project> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
 )
