@@ -287,38 +287,59 @@ class DeepMaterializer:
             and state.summary_facts_complete
             for item in selected
         ):
-            analyzer_version = "unknown"
+            cached = self.store.deep_cached_closure(
+                closure_generation_id, identities, self.config.project_root
+            )
             if not self.store.deep_materialization_matches(
                 materialization_id, identities, self.config.project_root
             ):
-                # A token returned for already-full input must have the same
-                # durable cache mapping as a token produced by a deep overlay.
-                self.store.publish_full_profile_materialization(
-                    self.config.project_root,
-                    root_symbol_id=symbol.id,
-                    materialization_id=materialization_id,
-                    closure_generation_id=closure_generation_id,
-                    identities=identities,
-                    distances={item.translation_unit_id: item.distance for item in selected},
-                    closure_complete=closure_complete,
-                    known_tus=known,
-                    omitted_tus=omitted,
-                    limit_reason=limit_reason,
-                    analyzer_identity=analyzer_identity,
-                    analyzer_version=analyzer_version,
-                    protocol=PROTOCOL,
-                    protocol_version=PROTOCOL_VERSION,
-                    profile=IndexProfile.FULL,
-                    build_scope=requested_scope,
-                    request_control=control,
-                )
+                if cached is None:
+                    cached = self.store.publish_full_profile_materialization(
+                        self.config.project_root,
+                        root_symbol_id=symbol.id,
+                        materialization_id=materialization_id,
+                        closure_generation_id=closure_generation_id,
+                        identities=identities,
+                        distances={item.translation_unit_id: item.distance for item in selected},
+                        closure_complete=closure_complete,
+                        known_tus=known,
+                        omitted_tus=omitted,
+                        limit_reason=limit_reason,
+                        analyzer_identity=analyzer_identity,
+                        analyzer_version="unknown",
+                        protocol=PROTOCOL,
+                        protocol_version=PROTOCOL_VERSION,
+                        profile=IndexProfile.FULL,
+                        build_scope=requested_scope,
+                        request_control=control,
+                    )
+                else:
+                    # Replacing exact cache rows would cascade-delete tokens already
+                    # attached to this closure; a new root needs only another alias.
+                    cached = self.store.publish_deep_materialization_alias(
+                        self.config.project_root,
+                        root_symbol_id=symbol.id,
+                        materialization_id=materialization_id,
+                        closure_generation_id=closure_generation_id,
+                        identities=identities,
+                        distances={item.translation_unit_id: item.distance for item in selected},
+                        closure_complete=closure_complete,
+                        known_tus=known,
+                        omitted_tus=omitted,
+                        limit_reason=limit_reason,
+                        build_scope=requested_scope,
+                        request_control=control,
+                    )
+            if cached is None:
+                raise RuntimeError("full-profile cache changed before result publication")
+            cached_provenance = cached[0]
             provenance = DeepProvenance(
-                analyzer_identity=analyzer_identity,
-                analyzer_version=analyzer_version,
-                protocol=PROTOCOL,
-                protocol_version=PROTOCOL_VERSION,
-                fact_schema_version=SCHEMA_VERSION,
-                profile=IndexProfile.FULL,
+                analyzer_identity=cached_provenance.analyzer_identity,
+                analyzer_version=cached_provenance.analyzer_version,
+                protocol=cached_provenance.protocol,
+                protocol_version=cached_provenance.protocol_version,
+                fact_schema_version=cached_provenance.fact_schema_version,
+                profile=cached_provenance.profile,
                 build_scope=list(requested_scope.variants),
                 closure_generation_id=closure_generation_id,
             )

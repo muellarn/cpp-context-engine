@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -782,6 +783,102 @@ def test_full_profile_materialization_persists_token_bound_cfg_and_flow_after_re
         assert service.data_flow(
             FlowRequest(function_symbol_id="caller", materialization_id=result.materialization_id)
         ).available
+
+
+def test_full_profile_exact_closure_alias_preserves_both_root_tokens_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    _navigation, deep = _two_tu_summary_batch(root)
+    reverse_site = replace(
+        deep.callsites[0],
+        id="call-caller",
+        owner_symbol_id="callee",
+        static_target_symbol_id="caller",
+        translation_unit_id="tu-callee",
+        build_configuration_id="config-callee",
+    )
+    reverse_target = replace(
+        deep.call_targets[0],
+        id="target-caller",
+        callsite_id=reverse_site.id,
+        target_symbol_id="caller",
+        translation_unit_id="tu-callee",
+        build_configuration_id="config-callee",
+    )
+    deep = replace(
+        deep,
+        callsites=(*deep.callsites, reverse_site),
+        call_targets=(*deep.call_targets, reverse_target),
+    )
+    analyzer = tmp_path / "fake-analyzer"
+    analyzer.write_bytes(b"stable analyzer identity")
+    compilation_database = root / "compile_commands.json"
+    compilation_database.write_text("[]", encoding="utf-8")
+    database = tmp_path / "index.db"
+    config = AppConfig(
+        project_root=root,
+        index_directory=tmp_path,
+        database_path=database,
+        compilation_database=compilation_database,
+        clang_analyzer_path=analyzer,
+        index_profile=IndexProfile.FULL,
+        embedding_dimensions=32,
+    )
+
+    with SQLiteStore(database, project_root=root) as store:
+        store.apply_ingestion(root, deep, index_profile=IndexProfile.FULL)
+        materializer = DeepMaterializer(config, store)
+        monkeypatch.setattr(materializer, "_revalidate", lambda *_args: None)
+        monkeypatch.setattr(
+            materializer,
+            "_load_configurations",
+            lambda *_args: {item.id: item for item in deep.build_configurations},
+        )
+        monkeypatch.setattr(
+            "cpp_context_engine.ingestion.deep.NativeAnalyzerClient.probe",
+            lambda *_args, **_kwargs: pytest.fail("full profile must not probe Clang"),
+        )
+        publish_full = Mock(wraps=store.publish_full_profile_materialization)
+        publish_alias = Mock(wraps=store.publish_deep_materialization_alias)
+        monkeypatch.setattr(store, "publish_full_profile_materialization", publish_full)
+        monkeypatch.setattr(store, "publish_deep_materialization_alias", publish_alias)
+        first = materializer.materialize(
+            MaterializeDeepRequest(symbol_id="caller", max_tus=2, max_wall_seconds=10)
+        )
+        second = materializer.materialize(
+            MaterializeDeepRequest(symbol_id="callee", max_tus=2, max_wall_seconds=10)
+        )
+        first_identities = {item.translation_unit_id: item.identity_hash for item in first.units}
+        second_identities = {item.translation_unit_id: item.identity_hash for item in second.units}
+
+        assert first.provenance.closure_generation_id == second.provenance.closure_generation_id
+        assert publish_full.call_count == 1
+        assert publish_alias.call_count == 1
+        assert store.deep_materialization_matches(first.materialization_id, first_identities, root)
+        assert store.deep_materialization_matches(
+            second.materialization_id, second_identities, root
+        )
+
+    with SQLiteStore(database, project_root=root) as restarted_store:
+        service = AnalysisQueryService(restarted_store, root, BuildScope.single())
+        for symbol_id, materialization_id in (
+            ("caller", first.materialization_id),
+            ("callee", second.materialization_id),
+        ):
+            assert service.control_flow(
+                CfgRequest(
+                    function_symbol_id=symbol_id,
+                    materialization_id=materialization_id,
+                )
+            ).available
+            assert service.data_flow(
+                FlowRequest(
+                    function_symbol_id=symbol_id,
+                    materialization_id=materialization_id,
+                )
+            ).available
 
 
 def test_partial_token_exposes_local_data_flow_with_truthful_closure_provenance(
