@@ -494,7 +494,44 @@ class SQLiteStore:
         )
         for table_row in tables:
             table = str(table_row["name"])
-            for row in self._connection.execute(f"PRAGMA index_list({_quote_identifier(table)})"):
+            indexes = tuple(
+                self._connection.execute(f"PRAGMA index_list({_quote_identifier(table)})")
+            )
+            foreign_keys: dict[int, list[tuple[int, str]]] = {}
+            for row in self._connection.execute(
+                f"PRAGMA foreign_key_list({_quote_identifier(table)})"
+            ):
+                foreign_keys.setdefault(int(row[0]), []).append((int(row[1]), str(row[3])))
+            index_columns = {
+                str(row["name"]): tuple(
+                    column[2]
+                    for column in self._connection.execute(
+                        f"PRAGMA index_info({_quote_identifier(str(row['name']))})"
+                    )
+                )
+                for row in indexes
+                if not row["partial"] and foreign_keys
+            }
+            retained = {str(row["name"]) for row in indexes if row["unique"]}
+            # Deferred FK debt makes later parent INSERTs consult existing children.
+            # Keep one full lookup per FK; dropping it turns ingestion quadratic.
+            for columns in sorted(
+                (tuple(column for _, column in sorted(key)) for key in foreign_keys.values()),
+                key=lambda columns: (-len(columns), columns),
+            ):
+                candidates = [
+                    name
+                    for name, prefix in index_columns.items()
+                    if prefix[: len(columns)] == columns
+                ]
+                if candidates:
+                    retained.add(
+                        min(
+                            candidates,
+                            key=lambda name: (name not in retained, len(index_columns[name]), name),
+                        )
+                    )
+            for row in indexes:
                 name = str(row["name"])
                 unique = bool(row["unique"])
                 origin = str(row["origin"])
@@ -504,9 +541,12 @@ class SQLiteStore:
                     and not unique
                     and table in _BULK_INGESTION_TABLES
                     and create_sql is not None
+                    and name not in retained
                 )
                 if origin in {"pk", "u"} or unique:
                     reason = "primary/unique constraint required during insertion"
+                elif name in retained:
+                    reason = "foreign-key lookup required during deferred insertion"
                 elif deferred:
                     reason = "non-unique secondary index on a bulk-ingestion table"
                 elif table.startswith(("symbol_fts_", "symbol_variant_fts_")):
