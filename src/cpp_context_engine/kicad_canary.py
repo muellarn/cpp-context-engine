@@ -938,6 +938,9 @@ class _PhaseMeasurements:
         self.starts: list[float | None] = [None] * len(self.names)
         self.ends: list[float | None] = [None] * len(self.names)
         self.current = -1
+        self.operation_names = ("restore_deferred_indexes", "refresh_summaries")
+        self.operation_starts: list[float | None] = [None, None]
+        self.operation_ends: list[float | None] = [None, None]
         self.counts: dict[str, Any] = {
             "selected_tus": total_tus,
             "staged_tus": total_tus if stage == "validation" else 0,
@@ -949,6 +952,11 @@ class _PhaseMeasurements:
         next_index = self.current + 1
         if next_index >= len(self.names) or self.names[next_index] != name:
             raise ValueError("out-of-order worker phase")
+        if self.current == 1 and any(
+            start is not None and end is None
+            for start, end in zip(self.operation_starts, self.operation_ends, strict=True)
+        ):
+            raise ValueError("worker phase advanced before operation completion")
         if self.current >= 0:
             self.ends[self.current] = timestamp
         self.current = next_index
@@ -988,6 +996,23 @@ class _PhaseMeasurements:
             # A partially staged stream has not reached the global finalization tail.
             if changed:
                 self._advance("post_tu_finalization", timestamp)
+        elif kind == "post_tu_operation":
+            if self.current != 1 or event.get("name") not in self.operation_names:
+                raise ValueError("operation outside post-TU finalization")
+            index = self.operation_names.index(event["name"])
+            if event.get("status") == "started":
+                if any(start is not None for start in self.operation_starts[index:]) or any(
+                    start is not None and end is None
+                    for start, end in zip(self.operation_starts, self.operation_ends, strict=True)
+                ):
+                    raise ValueError("out-of-order post-TU operation")
+                self.operation_starts[index] = timestamp
+            elif event.get("status") == "completed":
+                if self.operation_starts[index] is None or self.operation_ends[index] is not None:
+                    raise ValueError("post-TU completion without active operation")
+                self.operation_ends[index] = timestamp
+            else:
+                raise ValueError("unknown post-TU operation status")
         elif kind == "result":
             if self.current != len(self.names) - 1 or self.ends[self.current] is not None:
                 raise ValueError("worker result before all measurement phases")
@@ -1006,25 +1031,48 @@ class _PhaseMeasurements:
         return changed
 
     def snapshot(self) -> dict[str, Any]:
-        phases = []
-        for name, start, end in zip(self.names, self.starts, self.ends, strict=True):
-            phases.append(
-                {
-                    "name": name,
-                    "status": "not_started"
-                    if start is None
-                    else "incomplete"
-                    if end is None
-                    else "complete",
-                    "start_seconds": None if start is None else start - self.started,
-                    "end_seconds": None if end is None else end - self.started,
-                    "duration_seconds": None if end is None else end - start,
-                    "observed_seconds": None
-                    if start is None
-                    else (end if end is not None else self.last_timestamp) - start,
-                }
+        def interval(name: str, start: float | None, end: float | None) -> dict[str, Any]:
+            return {
+                "name": name,
+                "status": "not_started"
+                if start is None
+                else "incomplete"
+                if end is None
+                else "complete",
+                "start_seconds": None if start is None else start - self.started,
+                "end_seconds": None if end is None else end - self.started,
+                "duration_seconds": None if end is None else end - start,
+                "observed_seconds": None
+                if start is None
+                else (end if end is not None else self.last_timestamp) - start,
+            }
+
+        phases = [
+            interval(name, start, end)
+            for name, start, end in zip(self.names, self.starts, self.ends, strict=True)
+        ]
+        result = {"phases": phases, "counts": dict(self.counts)}
+        if self.names[0] == "tu_processing":
+            operations = [
+                interval(name, start, end)
+                for name, start, end in zip(
+                    self.operation_names, self.operation_starts, self.operation_ends, strict=True
+                )
+            ]
+            result["post_tu_operations"] = operations
+            duration = phases[1]["duration_seconds"]
+            # These intervals are nested within the phase, not additional time.
+            result["post_tu_unattributed_seconds"] = (
+                None
+                if duration is None
+                else duration
+                - sum(
+                    operation["duration_seconds"]
+                    for operation in operations
+                    if operation["duration_seconds"] is not None
+                )
             )
-        return {"phases": phases, "counts": dict(self.counts)}
+        return result
 
 
 def _run_supervised(
@@ -1138,6 +1186,7 @@ def _run_supervised(
                     if isinstance(event, Mapping) and event.get("event") in {
                         "phase",
                         "tu_staged",
+                        "post_tu_operation",
                         "result",
                         "error",
                     }:
@@ -1162,6 +1211,8 @@ def _run_supervised(
                             phase = "complete"
                     elif event.get("event") == "error":
                         violation = str(event.get("message", "worker failed"))
+                    elif event.get("event") == "post_tu_operation":
+                        pass  # Validated and persisted by the existing phase measurements above.
                     elif event.get("event") == "phase":
                         if event.get("name") not in {
                             "index",
@@ -1318,6 +1369,10 @@ def _write_worker_payload(payload: Mapping[str, Any]) -> None:
 
 def _worker_event(event: str, **fields: Any) -> None:
     _write_worker_payload({"event": event, "monotonic_seconds": time.monotonic(), **fields})
+
+
+def _worker_finalization_event(name: str, status: str) -> None:
+    _worker_event("post_tu_operation", name=name, status=status)
 
 
 def _worker_analyzer_event(event: AnalyzerPipelineEvent) -> None:
@@ -1601,7 +1656,12 @@ def _run_worker(spec_path: Path) -> int:
         ) as store:
             indexing = ProjectIndexer(
                 _ObservedIngestor(ingestor, total), store, profile=profile
-            ).index(project, cdb, build_variant=variant)
+            ).index(
+                project,
+                cdb,
+                build_variant=variant,
+                finalization_observer=_worker_finalization_event,
+            )
             _worker_event("phase", name="embeddings", indexing=asdict(indexing))
             embedded = SQLiteVectorSearch(
                 store,

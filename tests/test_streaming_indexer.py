@@ -138,6 +138,94 @@ def test_project_indexer_consumes_tu_batches_without_project_wide_batch(tmp_path
     assert ingestor.yielded == 120
 
 
+@pytest.mark.parametrize(
+    "fresh,failure",
+    [(True, None), (True, "restore_deferred_indexes"), (True, "refresh_summaries"), (False, None)],
+)
+def test_finalization_observer_boundaries_and_rollback(
+    tmp_path: Path, monkeypatch, fresh, failure
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    cdb = _database(root, 1)
+    events = []
+    clock = 1
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        if not fresh:
+            ProjectIndexer(_StreamingOnlyIngestor(), store).index(root, cdb)
+        before = _semantic_dump(store)
+        for method, name in [
+            ("_restore_fresh_generation_indexes", "restore_deferred_indexes"),
+            ("_refresh_summary_solutions", "refresh_summaries"),
+        ]:
+            original = getattr(store, method)
+
+            def operation(*args, _original=original, _name=name):
+                nonlocal clock
+                assert events[-1] == (_name, "started", clock)
+                result = _original(*args)
+                clock += 2
+                if failure == _name:
+                    raise RuntimeError("operation failed")
+                return result
+
+            monkeypatch.setattr(store, method, operation)
+
+        def observer(name, status):
+            assert store._connection.in_transaction
+            events.append((name, status, clock))
+
+        indexer = ProjectIndexer(_StreamingOnlyIngestor(), store)
+        if failure:
+            with pytest.raises(RuntimeError, match="operation failed"):
+                indexer.index(root, cdb, finalization_observer=observer)
+            assert _semantic_dump(store) == before
+        else:
+            indexer.index(root, cdb, finalization_observer=observer)
+        expected = []
+        at = 1
+        for name in (["restore_deferred_indexes"] if fresh else []) + ["refresh_summaries"]:
+            expected.append((name, "started", at))
+            at += 2
+            if failure == name:
+                break
+            expected.append((name, "completed", at))
+        assert events == expected
+        assert not store._connection.in_transaction
+
+
+def test_finalization_observer_failure_rolls_back_completed_operations(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    cdb = _database(root, 1)
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        before = _semantic_dump(store)
+        indexes = list(
+            store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+            )
+        )
+
+        def observer(name, status):
+            if name == "refresh_summaries" and status == "completed":
+                raise RuntimeError("observer failed after refresh")
+
+        with pytest.raises(RuntimeError, match="observer failed"):
+            ProjectIndexer(_StreamingOnlyIngestor(), store).index(
+                root, cdb, finalization_observer=observer
+            )
+        assert _semantic_dump(store) == before
+        assert (
+            list(
+                store._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+                )
+            )
+            == indexes
+        )
+        assert not store._connection.in_transaction
+
+
 def test_staged_batch_is_released_before_waiting_for_the_next_batch(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
