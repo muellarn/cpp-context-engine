@@ -147,7 +147,10 @@ def index_project(
     provider = embedding_provider(config)
     scope = BuildScope(tuple(variant.name for variant in config.build_variants))
     with SQLiteStore.indexing_generation(
-        config.database_path, project_root=config.project_root, build_scope=scope
+        config.database_path,
+        project_root=config.project_root,
+        build_scope=scope,
+        cancelled=cancelled,
     ) as store:
         if config.clang_analyzer_path is not None:
             client = NativeAnalyzerClient(

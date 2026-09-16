@@ -407,6 +407,7 @@ class SQLiteStore:
         *,
         project_root: Path | None = None,
         build_scope: BuildScope | None = None,
+        cancelled: threading.Event | None = None,
     ) -> Iterator[SQLiteStore]:
         """Stage a missing database privately; existing databases retain WAL readers.
 
@@ -445,6 +446,8 @@ class SQLiteStore:
             raise FileExistsError("SQLite sidecar appeared at fresh generation destination")
         # Linking on the same filesystem publishes atomically and refuses a racing writer.
         # The connection is closed first so no WAL can be opened under the staging name.
+        # Cancellation may arrive during WAL restoration or close, after runtime's last check.
+        _check_index_cancelled(cancelled)
         os.link(staged, path)
         staged.unlink()
         private.rmdir()
