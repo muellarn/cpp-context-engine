@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
@@ -118,6 +119,27 @@ def _write_final_canary_database(path: Path) -> None:
         )
         connection.execute("CREATE TABLE build_variants (name TEXT, index_profile TEXT)")
         connection.execute("INSERT INTO build_variants VALUES ('default', 'navigation')")
+
+
+@pytest.fixture
+def inline_validator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing artifact fault injection local; subprocess guards have separate tests."""
+
+    def validate(spec_path, _directory, _limits, _total):
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        kicad_canary._validate_gate_spec(spec)
+        return {
+            "validated": True,
+            "process_group_clean": True,
+            "elapsed_seconds": 0,
+            "total_elapsed_seconds": 0,
+            "peak_rss_bytes": 0,
+            "peak_swap_bytes": 0,
+            "peak_database_bytes": 0,
+            "peak_disk_bytes": 0,
+        }
+
+    monkeypatch.setattr(kicad_canary, "_run_validation_supervised", validate)
 
 
 def test_canary_child_wires_exact_analyzer_protocol_observer(
@@ -463,7 +485,7 @@ def test_preflight_classifies_out_of_tree_generated_sources_without_rejecting_th
 
 
 def test_all_gate_forwards_only_explicit_generated_roots(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inline_validator: None
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -644,7 +666,7 @@ def test_gate_subset_is_deterministic_and_retains_original_working_directory(
 
 
 def test_all_gate_retains_raw_duplicates_but_counts_normalized_configurations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inline_validator: None
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -806,6 +828,261 @@ def test_baseline_accepts_independent_artifacts_with_equal_semantics(tmp_path: P
     assert gates[0]["semantic_snapshot"] == gates[1]["semantic_snapshot"]
     assert gates[0]["database_artifact_sha256"] != gates[1]["database_artifact_sha256"]
     kicad_canary._compare_baseline_gate(gates[0], gates[1])
+
+
+@pytest.mark.parametrize("phase", ["index", "embeddings"])
+@pytest.mark.parametrize("checkpoint", [601, 1801])
+def test_checkpoint_rejects_unknown_remaining_work(
+    phase: str, checkpoint: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    events = [{"event": "phase", "name": "index"}]
+    if phase == "embeddings":
+        events.extend(
+            [
+                {"event": "tu_staged", "completed": 1},
+                {"event": "phase", "name": "embeddings"},
+            ]
+        )
+    phase_events = len(events)
+    events.append({"event": "result", "result": {}})
+
+    class Process:
+        pid = 999999
+        stdout = io.StringIO("".join(json.dumps(event) + "\n" for event in events))
+        stderr = io.StringIO("")
+
+        def poll(self):
+            return 0
+
+        def wait(self, **_kwargs):
+            return 0
+
+    samples = 0
+
+    def database_size(_path):
+        nonlocal samples
+        samples += 1
+        if samples >= phase_events:
+            clock.now = checkpoint
+        return 0
+
+    monkeypatch.setattr(kicad_canary.time, "monotonic", clock)
+    monkeypatch.setattr(kicad_canary.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(kicad_canary, "_database_size", database_size)
+    monkeypatch.setattr(kicad_canary, "_directory_size", lambda _path: 0)
+    monkeypatch.setattr(
+        kicad_canary, "_process_tree_metrics", lambda _pid: kicad_canary._TreeMetrics(0, 0, 0, ())
+    )
+    monkeypatch.setattr(kicad_canary, "_terminate_process_group", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_AnalyzerTelemetryMonitor",
+        lambda **_kwargs: SimpleNamespace(check=lambda: None, success_report=lambda: {}),
+    )
+    (tmp_path / "spec.json").write_text('{"full_project": true}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="projection.*unknown|unknown.*projection"):
+        kicad_canary._run_supervised(
+            tmp_path / "spec.json", tmp_path, CanaryLimits(wall_seconds=5400), 1
+        )
+
+
+def test_post_worker_validation_cannot_publish_after_gate_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inline_validator: None
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    clock = _Clock()
+
+    def validation(**_kwargs):
+        clock.now = 2
+
+    monkeypatch.setattr(kicad_canary.time, "monotonic", clock)
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(kicad_canary, "_revalidate_final_artifacts", validation)
+    monkeypatch.setattr(kicad_canary, "_validate_profile_provenance", lambda *_args: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_validated_artifact_publication",
+        lambda *_args: kicad_canary.contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        kicad_canary,
+        "_run_supervised",
+        lambda *_args: {
+            "completed_translation_units": 1,
+            "process_group_clean": True,
+            "database_provenance": {},
+            "analyzer_pipeline": _successful_pipeline_report(
+                configuration_count=1, slot_count=1, max_idle_seconds=1
+            ),
+        },
+    )
+    output = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="wall|deadline"):
+        kicad_canary.run_canary(
+            project_root=project,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=output,
+            gates=(1,),
+            gate_timeouts={"1": 1.0},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            embedding_dimensions=1,
+            queries=(),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=1,
+        )
+    assert not (output / "gate-1/SUCCESS").exists()
+
+
+@pytest.mark.parametrize("fault", ["deadline", "rss", "swap"])
+def test_validator_subprocess_limits_reap_owned_descendants(
+    fault: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launch = subprocess.Popen
+    metrics = kicad_canary._process_tree_metrics
+    workers: list[subprocess.Popen] = []
+    descendants: set[int] = set()
+    limits = CanaryLimits(wall_seconds=5)
+
+    def launch_validator(_command, **kwargs):
+        worker = launch(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess,sys,time; "
+                "subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'], "
+                "start_new_session=True); time.sleep(30)",
+            ],
+            **kwargs,
+        )
+        workers.append(worker)
+        return worker
+
+    def sampled(root):
+        tree = metrics(root)
+        if workers and root == workers[0].pid:
+            descendants.update(pid for pid in tree.live_pids if pid != root)
+        if root == os.getpid() and descendants:
+            return kicad_canary.replace(
+                tree,
+                rss=limits.rss_bytes + 1 if fault == "rss" else tree.rss,
+                swap=1 if fault == "swap" else tree.swap,
+            )
+        return tree
+
+    monkeypatch.setattr(kicad_canary.subprocess, "Popen", launch_validator)
+    monkeypatch.setattr(kicad_canary, "_process_tree_metrics", sampled)
+    spec = tmp_path / "validation-spec.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "supervision_stage": "validation",
+                "gate_started_monotonic": kicad_canary.time.monotonic(),
+                "total_wall_seconds": 0.4 if fault == "deadline" else 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    reason = {"deadline": "end-to-end", "rss": "RSS", "swap": "swap"}[fault]
+
+    with pytest.raises(RuntimeError, match=reason):
+        kicad_canary._run_validation_supervised(spec, tmp_path, limits, 1)
+
+    assert descendants
+    assert all(worker.poll() is not None for worker in workers)
+    assert all(not _process_group_live(pid) for pid in descendants)
+    assert not (tmp_path / "SUCCESS").exists()
+
+
+def test_validation_child_never_constructs_native_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    called: list[str] = []
+    spec = tmp_path / "validation-spec.json"
+    spec.write_text('{"supervision_stage":"validation"}', encoding="utf-8")
+    monkeypatch.setattr(
+        kicad_canary, "_validate_gate_spec", lambda _spec: called.append("validator")
+    )
+    monkeypatch.setattr(
+        kicad_canary,
+        "NativeAnalyzerClient",
+        lambda *_args, **_kwargs: pytest.fail("validator must not start a producer"),
+    )
+
+    assert kicad_canary._run_worker(spec) == 0
+    assert called == ["validator"]
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result == {"event": "result", "result": {"validated": True}}
+
+
+@pytest.mark.parametrize("missing", ["database", "disk", "both"])
+def test_all_cli_requires_explicit_artifact_budgets_before_run(
+    missing: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(kicad_canary, "run_canary", lambda **_kwargs: pytest.fail("must not run"))
+    args = [
+        "--project-root",
+        "/unused/project",
+        "--compile-commands",
+        "/unused/cdb.json",
+        "--clang-analyzer",
+        "/unused/analyzer",
+        "--output-directory",
+        "/unused/output",
+        "--gates",
+        "all",
+    ]
+    if missing == "database":
+        args.extend(["--disk-limit-mib", "65536"])
+    elif missing == "disk":
+        args.extend(["--database-limit-mib", "49152"])
+    assert kicad_canary.main(args) == 2
+    assert "explicit" in capsys.readouterr().err
+
+
+def test_sample_worker_and_total_deadlines_remain_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(kicad_canary, "run_canary", lambda **kwargs: observed.update(kwargs) or {})
+    assert (
+        kicad_canary.main(
+            [
+                "--project-root",
+                "/unused/project",
+                "--compile-commands",
+                "/unused/cdb.json",
+                "--clang-analyzer",
+                "/unused/analyzer",
+                "--output-directory",
+                "/unused/output",
+                "--gates",
+                "32",
+            ]
+        )
+        == 0
+    )
+    assert observed["gate_timeouts"]["32"] == 150
+    assert observed["total_gate_timeouts"]["32"] == 180
+    assert observed["database_bytes"] == 550 * 1024**2
+    assert observed["disk_bytes"] == 1024**3
 
 
 def test_full_database_provenance_requires_clang_and_every_deep_coverage_flag(
@@ -1089,7 +1366,7 @@ def test_public_summary_ordering_reports_navigation_unavailability() -> None:
 
 
 def test_baseline_mismatch_never_publishes_gate_success(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inline_validator: None
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -1359,7 +1636,7 @@ def test_missing_analyzer_telemetry_never_publishes_gate_success(
     ],
 )
 def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
-    tamper: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tamper: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inline_validator: None
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -1560,6 +1837,7 @@ def test_cli_rejects_nonfinite_limits_before_run(
         ("disk_bytes", 0),
         ("no_progress_seconds", float("inf")),
         ("gate_timeouts", {"1": float("-inf")}),
+        ("total_gate_timeouts", {"1": float("inf")}),
     ],
 )
 def test_run_configuration_rejects_invalid_numbers_before_supervisor(
