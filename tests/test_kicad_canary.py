@@ -777,8 +777,8 @@ def test_preflight_rejects_missing_sources_and_numeric_gates_deduplicate_tus(
         inspect_compilation_database(project, cdb)
 
 
-def test_semantic_snapshot_ignores_volatile_timestamp_and_database_location(tmp_path: Path) -> None:
-    digests: list[str] = []
+def test_baseline_accepts_independent_artifacts_with_equal_semantics(tmp_path: Path) -> None:
+    gates: list[dict[str, object]] = []
     for position, timestamp in enumerate(("first", "second")):
         database = tmp_path / str(position) / "index.db"
         database.parent.mkdir()
@@ -794,9 +794,18 @@ def test_semantic_snapshot_ignores_volatile_timestamp_and_database_location(tmp_
                 "INSERT INTO build_variants VALUES ('default', ?)",
                 (str(database.parent / "compile_commands.json"),),
             )
-        digests.append(semantic_snapshot(database)["digest"])
+        connection.close()
+        gates.append(
+            {
+                "gate": 1,
+                "semantic_snapshot": semantic_snapshot(database),
+                "database_artifact_sha256": kicad_canary._database_artifact_digest(database).sha256,
+            }
+        )
 
-    assert digests[0] == digests[1]
+    assert gates[0]["semantic_snapshot"] == gates[1]["semantic_snapshot"]
+    assert gates[0]["database_artifact_sha256"] != gates[1]["database_artifact_sha256"]
+    kicad_canary._compare_baseline_gate(gates[0], gates[1])
 
 
 def test_full_database_provenance_requires_clang_and_every_deep_coverage_flag(
@@ -887,10 +896,6 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
                 coverage="different"
             ),
             "database_provenance",
-        ),
-        (
-            lambda baseline: baseline["gates"][0].update(database_artifact_sha256="different"),
-            "database_artifact_sha256",
         ),
         (
             lambda baseline: baseline["gates"][0].update(database_integrity="different"),

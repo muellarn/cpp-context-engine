@@ -1537,6 +1537,8 @@ def _compare_baseline_header(report: Mapping[str, Any], baseline: Mapping[str, A
 
 def _compare_baseline_gate(gate: Mapping[str, Any], baseline_gate: Mapping[str, Any]) -> None:
     key = str(gate.get("gate"))
+    # Independent SQLite files contain different timestamps and output paths;
+    # physical hashes protect each artifact's validation/publication, not parity.
     for field in (
         "selection",
         "raw_cdb_entries",
@@ -1548,7 +1550,6 @@ def _compare_baseline_gate(gate: Mapping[str, Any], baseline_gate: Mapping[str, 
         "public_orderings",
         "summary_orderings",
         "database_provenance",
-        "database_artifact_sha256",
         "database_sidecar_policy",
         "database_integrity",
         "analyzer",
