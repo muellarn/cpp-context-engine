@@ -165,6 +165,118 @@ def test_partial_tu_failure_does_not_start_finalization(phase_worker, tmp_path: 
     assert all(phase["status"] == "not_started" for phase in measured["phases"][1:])
 
 
+@pytest.mark.parametrize("failure", [None, "restore_deferred_indexes", "refresh_summaries"])
+def test_post_tu_operation_measurements(phase_worker, tmp_path: Path, failure) -> None:
+    events = [
+        {"event": "phase", "name": "index", "monotonic_seconds": 1},
+        {"event": "tu_staged", "completed": 1, "monotonic_seconds": 2},
+        {"event": "tu_staged", "completed": 2, "monotonic_seconds": 3},
+    ]
+    for name, start, end in [("restore_deferred_indexes", 4, 6), ("refresh_summaries", 8, 11)]:
+        events.append(
+            {
+                "event": "post_tu_operation",
+                "name": name,
+                "status": "started",
+                "monotonic_seconds": start,
+            }
+        )
+        if failure == name:
+            events.append(
+                {"event": "error", "message": "operation failed", "monotonic_seconds": start + 1}
+            )
+            break
+        events.append(
+            {
+                "event": "post_tu_operation",
+                "name": name,
+                "status": "completed",
+                "monotonic_seconds": end,
+            }
+        )
+    if failure:
+        with pytest.raises(RuntimeError, match="operation failed"):
+            phase_worker(events)
+    else:
+        events.extend(
+            [
+                {"event": "phase", "name": "embeddings", "monotonic_seconds": 12},
+                {"event": "phase", "name": "producer_checks", "monotonic_seconds": 13},
+                {"event": "result", "result": {}, "monotonic_seconds": 14},
+            ]
+        )
+        phase_worker(events)
+    measured = json.loads((tmp_path / "phase-timings-index.json").read_text())["measurements"]
+    restore, refresh = measured["post_tu_operations"]
+    assert restore["start_seconds"] == 4
+    assert restore["duration_seconds"] == (None if failure == "restore_deferred_indexes" else 2)
+    if failure == "restore_deferred_indexes":
+        assert restore["status"] == "incomplete"
+        assert refresh["status"] == "not_started"
+        assert refresh["start_seconds"] is None
+    else:
+        assert restore["status"] == "complete"
+        assert refresh["start_seconds"] == 8
+        assert refresh["duration_seconds"] == (None if failure else 3)
+        assert refresh["status"] == ("incomplete" if failure else "complete")
+    assert measured["post_tu_unattributed_seconds"] == (None if failure else 4)
+    assert measured["phases"][1]["duration_seconds"] == (None if failure else 9)
+
+
+def test_post_tu_measurement_allows_skipped_restore() -> None:
+    measured = kicad_canary._PhaseMeasurements("index", 0, 0, 1)
+    for event in [
+        {"event": "phase", "name": "index", "monotonic_seconds": 1},
+        {"event": "tu_staged", "completed": 1, "monotonic_seconds": 2},
+        {
+            "event": "post_tu_operation",
+            "name": "refresh_summaries",
+            "status": "started",
+            "monotonic_seconds": 4,
+        },
+        {
+            "event": "post_tu_operation",
+            "name": "refresh_summaries",
+            "status": "completed",
+            "monotonic_seconds": 6,
+        },
+        {"event": "phase", "name": "embeddings", "monotonic_seconds": 8},
+    ]:
+        measured.observe(event, 20)
+    snapshot = measured.snapshot()
+    assert snapshot["post_tu_operations"][0]["status"] == "not_started"
+    assert snapshot["post_tu_operations"][0]["duration_seconds"] is None
+    assert snapshot["post_tu_unattributed_seconds"] == 4
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"event": "post_tu_operation", "name": "restore_deferred_indexes", "status": "started"},
+        {"event": "post_tu_operation", "name": "refresh_summaries", "status": "started"},
+        {"event": "post_tu_operation", "name": "refresh_summaries", "status": "completed"},
+        {"event": "phase", "name": "embeddings"},
+    ],
+)
+def test_post_tu_measurement_rejects_overlapping_or_missing_completion(bad) -> None:
+    measured = kicad_canary._PhaseMeasurements("index", 0, 0, 1)
+    for event in [
+        {"event": "phase", "name": "index", "monotonic_seconds": 1},
+        {"event": "tu_staged", "completed": 1, "monotonic_seconds": 2},
+        {
+            "event": "post_tu_operation",
+            "name": "restore_deferred_indexes",
+            "status": "started",
+            "monotonic_seconds": 3,
+        },
+    ]:
+        measured.observe(event, 20)
+    with pytest.raises(ValueError):
+        measured.observe({**bad, "monotonic_seconds": 4}, 20)
+    assert measured.snapshot()["post_tu_operations"][0]["status"] == "incomplete"
+    assert measured.snapshot()["phases"][1]["duration_seconds"] is None
+
+
 @pytest.mark.parametrize(
     "stop", ["before_index", "finalization", "embeddings", "producer_checks", "validation"]
 )

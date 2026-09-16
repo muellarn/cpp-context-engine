@@ -106,6 +106,21 @@ measurement artifacts, not forecasts: the unknown-total-ETA guard stays fail-clo
 until representative navigation samples and tail-scaling evidence support a
 separately reviewed calibration method.
 
+Index-stage measurements additionally retain `post_tu_operations` for the exact
+`restore_deferred_indexes` and `refresh_summaries` calls. Their worker-side start
+and completion events use the same monotonic clock and atomic snapshots. An
+exception or cancellation leaves the current operation incomplete (null end and
+duration); a later operation remains not started. Index restoration is omitted
+for a non-fresh generation and remains `not_started`, not a fabricated success.
+
+These intervals are **inside** `post_tu_finalization`, never added to its duration.
+`post_tu_unattributed_seconds` accounts for the remaining phase time only once the
+whole phase is complete; it stays null after an interruption. Relationship updates,
+other finalization work and commit are not silently attributed to either call.
+Completed operations mean that their calls returned, not that the transaction
+committed or publication succeeded. Observer errors preserve transaction rollback.
+These additive fields do not change historical reports, budgets or forecasts.
+
 The smaller limits are strict discovery guardrails. Each new database records:
 
 - each staged TU, phase, elapsed time and TU-only ETA (not a total forecast);

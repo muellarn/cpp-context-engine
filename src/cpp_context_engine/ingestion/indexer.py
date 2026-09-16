@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +69,7 @@ class ProjectIndexer:
         compilation_database: Path,
         *,
         build_variant: BuildVariant | None = None,
+        finalization_observer: Callable[[str, str], None] | None = None,
     ) -> IndexingResult:
         project_root = project_root.resolve(strict=False)
         variant = build_variant or BuildVariant(DEFAULT_BUILD_VARIANT, compilation_database)
@@ -135,6 +136,11 @@ class ProjectIndexer:
                 ),
                 build_variant=variant,
                 index_profile=self._profile,
+                **(
+                    {"finalization_observer": finalization_observer}
+                    if finalization_observer is not None
+                    else {}
+                ),
             )
         finally:
             close = getattr(batch_stream, "close", None)
