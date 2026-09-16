@@ -690,26 +690,41 @@ def _validate_profile_provenance(
 
 
 def _database_size(database: Path) -> int:
-    return sum(
-        path.stat().st_size
-        for path in (database, Path(f"{database}-wal"), Path(f"{database}-shm"))
-        if path.is_file()
+    databases = [database]
+    if database.parent.is_dir():
+        databases.extend(
+            private / database.name
+            for private in database.parent.iterdir()
+            if private.name.startswith(f".{database.name}.fresh-") and private.is_dir()
+        )
+    # Include unpublished generations and rollback journals, not just the final WAL path.
+    return _unique_file_bytes(
+        Path(f"{item}{suffix}") for item in databases for suffix in ("", "-wal", "-shm", "-journal")
     )
 
 
-def _directory_size(directory: Path) -> int:
+def _unique_file_bytes(paths: Iterable[Path]) -> int:
     total = 0
-    try:
-        paths = directory.rglob("*")
-        for path in paths:
-            try:
-                if path.is_file():
-                    total += path.stat().st_size
-            except OSError:
+    seen: set[tuple[int, int]] = set()
+    for path in paths:
+        try:
+            if not path.is_file():
                 continue
-    except OSError:
-        pass
+            metadata = path.stat()
+        except FileNotFoundError:
+            continue  # Publication can unlink the private hardlink during a sample.
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity not in seen:
+            seen.add(identity)
+            total += metadata.st_size
     return total
+
+
+def _directory_size(directory: Path) -> int:
+    try:
+        return _unique_file_bytes(directory.rglob("*"))
+    except FileNotFoundError:
+        return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1377,7 +1392,9 @@ def _run_worker(spec_path: Path) -> int:
         variant = BuildVariant("default", cdb, generated_source_roots=generated_source_roots)
         scope = BuildScope((variant.name,))
         _worker_event("phase", name="index")
-        with SQLiteStore(database, project_root=project, build_scope=scope) as store:
+        with SQLiteStore.indexing_generation(
+            database, project_root=project, build_scope=scope
+        ) as store:
             indexing = ProjectIndexer(
                 _ObservedIngestor(ingestor, total), store, profile=profile
             ).index(project, cdb, build_variant=variant)

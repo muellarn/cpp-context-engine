@@ -6,9 +6,11 @@ import hashlib
 import json
 import math
 import operator
+import os
 import re
 import sqlite3
 import struct
+import tempfile
 import threading
 import time
 import zlib
@@ -272,6 +274,56 @@ class SummaryPayloadError(RuntimeError):
 
 class SQLiteStore:
     """A replaceable local store with atomic translation-unit updates."""
+
+    @classmethod
+    @contextmanager
+    def indexing_generation(
+        cls,
+        path: Path,
+        *,
+        project_root: Path | None = None,
+        build_scope: BuildScope | None = None,
+    ) -> Iterator[SQLiteStore]:
+        """Stage a missing database privately; existing databases retain WAL readers.
+
+        Failed private directories are retained for inspection, never published.
+        """
+
+        if path.exists() or path.is_symlink():
+            with cls(path, project_root=project_root, build_scope=build_scope) as store:
+                yield store
+            return
+        sidecars = tuple(Path(f"{path}{suffix}") for suffix in ("-wal", "-shm", "-journal"))
+        if any(item.exists() or item.is_symlink() for item in sidecars):
+            raise FileExistsError("unowned SQLite sidecar at fresh generation destination")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        private = Path(tempfile.mkdtemp(prefix=f".{path.name}.fresh-", dir=path.parent))
+        staged = private / path.name
+        with cls(staged, project_root=project_root, build_scope=build_scope) as store:
+            # A fresh WAL commit copies the entire generation while retaining its WAL.
+            # Only our unpublished private database may avoid that duplicate footprint.
+            mode = store._connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+            if mode != "delete":
+                raise RuntimeError("private generation did not acquire rollback journaling")
+            try:
+                yield store
+                if store._connection.in_transaction:
+                    raise RuntimeError("private generation has uncommitted changes")
+            finally:
+                if store._connection.in_transaction:
+                    store._connection.rollback()
+                mode = store._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                if mode != "wal":
+                    raise RuntimeError("private generation did not restore WAL")
+        if any(item != staged for item in private.iterdir()):
+            raise RuntimeError("private generation still has SQLite sidecars")
+        if any(item.exists() or item.is_symlink() for item in sidecars):
+            raise FileExistsError("SQLite sidecar appeared at fresh generation destination")
+        # Linking on the same filesystem publishes atomically and refuses a racing writer.
+        # The connection is closed first so no WAL can be opened under the staging name.
+        os.link(staged, path)
+        staged.unlink()
+        private.rmdir()
 
     def __init__(
         self,
