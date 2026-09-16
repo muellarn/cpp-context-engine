@@ -706,6 +706,14 @@ public:
   bool shouldVisitTemplateInstantiations() const { return true; }
   bool shouldVisitImplicitCode() const { return true; }
 
+  bool TraverseDecl(clang::Decl *decl) {
+    const auto *previous = currentCallable_;
+    auto restore = llvm::make_scope_exit([&] { currentCallable_ = previous; });
+    if (const auto *function = llvm::dyn_cast_or_null<clang::FunctionDecl>(decl))
+      currentCallable_ = function;
+    return clang::RecursiveASTVisitor<Collector>::TraverseDecl(decl);
+  }
+
   bool VisitNamedDecl(clang::NamedDecl *decl) {
     auto kind = symbolKind(decl);
     if (!kind || !source_.relative(decl->getLocation()))
@@ -2779,6 +2787,10 @@ private:
   template <typename Node> const clang::FunctionDecl *enclosingCallable(const Node *node) const {
     if (!node)
       return nullptr;
+    // Template instances can share an expression's AST parent list. The active
+    // declaration is the actual owner; lambda captures retain their outer context.
+    if (currentCallable_)
+      return currentCallable_;
     clang::DynTypedNode current = clang::DynTypedNode::create(*node);
     for (unsigned depth = 0; depth < 64; ++depth) {
       auto parents = context_.getParents(current);
@@ -2845,6 +2857,7 @@ private:
   SourceFacts &source_;
   const std::vector<MacroExpansionRecord> &macroExpansions_;
   bool navigationOnly_;
+  const clang::FunctionDecl *currentCallable_ = nullptr;
   std::unordered_set<std::string> emittedSymbolFacts_;
 };
 
