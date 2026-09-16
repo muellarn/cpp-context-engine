@@ -116,6 +116,12 @@ are skipped. `search --json` returns stable symbol IDs, source files and line
 ranges, fused scores, selection reasons, and every code-graph hop used to connect
 context. It is fully local by default.
 
+Native TU reuse is bound to the SHA256 of the analyzer binary that produced it.
+After an analyzer upgrade, run `index` for each enabled build variant: changed
+binary identities and legacy TUs without producer provenance are reindexed once.
+Deep analysis refuses to relabel stale or legacy full-profile facts as current;
+refresh the index first. Navigation and on-demand Deep retain separate provenance.
+
 The default `full` profile is unchanged. For a navigation-first index, explicitly
 select `--profile navigation` (or pass `profile="navigation"` to the MCP
 `index_project` tool). It preserves files, includes, symbols, references, graph
