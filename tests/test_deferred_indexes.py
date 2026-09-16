@@ -103,6 +103,61 @@ def test_every_sqlite_index_has_an_explicit_fresh_generation_classification(
     )
 
 
+@pytest.mark.parametrize("rename_lookup", [False, True])
+def test_fresh_generation_keeps_complete_foreign_key_lookup_plans(
+    tmp_path: Path, rename_lookup: bool
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database = tmp_path / "index.db"
+    with _RecordingStore.indexing_generation(database) as store:
+        connection = store._connection  # noqa: SLF001
+        if rename_lookup:
+            connection.execute("DROP INDEX fk_lookup_data_accesses_project_id_cfg_element_id")
+            connection.execute(
+                "CREATE INDEX ordinary_element_lookup ON data_accesses(project_id, cfg_element_id)"
+            )
+        # A filtered index cannot cover every child row during deferred FK checks.
+        connection.execute(
+            "CREATE INDEX partial_element_lookup ON data_accesses(project_id, cfg_element_id) "
+            "WHERE kind = 'read'"
+        )
+        original = store._classify_schema_indexes()  # noqa: SLF001
+
+        def batches():
+            assert not database.exists()
+            assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert connection.execute("PRAGMA defer_foreign_keys").fetchone()[0] == 1
+            current = store._classify_schema_indexes()  # noqa: SLF001
+            assert set(current) < set(original)
+            assert ("data_accesses", "partial_element_lookup") not in current
+            for table in sorted({table for table, _name in original}):
+                foreign_keys: dict[int, list[tuple[int, str]]] = {}
+                for row in connection.execute(f"PRAGMA foreign_key_list({table})"):
+                    foreign_keys.setdefault(row[0], []).append((row[1], row[3]))
+                for key in foreign_keys.values():
+                    columns = [column for _sequence, column in sorted(key)]
+                    predicates = " AND ".join(f"{column} = ?" for column in columns)
+                    plan = " ".join(
+                        row[3]
+                        for row in connection.execute(
+                            f"EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE {predicates}",
+                            (1,) * len(columns),
+                        )
+                    )
+                    assert all(f"{column}=?" in plan for column in columns), (table, key, plan)
+            if rename_lookup:
+                assert ("data_accesses", "ordinary_element_lookup") in current
+            yield _batch(root)
+
+        store.apply_ingestion_batches(root, batches())
+        assert store._classify_schema_indexes() == original  # noqa: SLF001
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert database.exists()
+    with SQLiteStore(database) as published:
+        assert published.get_symbol("alpha") is not None
+
+
 def test_only_the_first_project_generation_defers_indexes(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
