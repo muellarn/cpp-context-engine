@@ -64,7 +64,6 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
         database_provenance,
         semantic_snapshot,
     )
-
     from cpp_context_engine.models import IndexProfile
 
     evidence = json.loads(input_report.read_text())
