@@ -135,16 +135,22 @@ def llm_provider(config: AppConfig) -> LLMProvider:
     )
 
 
-def index_project(config: AppConfig) -> IndexOperationResult:
+def index_project(
+    config: AppConfig, *, cancelled: threading.Event | None = None
+) -> IndexOperationResult:
     """Incrementally index compiler facts, then only missing/current vectors."""
 
     assert config.database_path is not None
+    _check_cancelled(cancelled)
     if not config.project_root.is_dir():
         raise ValueError(f"project directory does not exist: {config.project_root}")
     provider = embedding_provider(config)
     scope = BuildScope(tuple(variant.name for variant in config.build_variants))
     with SQLiteStore.indexing_generation(
-        config.database_path, project_root=config.project_root, build_scope=scope
+        config.database_path,
+        project_root=config.project_root,
+        build_scope=scope,
+        cancelled=cancelled,
     ) as store:
         if config.clang_analyzer_path is not None:
             client = NativeAnalyzerClient(
@@ -156,6 +162,9 @@ def index_project(config: AppConfig) -> IndexOperationResult:
                 max_record_bytes=config.analyzer_max_record_bytes,
                 max_stderr_bytes=config.analyzer_max_stderr_bytes,
                 profile=config.index_profile,
+                # Without the request event, an MCP cancellation can leave an
+                # active companion running until its independent timeout.
+                external_cancelled=cancelled,
             )
             info = client.probe()
             ingestor = NativeClangIngestor(
@@ -182,6 +191,7 @@ def index_project(config: AppConfig) -> IndexOperationResult:
                 config.project_root,
                 variant.compilation_database,
                 build_variant=variant,
+                cancelled=cancelled,
             )
             for variant in config.build_variants
         )
@@ -209,7 +219,9 @@ def index_project(config: AppConfig) -> IndexOperationResult:
             project_root=config.project_root,
             build_scope=scope,
         )
+        _check_cancelled(cancelled)
         embedded_symbols = vector_search.index_missing()
+        _check_cancelled(cancelled)
         return IndexOperationResult(
             indexing,
             embedded_symbols,
@@ -219,6 +231,11 @@ def index_project(config: AppConfig) -> IndexOperationResult:
             capabilities,
             config.index_profile,
         )
+
+
+def _check_cancelled(cancelled: threading.Event | None) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError("indexing was cancelled")
 
 
 def build_runtime(

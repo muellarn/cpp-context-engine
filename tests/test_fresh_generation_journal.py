@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from contextlib import closing
 from pathlib import Path
 
@@ -109,6 +110,34 @@ def test_active_database_budget_includes_rollback_journal(tmp_path: Path) -> Non
         Path(f"{database}{suffix}").write_bytes(b"x" * size)
 
     assert _database_size(database) == 1000
+
+
+def test_runtime_cancel_during_private_close_never_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _project(tmp_path)
+    cancelled = threading.Event()
+    staged_paths: list[Path] = []
+
+    class CancelOnCloseStore(SQLiteStore):
+        def close(self) -> None:
+            assert self.has_project(config.project_root)
+            assert self._connection.execute("SELECT count(*) FROM embedding_vectors").fetchone()[0]
+            staged_paths.append(self.path)
+            super().close()
+            cancelled.set()
+
+    monkeypatch.setattr(runtime, "SQLiteStore", CancelOnCloseStore)
+    monkeypatch.setattr(runtime, "ClangIngestor", lambda **_kwargs: _PayloadIngestor())
+
+    with pytest.raises(RuntimeError, match="indexing was cancelled"):
+        runtime.index_project(config, cancelled=cancelled)
+
+    assert cancelled.is_set()
+    assert not config.database_path.exists()
+    assert len(staged_paths) == 1
+    with closing(sqlite3.connect(staged_paths[0])) as reader:
+        assert reader.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
 def test_private_success_publishes_only_after_wal_restore_and_close(tmp_path: Path) -> None:
