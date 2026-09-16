@@ -16,6 +16,15 @@ binding and native library must have compatible major versions.
 
 ## Full Clang-18 analyzer companion
 
+Schema v17 records the producing native analyzer's SHA256 per translation unit,
+including its existing build/configuration scope. After upgrading the analyzer,
+run normal incremental `index` for each enabled build variant. Changed identities
+and legacy TUs with unknown provenance are reindexed even if sources and commands
+are unchanged; matching identities keep incremental hits. Full-to-Deep reuse
+rejects stale or unknown producers and requires this refresh first. Deep overlays
+retain their own binary-bound provenance without relabeling retained navigation
+facts. No wire-protocol change is required for a semantic analyzer fix.
+
 The optional `native/clang-analyzer` executable uses Clang LibTooling's full AST,
 `SourceManager`, and `PPCallbacks`. Configure it with CMake's installed LLVM and
 Clang package files, then select it explicitly:
