@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
@@ -46,6 +46,13 @@ DEFAULT_GATE_TIMEOUTS: Mapping[str, float] = {
     "4": 90.0,
     "16": 120.0,
     "32": 150.0,
+    "all": 5_400.0,
+}
+DEFAULT_TOTAL_GATE_TIMEOUTS: Mapping[str, float] = {
+    "1": 90.0,
+    "4": 120.0,
+    "16": 150.0,
+    "32": 180.0,
     "all": 5_400.0,
 }
 DEFAULT_QUERIES = ("compareVersionStrings",)
@@ -922,6 +929,15 @@ def _run_supervised(
     limits: CanaryLimits,
     total_tus: int,
 ) -> dict[str, Any]:
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    stage = spec.get("supervision_stage", "index")
+    if stage not in {"index", "validation"}:
+        raise ValueError("unknown canary supervision stage")
+    stage_started = time.monotonic()
+    started = float(spec.get("gate_started_monotonic", stage_started))
+    total_wall_seconds = float(spec.get("total_wall_seconds", limits.wall_seconds))
+    full_project = bool(spec.get("full_project", False))
+    phase = stage
     command = [
         sys.executable,
         "-m",
@@ -949,18 +965,21 @@ def _run_supervised(
     )
     for reader in readers:
         reader.start()
-    started = time.monotonic()
-    last_report = started
-    last_useful = started
+    last_report = stage_started
+    last_useful = stage_started
     last_signature: tuple[int, int, int] | None = None
-    completed_tus = 0
+    completed_tus = total_tus if stage == "validation" else 0
     peak_rss = peak_swap = peak_database = peak_disk = 0
     stderr_tail: list[str] = []
     worker_result: dict[str, Any] | None = None
     violation: str | None = None
-    analyzer_telemetry = _AnalyzerTelemetryMonitor(
-        max_idle_seconds=limits.no_progress_seconds,
-        expected_configurations=total_tus,
+    analyzer_telemetry = (
+        _AnalyzerTelemetryMonitor(
+            max_idle_seconds=limits.no_progress_seconds,
+            expected_configurations=total_tus,
+        )
+        if stage == "index"
+        else None
     )
     stdout_eof = stderr_eof = False
     observed_groups: set[_ProcessGroupIdentity] = set()
@@ -989,6 +1008,8 @@ def _run_supervised(
                         violation = "worker emitted a non-object protocol payload"
                     elif event.get("event") == "analyzer_pipeline":
                         try:
+                            if analyzer_telemetry is None:
+                                raise ValueError("validator emitted analyzer telemetry")
                             analyzer_telemetry.observe_payload(event)
                         except (RuntimeError, ValueError) as error:
                             violation = f"invalid analyzer pipeline telemetry: {error}"
@@ -996,30 +1017,42 @@ def _run_supervised(
                         completed_tus = int(event["completed"])
                     elif event.get("event") == "result":
                         worker_result = event["result"]
+                        if stage == "validation":
+                            phase = "complete"
                     elif event.get("event") == "error":
                         violation = str(event.get("message", "worker failed"))
-                    elif event.get("event") != "phase":
+                    elif event.get("event") == "phase":
+                        if event.get("name") not in {"index", "embeddings", "validation"}:
+                            violation = "worker emitted an unknown phase"
+                        else:
+                            phase = str(event["name"])
+                    else:
                         violation = "worker emitted an unknown protocol event"
-            elapsed = time.monotonic() - started
+            elapsed = time.monotonic() - stage_started
+            total_elapsed = time.monotonic() - started
             tree = _process_tree_metrics(process.pid)
             # Descendants can reparent or create their own sessions before failure cleanup.
             _remember_process_tree(observed_groups, observed_processes, tree)
+            # Count the coordinator too, but never include it in owned-child cleanup.
+            budget_tree = _process_tree_metrics(os.getpid())
             database_bytes = _database_size(database)
             disk_bytes = _directory_size(gate_directory)
-            peak_rss = max(peak_rss, tree.rss)
-            peak_swap = max(peak_swap, tree.swap)
+            peak_rss = max(peak_rss, budget_tree.rss)
+            peak_swap = max(peak_swap, budget_tree.swap)
             peak_database = max(peak_database, database_bytes)
             peak_disk = max(peak_disk, disk_bytes)
             current = limits.violation(
                 elapsed=elapsed,
-                rss=tree.rss,
-                swap=tree.swap,
+                rss=budget_tree.rss,
+                swap=budget_tree.swap,
                 database=database_bytes,
                 disk=disk_bytes,
             )
             if violation is None:
                 violation = current
-            if violation is None:
+            if violation is None and total_elapsed > total_wall_seconds:
+                violation = "end-to-end gate deadline exceeded"
+            if violation is None and analyzer_telemetry is not None:
                 try:
                     # Analyzer events are transition-based, so enforce open idle
                     # intervals even while the child emits no protocol records.
@@ -1035,19 +1068,29 @@ def _run_supervised(
                 and time.monotonic() - last_useful > limits.no_progress_seconds
             ):
                 violation = f"no observable progress for {limits.no_progress_seconds:g} seconds"
-            if completed_tus:
-                projected = elapsed * total_tus / completed_tus
-                if elapsed >= 1_800 and projected > 3_600:
+            if violation is None and full_project and completed_tus and phase != "complete":
+                projected = total_elapsed * total_tus / completed_tus
+                if total_elapsed >= 1_800 and projected > 3_600:
                     violation = "30-minute projection exceeds the 60-minute target"
-                elif elapsed >= 600 and projected > 5_400:
+                elif total_elapsed >= 600 and projected > 5_400:
                     violation = "10-minute projection exceeds the 90-minute hard limit"
+            if violation is None and full_project and total_elapsed >= 600 and phase != "complete":
+                # TU throughput cannot estimate still-unmeasured embeddings/verification.
+                violation = f"total projection unknown at decision checkpoint (phase {phase})"
             if time.monotonic() - last_report >= 5 or kind == "stdout" and completed_tus:
                 rate = completed_tus / elapsed if elapsed > 0 else 0.0
-                eta = (total_tus - completed_tus) / rate if rate > 0 else None
+                eta = (
+                    (total_tus - completed_tus) / rate
+                    if phase == "index" and 0 < completed_tus < total_tus and rate > 0
+                    else None
+                )
                 eta_text = f"{eta:.1f}s" if eta is not None else "unknown"
                 print(
-                    f"canary: {completed_tus}/{total_tus} TUs, {elapsed:.1f}s, ETA {eta_text}, "
-                    f"RSS {tree.rss / 1024**2:.1f} MiB, DB {database_bytes / 1024**2:.1f} MiB",
+                    f"canary: {completed_tus}/{total_tus} TUs, {total_elapsed:.1f}s, "
+                    f"phase {phase}, "
+                    f"TU-only ETA {eta_text}, total ETA unknown, "
+                    f"RSS {budget_tree.rss / 1024**2:.1f} MiB, "
+                    f"DB {database_bytes / 1024**2:.1f} MiB",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1074,13 +1117,14 @@ def _run_supervised(
         detail = stderr_tail[-1] if stderr_tail else f"exit {return_code}"
         raise RuntimeError(f"canary worker failed: {detail}")
     try:
-        analyzer_report = analyzer_telemetry.success_report()
+        analyzer_report = analyzer_telemetry.success_report() if analyzer_telemetry else None
     except (RuntimeError, ValueError) as error:
         raise RuntimeError(f"analyzer pipeline telemetry did not finish safely: {error}") from None
     return {
         **worker_result,
-        "analyzer_pipeline": analyzer_report,
-        "elapsed_seconds": time.monotonic() - started,
+        **({"analyzer_pipeline": analyzer_report} if analyzer_report is not None else {}),
+        "elapsed_seconds": time.monotonic() - stage_started,
+        "total_elapsed_seconds": time.monotonic() - started,
         "peak_rss_bytes": peak_rss,
         "peak_swap_bytes": peak_swap,
         "peak_database_bytes": peak_database,
@@ -1368,6 +1412,11 @@ def _validated_artifact_publication(
 def _run_worker(spec_path: Path) -> int:
     try:
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        if spec.get("supervision_stage") == "validation":
+            _worker_event("phase", name="validation")
+            _validate_gate_spec(spec)
+            _worker_event("result", result={"validated": True})
+            return 0
         project = Path(spec["project_root"])
         cdb = Path(spec["compilation_database"])
         database = Path(spec["database"])
@@ -1446,12 +1495,55 @@ def _run_worker(spec_path: Path) -> int:
                     "capabilities": sorted(info.capabilities),
                     "sha256": _sha256(analyzer),
                 },
+                "native_spool_budget_bytes": ingestor.max_spool_bytes,
             },
         )
         return 0
     except BaseException as error:
         _worker_event("error", message=f"{type(error).__name__}: {error}")
         return 2
+
+
+def _validate_gate_spec(spec: Mapping[str, Any]) -> None:
+    """Independent validator process; never run these checks in the index producer."""
+
+    database = Path(spec["database"])
+    subset = Path(spec["compilation_database"])
+    source_cdb = Path(spec["source_compilation_database"])
+    gate_report = spec["gate_report"]
+    validated = _revalidate_final_artifacts(
+        project_root=Path(spec["project_root"]),
+        subset=subset,
+        expected_subset=SubsetDatabase(**spec["subset_metadata"]),
+        database=database,
+        analyzer=Path(spec["analyzer"]),
+        profile=IndexProfile(spec["profile"]),
+        workers=int(spec["workers"]),
+        embedding_dimensions=int(spec["embedding_dimensions"]),
+        queries=tuple(spec["queries"]),
+        generated_source_roots=tuple(Path(root) for root in spec["generated_source_roots"]),
+        child_result=gate_report,
+    )
+    _validate_profile_provenance(
+        gate_report["database_provenance"], IndexProfile(spec["profile"]), spec["translation_units"]
+    )
+    if spec["baseline_gate"] is not None:
+        _compare_baseline_gate(gate_report, spec["baseline_gate"])
+    if _sha256(source_cdb) != spec["source_cdb_sha256"]:
+        raise RuntimeError("source compilation database changed during the canary")
+    with _validated_artifact_publication(subset, database, validated):
+        # The supervisor can interrupt a blocked validator. Recheck the shared
+        # deadline under the publication lock too, before any SUCCESS appears.
+        if time.monotonic() - spec["gate_started_monotonic"] > spec["total_wall_seconds"]:
+            raise RuntimeError("end-to-end gate deadline exceeded before publication")
+        (database.parent / ".running").unlink()
+        _write_report_atomic(database.parent / "SUCCESS", "complete\n")
+
+
+def _run_validation_supervised(
+    spec_path: Path, directory: Path, limits: CanaryLimits, total_tus: int
+) -> dict[str, Any]:
+    return _run_supervised(spec_path, directory, limits, total_tus)
 
 
 def _parse_gates(raw: str) -> tuple[int | str, ...]:
@@ -1614,7 +1706,9 @@ def run_canary(
     profile: IndexProfile = IndexProfile.NAVIGATION,
     baseline_report: Path | None = None,
     generated_source_roots: Sequence[Path] = (),
+    total_gate_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
+    total_timeouts = gate_timeouts if total_gate_timeouts is None else total_gate_timeouts
     for name, value in (
         ("workers", workers),
         ("analyzer timeout", analyzer_timeout_seconds),
@@ -1630,6 +1724,10 @@ def run_canary(
     missing_timeouts = [str(gate) for gate in gates if str(gate) not in gate_timeouts]
     if missing_timeouts:
         raise ValueError("no timeout configured for gates: " + ", ".join(missing_timeouts))
+    for gate in gates:
+        if str(gate) not in total_timeouts:
+            raise ValueError(f"no end-to-end timeout configured for gate: {gate}")
+        _require_finite_positive(f"gate {gate} end-to-end timeout", total_timeouts[str(gate)])
     profile = IndexProfile(profile)
     inspection = inspect_compilation_database(project_root, compilation_database)
     canonical_generated_roots = _canonical_generated_roots_for_gates(
@@ -1669,6 +1767,7 @@ def run_canary(
         _compare_baseline_header(requested_report, baseline)
         baseline_gates = _comparable_gates(baseline)
     for gate in gates:
+        gate_started = time.monotonic()
         name = str(gate)
         if _sha256(inspection.compilation_database) != inspection.sha256:
             raise RuntimeError("source compilation database changed during the canary")
@@ -1691,6 +1790,9 @@ def run_canary(
             expected_translation_units = subset_metadata.normalized_configuration_count
             gate_generated_roots = canonical_generated_roots if gate == "all" else ()
             spec = {
+                "gate_started_monotonic": gate_started,
+                "total_wall_seconds": total_timeouts[name],
+                "full_project": gate == "all",
                 "project_root": str(inspection.project_root),
                 "compilation_database": str(subset),
                 "database": str(running / "index.db"),
@@ -1724,22 +1826,6 @@ def run_canary(
             )
             if measured["completed_translation_units"] != expected_translation_units:
                 raise RuntimeError("worker did not stage every selected translation unit")
-            validated_artifacts = _revalidate_final_artifacts(
-                project_root=inspection.project_root,
-                subset=subset,
-                expected_subset=subset_metadata,
-                database=running / "index.db",
-                analyzer=analyzer,
-                profile=profile,
-                workers=workers,
-                embedding_dimensions=embedding_dimensions,
-                queries=queries,
-                generated_source_roots=gate_generated_roots,
-                child_result=measured,
-            )
-            _validate_profile_provenance(
-                measured["database_provenance"], profile, expected_translation_units
-            )
             gate_report = {
                 "gate": gate,
                 "selection": "complete_cdb" if gate == "all" else "project_source_prefix",
@@ -1749,18 +1835,43 @@ def run_canary(
                 "selected_sources": [entry.display_path for entry in selected],
                 "subset_cdb_sha256": subset_metadata.sha256,
                 "limits": asdict(limits),
+                "total_wall_seconds": total_timeouts[name],
                 **measured,
             }
-            if baseline is not None:
-                _compare_baseline_gate(gate_report, baseline_gates[len(gate_reports)])
-            if _sha256(inspection.compilation_database) != inspection.sha256:
-                raise RuntimeError("source compilation database changed during the canary")
-            with _validated_artifact_publication(subset, running / "index.db", validated_artifacts):
-                gate_reports.append(gate_report)
-                running_marker.unlink()
-                _write_report_atomic(running / "SUCCESS", "complete\n")
-    if _sha256(inspection.compilation_database) != inspection.sha256:
-        raise RuntimeError("source compilation database changed during the canary")
+            validation_spec = {
+                **spec,
+                "supervision_stage": "validation",
+                "gate_report": gate_report,
+                "subset_metadata": asdict(subset_metadata),
+                "source_compilation_database": str(inspection.compilation_database),
+                "source_cdb_sha256": inspection.sha256,
+                "baseline_gate": baseline_gates[len(gate_reports)]
+                if baseline is not None
+                else None,
+            }
+            validation_path = running / "validation-spec.json"
+            _write_report_atomic(
+                validation_path, json.dumps(validation_spec, sort_keys=True) + "\n"
+            )
+            validation = _run_validation_supervised(
+                validation_path,
+                running,
+                replace(limits, wall_seconds=total_timeouts[name]),
+                expected_translation_units,
+            )
+            if not validation.get("validated") or not validation.get("process_group_clean"):
+                raise RuntimeError("independent validator did not finish cleanly")
+            gate_report["validation_elapsed_seconds"] = validation["elapsed_seconds"]
+            gate_report["total_elapsed_seconds"] = validation["total_elapsed_seconds"]
+            for field in (
+                "peak_rss_bytes",
+                "peak_swap_bytes",
+                "peak_database_bytes",
+                "peak_disk_bytes",
+            ):
+                gate_report[field] = max(measured.get(field, 0), validation[field])
+            gate_report["artifact_directory_peak_bytes"] = gate_report["peak_disk_bytes"]
+            gate_reports.append(gate_report)
     if baseline is not None:
         _compare_baseline(report, baseline)
     _write_report_atomic(
@@ -1782,6 +1893,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=("navigation", "full"), default="navigation")
     parser.add_argument("--gates", default="1,4,16,32")
     parser.add_argument("--gate-timeouts", default="")
+    parser.add_argument("--total-gate-timeouts", default="")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--analyzer-timeout-seconds", type=float, default=75.0)
     parser.add_argument("--embedding-dimensions", type=int, default=32)
@@ -1819,6 +1931,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.clang_analyzer is None or args.output_directory is None:
             raise ValueError("--clang-analyzer and --output-directory are required for a run")
         profile = IndexProfile(args.profile)
+        gates = _parse_gates(args.gates)
+        if "all" in gates and (args.database_limit_mib is None or args.disk_limit_mib is None):
+            raise ValueError("all gate requires explicit --database-limit-mib and --disk-limit-mib")
         database_limit_mib = args.database_limit_mib
         if database_limit_mib is None:
             database_limit_mib = 550 if profile is IndexProfile.NAVIGATION else 1_350
@@ -1835,11 +1950,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("no-progress timeout", args.no_progress_seconds),
         ):
             _require_finite_positive(name, value)
-        gates = _parse_gates(args.gates)
         timeouts = (
             _parse_timeouts(args.gate_timeouts)
             if args.gate_timeouts
             else dict(DEFAULT_GATE_TIMEOUTS)
+        )
+        total_timeouts = (
+            _parse_timeouts(args.total_gate_timeouts)
+            if args.total_gate_timeouts
+            else dict(DEFAULT_TOTAL_GATE_TIMEOUTS)
         )
         missing = [str(gate) for gate in gates if str(gate) not in timeouts]
         if missing:
@@ -1862,6 +1981,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile=profile,
             baseline_report=args.baseline_report,
             generated_source_roots=args.generated_source_root,
+            total_gate_timeouts=total_timeouts,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
