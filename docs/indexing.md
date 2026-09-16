@@ -39,6 +39,19 @@ are `file`, `symbol`, `occurrence`, `edge`, `include`, and the versioned
 `data_access_v1`, and `data_flow_evidence_v1` types;
 references use stable
 USR or location-derived keys that the Python adapter converts to canonical IDs.
+The mandatory `compact_structural_keys_v1` capability projects the fixed CFG,
+analysis, access, memory-location, evidence and effect key families to typed
+SHA-256 references only when shorter than their original UTF-8 spelling. Native
+solver keys, ordering, cap selection and deduplication remain unchanged. The adapter
+reconstructs original identities from structural fields; memory definitions carry
+their original `identity_key` once because external offsets and field USRs cannot
+be reconstructed from names. Disk registries stay compact; existing typed builder
+passes resolve references and reject unknown, conflicting or duplicate aliases.
+Persisted IDs, ordering and summary hashes remain unchanged. Return-origin identity
+keys retain their original spelling. Both peers
+must confirm this capability during `hello`: rebuild the companion together with
+the Python package. Old clients are rejected before analysis, not silently given
+keys they would interpret as different graph identities.
 Macro expansions carry independent `spelling_span` and `expansion_span` objects.
 Every emitted span is validated against one Clang file buffer and ordered byte
 offsets. Genuinely cross-file endpoints use Clang's deterministic file-character
@@ -63,7 +76,7 @@ produce `data_flow_facts_available=true`.
 `full` remains the default profile and retains all existing facts. The explicit
 `navigation` profile is negotiated through the optional `analysis_profiles_v1`
 capability without changing protocol version 5. Full requests omit the profile
-field and therefore remain compatible with older companions; navigation fails
+field; among compatible companions, navigation fails
 before analysis if the companion does not advertise profile support.
 
 Navigation emits only project/build/TU and dependency state, files/includes,
@@ -78,9 +91,9 @@ leave stale deep rows visible. Deep API and MCP queries inspect this coverage an
 return a structured unavailable result when the selected build scope is not deep.
 
 The handshake advertises optional `gzip_jsonl_v1` transport support without
-changing protocol version 5, fact schemas, or stable IDs. Probes and old clients
-remain plain JSONL. A new client requests gzip only after a plain probe advertised
-it; a new client talking to an old companion therefore remains plain. The native
+changing protocol version 5, fact schemas, or stable IDs. Probes remain plain JSONL.
+Clients request gzip only after a compatible plain probe advertised it; a
+compatible companion without gzip support remains plain. The native
 sink suppresses duplicate sort keys before serialization and emits first-seen
 facts incrementally through a bounded gzip level-1 writer. The Python adapter
 decompresses and parses fragmented records incrementally into compact,
