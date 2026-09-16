@@ -61,14 +61,23 @@ cpp-context-kicad-canary \
   --output-directory "$CANARY_OUTPUT/navigation-a" \
   --gates 1,4,16,32 \
   --gate-timeouts 1:60,4:90,16:120,32:150 \
+  --total-gate-timeouts 1:90,4:120,16:150,32:180 \
   --workers 8 \
   --query compareVersionStrings
 ```
 
-The 32-TU acceptance limit is 150 seconds. The smaller limits are deliberately
-strict discovery guardrails. Every gate uses a new database and records:
+The 32-TU index/worker acceptance limit remains 150 seconds. Independent
+verification runs in a separate process under the same resource supervisor,
+using only the remaining end-to-end budget. Total defaults are 90/120/150/180
+seconds for 1/4/16/32 TUs and 5,400 seconds for `all`; these are deadlines, not
+forecast factors. `elapsed_seconds` retains worker/index time;
+`validation_elapsed_seconds` and `total_elapsed_seconds` report the separate
+verification cost and overall gate duration. Custom worker timeouts need a
+deliberate `--total-gate-timeouts` selection too.
 
-- each staged TU, elapsed time, rate and ETA;
+The smaller limits are strict discovery guardrails. Each new database records:
+
+- each staged TU, phase, elapsed time and TU-only ETA (not a total forecast);
 - peak process-tree RSS and swap, active SQLite/WAL/SHM bytes and total gate
   disk bytes;
 - input/subset CDB digests, selected raw indices, engine/project commits, native
@@ -76,13 +85,22 @@ strict discovery guardrails. Every gate uses a new database and records:
 - stable semantic table counts/digest, exact ranked query IDs and scores, and
   order-sensitive public calls/CFG/data-flow result digests.
 
-Any swap, RSS above 2.5 GiB, active database above 550 MiB, output above 1 GiB,
+For numeric navigation samples, swap, RSS above 2.5 GiB, active database above
+550 MiB, artifact-directory output above 1 GiB,
 hard gate timeout, or ten seconds with no TU/DB/CPU progress terminates the whole
 worker process tree. A gate contains a `.running` marker until every check has
 passed; failures are renamed `.failed` and only success writes `SUCCESS`. The
 source CDB digest is rechecked before publication. Baseline provenance, exact
 gate membership, semantic facts, public result ordering and analyzer identity
 are also checked before `SUCCESS` is written.
+
+RSS/swap supervision includes the coordinator, producer and independent
+validator. A failed validator leaves no `SUCCESS`. Physical hashes still guard
+same-artifact verification/publication, not cross-run parity of volatile bytes.
+`artifact_directory_peak_bytes` (also retained as `peak_disk_bytes`) covers
+the gate directory including private staging/journals. Native `/tmp` spools
+are separate: `native_spool_budget_bytes` reports their existing aggregate hard
+allowance, 4 GiB at eight workers. Directory usage is not total machine disk use.
 
 Run the same gates a second time against the first report. Semantic rows, IDs,
 coverage fields, embeddings and search rankings must match exactly:
@@ -95,12 +113,24 @@ cpp-context-kicad-canary \
   --output-directory "$CANARY_OUTPUT/navigation-b" \
   --gates 1,4,16,32 \
   --gate-timeouts 1:60,4:90,16:120,32:150 \
+  --total-gate-timeouts 1:90,4:120,16:150,32:180 \
   --workers 8 \
   --query compareVersionStrings \
   --baseline-report "$CANARY_OUTPUT/navigation-a/report.json"
 ```
 
-Only after both progressive runs pass may the complete navigation run start:
+Only after progressive/parity and representative main-source/generated-source
+checks pass may a complete run be considered. `all` requires explicit artifact
+budgets. The fixed initial ceiling is 48 GiB active DB / 64 GiB gate directory,
+plus the separate unchanged spool allowance, on the prepared host with about
+749 GiB free. These are ceilings, not size forecasts; never raise them mid-run.
+Numeric bench32 limits are unchanged.
+
+The prepared CDB covers 2,252 compiler configurations / 2,194 canonical sources
+(2,153 source-root and 41 generated), not every possible KiCad build. Bind
+`/home/arno/git/kicad` as `KICAD_SOURCE` and
+`/home/arno/.local/state/cpp-context-engine/kicad-c6135c6` as `KICAD_BUILD` and
+`KICAD_GENERATED_ROOT`, then repeat complete preflight before the full command:
 
 ```bash
 cpp-context-kicad-canary \
@@ -111,12 +141,23 @@ cpp-context-kicad-canary \
   --output-directory "$CANARY_OUTPUT/navigation-full" \
   --gates all \
   --gate-timeouts all:5400 \
+  --total-gate-timeouts all:5400 \
   --workers 8 \
+  --rss-limit-mib 2560 \
+  --database-limit-mib 49152 \
+  --disk-limit-mib 65536 \
   --query compareVersionStrings
 ```
 
 At ten minutes a projection above the 90-minute hard limit terminates the run.
 At thirty minutes a projection above the 60-minute target also terminates it.
+TU throughput is only a lower bound: unmeasured embeddings/verification do not
+become zero after the last TU. If total remaining work cannot be estimated at a
+decision checkpoint, the run fails closed with an unknown-projection reason.
+This means missing forecast evidence, not proven slowness. Until there is a
+calibrated tail estimate, a full run crossing the ten-minute checkpoint remains
+no-go. Do not invent multipliers or extrapolate the third-party-heavy prefix32
+as a reliable whole-project forecast.
 
 Bounded real-KiCad deep materialization, cache/restart, invalidation,
 cancellation, and multi-build checks are a separate gate dependent on Issue #45.
@@ -135,6 +176,7 @@ cpp-context-kicad-canary \
   --profile full \
   --gates 32 \
   --gate-timeouts 32:360 \
+  --total-gate-timeouts 32:420 \
   --workers 8 \
   --database-limit-mib 1350 \
   --disk-limit-mib 2048 \
