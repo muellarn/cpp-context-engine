@@ -143,7 +143,7 @@ def index_project(config: AppConfig) -> IndexOperationResult:
         raise ValueError(f"project directory does not exist: {config.project_root}")
     provider = embedding_provider(config)
     scope = BuildScope(tuple(variant.name for variant in config.build_variants))
-    with SQLiteStore(
+    with SQLiteStore.indexing_generation(
         config.database_path, project_root=config.project_root, build_scope=scope
     ) as store:
         if config.clang_analyzer_path is not None:
