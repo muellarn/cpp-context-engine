@@ -75,6 +75,37 @@ forecast factors. `elapsed_seconds` retains worker/index time;
 verification cost and overall gate duration. Custom worker timeouts need a
 deliberate `--total-gate-timeouts` selection too.
 
+Each supervised stage also retains `phase-timings-index.json` or
+`phase-timings-validation.json`, including on a failed gate. The worker timestamps
+boundaries with the same host's monotonic clock; supervisor pipe-delivery delays
+are not charged to phases. The fixed, non-overlapping phases are:
+
+- `tu_processing`: index setup and TU processing until **all** selected TUs have
+  been staged, not merely until the most recent successful TU;
+- `post_tu_finalization`: remaining generator checks/cleanup, global index
+  finalization and commit, ending when embedding work starts;
+- `embeddings`: embedding work and private-generation close/publication;
+- `producer_checks`: ranking, canonical snapshots, provenance and integrity checks;
+- `validation`: the separate independent validator, including its publication checks.
+
+Complete phases have start/end offsets from the shared gate start and a duration.
+Not-started and incomplete phases have a null duration, never a fabricated zero;
+`observed_seconds` for an incomplete phase is only the interval through its last
+confirmed worker event, not a completed measurement. Startup, inter-process gaps,
+and supervisor cleanup are outside these phase intervals; the existing total
+elapsed time remains authoritative and is not added to the phase sum. Analyzer
+slot times overlap TU processing and must not be added either.
+
+Snapshots are atomically retained at transitions, at most once per five seconds
+between transitions, and during supervisor cleanup. They retain configured input
+pins/budgets, resource peaks and available existing counts. Embedding counts are
+processed variant records, not unique provider computations; incomplete counts
+remain null. Successful reports include `phase_measurements` and
+`validation_phase_measurements`. Historical reports are not rewritten. These are
+measurement artifacts, not forecasts: the unknown-total-ETA guard stays fail-closed
+until representative navigation samples and tail-scaling evidence support a
+separately reviewed calibration method.
+
 The smaller limits are strict discovery guardrails. Each new database records:
 
 - each staged TU, phase, elapsed time and TU-only ETA (not a total forecast);
