@@ -8,7 +8,6 @@ import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import nullcontext
-from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,6 +19,7 @@ from cpp_context_engine.ingestion.native import (
     PROTOCOL_VERSION,
     NativeAnalyzerClient,
     NativeClangIngestor,
+    _file_digest,
     _ResourceBudget,
 )
 from cpp_context_engine.models import BuildConfiguration, BuildScope, IndexProfile
@@ -287,6 +287,12 @@ class DeepMaterializer:
             and state.summary_facts_complete
             for item in selected
         ):
+            # Complete facts do not prove compatibility with the current analyzer.
+            if any(
+                not state.analyzer_identity or state.analyzer_identity != analyzer_identity
+                for state in indexed_states.values()
+            ):
+                raise RuntimeError("analyzer identity changed or unknown; refresh the index")
             cached = self.store.deep_cached_closure(
                 closure_generation_id, identities, self.config.project_root
             )
@@ -693,20 +699,3 @@ def _digest(parts: list[str], control: DeepRequestControl | None = None) -> str:
         digest.update(part.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-def _file_digest(path: Path, control: DeepRequestControl | None = None) -> str:
-    try:
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                if control is not None:
-                    control.check("file hashing")
-                digest.update(chunk)
-        if control is not None:
-            control.check("file hashing")
-        return digest.hexdigest()
-    except TimeoutError:
-        raise
-    except OSError as error:
-        raise RuntimeError("deep materialization input is unavailable") from error

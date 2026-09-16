@@ -85,6 +85,7 @@ class ProjectIndexer:
         )
         previous = self._store.translation_unit_states(project_root, build_scope=(variant.name,))
         current_ids = frozenset(translation_unit_id(config) for config in database.configurations)
+        analyzer_identity = getattr(self._ingestor, "analyzer_identity", "")
         changed = [
             configuration
             for configuration in database.configurations
@@ -96,6 +97,7 @@ class ProjectIndexer:
                     getattr(self._ingestor, "advanced_facts_complete", False)
                 ),
                 profile=self._profile,
+                analyzer_identity=analyzer_identity,
             )
         ]
         counts = {result_name: 0 for result_name, _batch_name in _BATCH_COUNT_FIELDS}
@@ -113,6 +115,10 @@ class ProjectIndexer:
         def counted_batches() -> Iterator[IngestionBatch]:
             for batch in batch_stream:
                 _check_cancelled(cancelled)
+                if any(
+                    unit.analyzer_identity != analyzer_identity for unit in batch.translation_units
+                ):
+                    raise RuntimeError("analyzer changed before indexing")
                 for result_name, batch_name in _BATCH_COUNT_FIELDS:
                     counts[result_name] += len(getattr(batch, batch_name))
                 try:
@@ -156,10 +162,16 @@ class ProjectIndexer:
         analysis_backend: str,
         advanced_facts_complete: bool,
         profile: IndexProfile = IndexProfile.FULL,
+        analyzer_identity: str = "",
     ) -> bool:
         if state is None:
             return True
         if state.command_hash != configuration.command_hash:
+            return True
+        # Legacy native facts have no proven producer and must be regenerated once.
+        if analysis_backend == "clang-libtooling" and (
+            not analyzer_identity or state.analyzer_identity != analyzer_identity
+        ):
             return True
         if (
             state.analysis_backend != analysis_backend

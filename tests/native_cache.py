@@ -265,6 +265,10 @@ class StagedNativeAnalyzerClient:
         self._cache = cache
         self._client = client
 
+    @property
+    def analyzer_identity(self) -> str:
+        return self._client.analyzer_identity
+
     def probe(self, *, refresh: bool = False) -> AnalyzerInfo:
         return self._client.probe(refresh=refresh)
 

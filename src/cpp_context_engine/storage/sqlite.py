@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 VECTOR_ENCODING_RAW_F64LE_V1 = 0
 VECTOR_ENCODING_ZLIB_F64LE_V1 = 1
 DEFAULT_EMBEDDING_TEXT_CHARS = 32_000
@@ -192,6 +192,7 @@ class TranslationUnitState:
     cfg_facts_complete: bool = False
     data_flow_facts_complete: bool = False
     summary_facts_complete: bool = False
+    analyzer_identity: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -858,6 +859,30 @@ class SQLiteStore:
             self._migrate_v15()
         if current <= 15:
             self._migrate_v16()
+        if current <= 16:
+            self._migrate_v17()
+
+    def _migrate_v17(self) -> None:
+        """Retain unknown legacy TU provenance until native reindexing replaces it."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(translation_units)")
+            }
+            # Preserve the existing minimal legacy-schema migration contract.
+            if columns and "analyzer_identity" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE translation_units ADD COLUMN "
+                    "analyzer_identity TEXT NOT NULL DEFAULT ''"
+                )
+            self._connection.execute("PRAGMA user_version = 17")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
 
     def _migrate_v15(self) -> None:
         """Add content-addressed, TU-scoped deep-analysis overlay metadata."""
@@ -3207,8 +3232,8 @@ class SQLiteStore:
                     content_hash, diagnostics_json, build_variant,
                     analysis_backend, advanced_facts_complete, index_profile,
                     navigation_facts_complete, cfg_facts_complete,
-                    data_flow_facts_complete, summary_facts_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    data_flow_facts_complete, summary_facts_complete, analyzer_identity
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -3225,6 +3250,7 @@ class SQLiteStore:
                     int(cfg_complete),
                     int(data_flow_complete),
                     int(summary_complete),
+                    unit.analyzer_identity,
                 ),
             )
             self._connection.executemany(
@@ -5369,7 +5395,8 @@ class SQLiteStore:
                    units.content_hash, units.build_variant, units.analysis_backend,
                    units.advanced_facts_complete, units.index_profile,
                    units.navigation_facts_complete, units.cfg_facts_complete,
-                   units.data_flow_facts_complete, units.summary_facts_complete
+                   units.data_flow_facts_complete, units.summary_facts_complete,
+                   units.analyzer_identity
             FROM translation_units units
             JOIN build_configurations configs
               ON configs.project_id = units.project_id
@@ -5413,6 +5440,7 @@ class SQLiteStore:
                 cfg_facts_complete=bool(row["cfg_facts_complete"]),
                 data_flow_facts_complete=bool(row["data_flow_facts_complete"]),
                 summary_facts_complete=bool(row["summary_facts_complete"]),
+                analyzer_identity=row["analyzer_identity"],
             )
         return result
 
@@ -5937,6 +5965,8 @@ class SQLiteStore:
             )
             if set(states) != set(unit_ids) or any(
                 state.index_profile is not IndexProfile.FULL
+                or not state.analyzer_identity
+                or state.analyzer_identity != analyzer_identity
                 or not state.cfg_facts_complete
                 or not state.data_flow_facts_complete
                 or not state.summary_facts_complete

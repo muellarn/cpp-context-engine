@@ -653,6 +653,13 @@ def test_deep_overlay_persists_solved_payload_and_invalidates_reverse_caller(
     root = tmp_path / "project"
     root.mkdir()
     navigation, deep = _two_tu_summary_batch(root)
+    navigation = replace(
+        navigation,
+        translation_units=tuple(
+            replace(unit, analyzer_identity="navigation-producer")
+            for unit in navigation.translation_units
+        ),
+    )
     database = tmp_path / "index.db"
     identities = {"tu-caller": "identity-caller", "tu-callee": "identity-callee"}
     commands = {"tu-caller": "command-caller", "tu-callee": "command-callee"}
@@ -670,6 +677,12 @@ def test_deep_overlay_persists_solved_payload_and_invalidates_reverse_caller(
             protocol_version=5,
             closure_complete=True,
         )
+        assert {
+            state.analyzer_identity for state in store.translation_unit_states(root).values()
+        } == {"navigation-producer"}
+        assert {state.analyzer_identity for state in store.deep_cache_states(root).values()} == {
+            "analyzer"
+        }
         assert (
             store._connection.execute(  # noqa: SLF001 - persisted solver evidence
                 "SELECT count(*) FROM summary_solution_payloads WHERE summary_id = 'summary-caller'"
@@ -730,6 +743,13 @@ def test_full_profile_materialization_persists_token_bound_cfg_and_flow_after_re
     _navigation, deep = _two_tu_summary_batch(root)
     analyzer = tmp_path / "fake-analyzer"
     analyzer.write_bytes(b"stable analyzer identity")
+    deep = replace(
+        deep,
+        translation_units=tuple(
+            replace(unit, analyzer_identity=_file_digest(analyzer))
+            for unit in deep.translation_units
+        ),
+    )
     compilation_database = root / "compile_commands.json"
     compilation_database.write_text("[]", encoding="utf-8")
     database = tmp_path / "index.db"
@@ -814,6 +834,13 @@ def test_full_profile_exact_closure_alias_preserves_both_root_tokens_after_resta
     )
     analyzer = tmp_path / "fake-analyzer"
     analyzer.write_bytes(b"stable analyzer identity")
+    deep = replace(
+        deep,
+        translation_units=tuple(
+            replace(unit, analyzer_identity=_file_digest(analyzer))
+            for unit in deep.translation_units
+        ),
+    )
     compilation_database = root / "compile_commands.json"
     compilation_database.write_text("[]", encoding="utf-8")
     database = tmp_path / "index.db"
@@ -1217,7 +1244,7 @@ def test_restart_reuses_exact_closure_generation_across_root_symbols_without_spa
                     analyzer_identity,
                     "cpp-context-clang-facts",
                     "5",
-                    "16",
+                    "17",
                     "full",
                 ],
                 control,
@@ -1309,7 +1336,7 @@ def test_restart_reuses_exact_closure_generation_across_root_symbols_without_spa
             "fixture-1",
             "cpp-context-clang-facts",
             5,
-            16,
+            17,
             "full",
             closure_generation_id,
             2,
@@ -1466,7 +1493,7 @@ def test_restart_reuses_exact_closure_generation_across_root_symbols_without_spa
     assert result.provenance.analyzer_version == "fixture-1"
     assert result.provenance.protocol == "cpp-context-clang-facts"
     assert result.provenance.protocol_version == 5
-    assert result.provenance.fact_schema_version == 16
+    assert result.provenance.fact_schema_version == 17
     assert result.provenance.profile is IndexProfile.FULL
     assert result.provenance.build_scope == ["default"]
     assert result.provenance.closure_generation_id == closure_generation_id
