@@ -103,6 +103,7 @@ REQUIRED_CAPABILITIES = frozenset(
         "points_to_v1",
         "function_summaries_v1",
         "interprocedural_bindings_v1",
+        "compact_access_keys_v1",
     }
 )
 DEFAULT_TIMEOUT_SECONDS = 75.0
@@ -1387,6 +1388,7 @@ class _FactBatchBuilder:
         self.memory_location_ids: dict[str, str] = {}
         self.memory_location_analysis_ids: dict[str, str] = {}
         self.data_access_ids: dict[str, str] = {}
+        self.data_access_identity_keys: dict[str, str] = {}
         self.data_access_analysis_ids: dict[str, str] = {}
         self.function_summary_ids: dict[str, str] = {}
         self.function_summary_analysis_ids: dict[str, str] = {}
@@ -1507,7 +1509,17 @@ class _FactBatchBuilder:
         for fact in access_facts:
             key = _string(fact, "key")
             analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
-            self.data_access_ids[key] = "access_" + _hash_text(analysis_id, key)[:32]
+            block_key = _string(fact, "block_key")
+            sequence = _non_negative_integer(fact, "sequence")
+            identity_key = key
+            if key == f"{block_key}:access:{sequence}":
+                # Compact transport references must not change persisted/public IDs.
+                identity_key = (
+                    f"{_string(fact, 'analysis_key')}:access:{block_key}:{sequence}:"
+                    f"{_string(fact, 'kind')}:{_string(fact, 'location_key')}"
+                )
+                self.data_access_identity_keys[key] = identity_key
+            self.data_access_ids[key] = "access_" + _hash_text(analysis_id, identity_key)[:32]
             self.data_access_analysis_ids[key] = analysis_id
 
         for fact in (*location_facts, *access_facts):
@@ -1700,6 +1712,15 @@ class _FactBatchBuilder:
             raise AnalyzerProtocolError(
                 "analyzer data-flow facts have inconsistent analysis references"
             )
+        source_identity = self.data_access_identity_keys.get(source_access_key, source_access_key)
+        target_identity = self.data_access_identity_keys.get(target_access_key, target_access_key)
+        if (source_identity, target_identity) != access_keys:
+            if (
+                key != f"{analysis_key}:evidence:{relation.value}:"
+                f"{source_access_key}:{target_access_key}"
+            ):
+                raise AnalyzerProtocolError("analyzer compact evidence key is inconsistent")
+            key = f"{analysis_key}:evidence:{relation.value}:{source_identity}:{target_identity}"
         return DataFlowEvidence(
             id="evidence_" + _hash_text(analysis_id, key)[:32],
             analysis_id=analysis_id,
@@ -1878,6 +1899,12 @@ class _FactBatchBuilder:
         access_key = _optional_key(fact, "source_access_key")
         self._validate_summary_analysis(summary_key, location_key, access_key)
         key = _string(fact, "key")
+        access_identity = self.data_access_identity_keys.get(access_key, access_key)
+        if access_identity != access_key:
+            kind = _string(fact, "kind")
+            if key != f"{summary_key}:effect:{kind}:{access_key}":
+                raise AnalyzerProtocolError("analyzer compact summary effect key is inconsistent")
+            key = f"{summary_key}:effect:{kind}:{access_identity}"
         parameter_index = _optional_non_negative_integer(fact, "parameter_index")
         if (
             parameter_index is not None

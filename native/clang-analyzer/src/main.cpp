@@ -61,7 +61,7 @@ const std::vector<std::string> kCapabilities = {
     "macro_expansion_stack", "template_relationships_v1",
     "intraprocedural_dataflow_v1", "points_to_v1", "function_summaries_v1",
     "interprocedural_bindings_v1", "gzip_jsonl_v1", "analysis_profiles_v1",
-    "generated_source_roots_v1"};
+    "generated_source_roots_v1", "compact_access_keys_v1"};
 
 class OutputWriter {
 public:
@@ -1493,8 +1493,9 @@ private:
                                const clang::Stmt *statement,
                                const clang::Expr *assigned = nullptr) -> DataAccessRecord & {
       const unsigned sequence = sequences[block]++;
-      std::string key = analysisKey + ":access:" + block + ":" +
-                        std::to_string(sequence) + ":" + kind.str() + ":" + location;
+      // Sequence is unique within the block; repeating location/analysis here
+      // amplified every evidence and summary reference beyond the stream limit.
+      std::string key = block + ":access:" + std::to_string(sequence);
       auto &records = accessesByBlock[block];
       records.push_back(DataAccessRecord{key, block, element, location, kind.str(), sequence,
                                          statement, assigned,
@@ -2265,6 +2266,11 @@ private:
     }
 
     std::set<std::string> emittedReturnOrigins;
+    const auto legacyAccessKey = [&](const DataAccessRecord &access) {
+      // Return-origin keys are persisted identities, not access references.
+      return "data-flow:" + graphKey + ":access:" + access.blockKey + ":" +
+             std::to_string(access.sequence) + ":" + access.kind + ":" + access.locationKey;
+    };
     std::function<void(const clang::Expr *, const DataAccessRecord &)> emitReturnOrigins;
     emitReturnOrigins = [&](const clang::Expr *raw, const DataAccessRecord &access) {
       if (!raw)
@@ -2292,7 +2298,7 @@ private:
       }
       if (llvm::isa<clang::IntegerLiteral, clang::FloatingLiteral,
                     clang::CXXBoolLiteralExpr, clang::CharacterLiteral>(expression)) {
-        const auto key = summaryKey + ":return:constant:" + access.key;
+        const auto key = summaryKey + ":return:constant:" + legacyAccessKey(access);
         if (emittedReturnOrigins.insert(key).second)
           sink_.add("summary-return:" + key,
                     {{"fact", "summary_return_origin_v1"},
@@ -2316,7 +2322,7 @@ private:
           return;
         }
         const auto parameterIndex = rootParameterIndex(locationKey);
-        const auto key = summaryKey + ":return:location:" + access.key + ":" + locationKey;
+        const auto key = summaryKey + ":return:location:" + legacyAccessKey(access) + ":" + locationKey;
         if (emittedReturnOrigins.insert(key).second) {
           llvm::json::Object fact{{"fact", "summary_return_origin_v1"},
                                   {"key", key},
@@ -2867,6 +2873,17 @@ bool handleHello(const llvm::json::Object &request) {
   }
   if (!requiredMajor || *requiredMajor != kClangMajor) {
     emitError("clang_major_mismatch", "the analyzer requires Clang major 18");
+    return false;
+  }
+  const auto *requiredCapabilities = request.getArray("required_capabilities");
+  if (!requiredCapabilities ||
+      std::none_of(requiredCapabilities->begin(), requiredCapabilities->end(),
+                   [](const auto &value) {
+                     const auto capability = value.getAsString();
+                     return capability && *capability == "compact_access_keys_v1";
+                   })) {
+    // Older clients ignore added server capabilities and would derive wrong IDs.
+    emitError("capability_mismatch", "client must confirm compact_access_keys_v1");
     return false;
   }
   llvm::json::Array capabilities;

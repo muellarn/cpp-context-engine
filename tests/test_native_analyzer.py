@@ -98,6 +98,7 @@ def _fake_hello(*, gzip_transport: bool = False) -> dict[str, object]:
         "points_to_v1",
         "function_summaries_v1",
         "interprocedural_bindings_v1",
+        "compact_access_keys_v1",
         "analysis_profiles_v1",
     ]
     if gzip_transport:
@@ -277,6 +278,7 @@ def test_real_companion_rejects_generated_source_escape(tmp_path: Path, escape_k
         "protocol": "cpp-context-clang-facts",
         "protocol_version": 5,
         "required_clang_major": 18,
+        "required_capabilities": ["compact_access_keys_v1"],
     }
     analyze = {
         "type": "analyze",
@@ -306,7 +308,7 @@ def test_real_companion_rejects_generated_source_escape(tmp_path: Path, escape_k
     assert str(tmp_path) not in records[-1]["message"]
 
 
-def test_real_companion_accepts_legacy_v5_request_without_generated_roots(tmp_path: Path) -> None:
+def test_real_companion_accepts_v5_request_without_generated_roots(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     source = project / "source.cc"
@@ -317,6 +319,7 @@ def test_real_companion_accepts_legacy_v5_request_without_generated_roots(tmp_pa
             "protocol": "cpp-context-clang-facts",
             "protocol_version": 5,
             "required_clang_major": 18,
+            "required_capabilities": ["compact_access_keys_v1"],
         },
         {
             "type": "analyze",
@@ -1040,6 +1043,7 @@ def test_native_handshake_matches_protocol_golden() -> None:
         "protocol": "cpp-context-clang-facts",
         "protocol_version": 5,
         "required_clang_major": 18,
+        "required_capabilities": ["compact_access_keys_v1"],
     }
     completed = subprocess.run(  # noqa: S603 - repository-built test binary
         [analyzer_binary()],
@@ -1062,7 +1066,7 @@ def test_real_companion_finalizes_gzip_when_rejecting_request() -> None:
         "protocol": "cpp-context-clang-facts",
         "protocol_version": 5,
         "required_clang_major": 18,
-        "required_capabilities": [],
+        "required_capabilities": ["compact_access_keys_v1"],
         "response_transport": "gzip_jsonl_v1",
     }
     malformed_analyze = {"type": "analyze"}
@@ -1532,6 +1536,118 @@ def _solution_hashes(batch):
     return {
         summary.function_symbol_id: summary.solution_hash for summary in batch.function_summaries
     }
+
+
+def test_compact_access_wire_keys_preserve_exact_legacy_batches_and_solutions(
+    tmp_path: Path,
+) -> None:
+    configuration = CompilationDatabase.load(
+        TEMPLATE_DATAFLOW_FIXTURE / "compile_commands.json"
+    ).configurations[0]
+    compact = fresh_native_client(analyzer_binary(), timeout_seconds=15).analyze(
+        TEMPLATE_DATAFLOW_FIXTURE, configuration
+    )
+    access_keys = {}
+    for fact in compact:
+        if fact["fact"] == "data_access_v1":
+            assert fact["key"] == f"{fact['block_key']}:access:{fact['sequence']}"
+            access_keys[fact["key"]] = (
+                f"{fact['analysis_key']}:access:{fact['block_key']}:{fact['sequence']}:"
+                f"{fact['kind']}:{fact['location_key']}"
+            )
+    assert access_keys
+    legacy = []
+    for raw in compact:
+        fact = dict(raw)
+        kind = fact["fact"]
+        if kind == "data_access_v1":
+            fact["key"] = access_keys[fact["key"]]
+        for field in ("source_access_key", "target_access_key", "definition_access_key"):
+            if field in fact:
+                fact[field] = access_keys[fact[field]]
+        if kind == "data_flow_evidence_v1" and "source_access_key" in fact:
+            fact["key"] = (
+                f"{fact['analysis_key']}:evidence:{fact['relation']}:"
+                f"{fact['source_access_key']}:{fact['target_access_key']}"
+            )
+        elif kind == "summary_effect_v1":
+            fact["key"] = f"{fact['summary_key']}:effect:{fact['kind']}:{fact['source_access_key']}"
+        legacy.append(fact)
+    wire_size = lambda facts: sum(  # noqa: E731 - same canonical serializer on both sides
+        len(json.dumps(fact, sort_keys=True, separators=(",", ":")).encode()) + 1 for fact in facts
+    )
+    # Require at least the exact access-key savings; references add further savings.
+    minimum_saving = sum(
+        len(old.encode()) - len(short.encode()) for short, old in access_keys.items()
+    )
+    assert minimum_saving > 0
+    assert wire_size(legacy) - wire_size(compact) >= minimum_saving
+    batches = [
+        NativeClangIngestor._merge_batches(
+            (_FactBatchBuilder(TEMPLATE_DATAFLOW_FIXTURE.resolve(), configuration).build(facts),)
+        )
+        for facts in (legacy, compact)
+    ]
+    assert batches[0] == batches[1]
+    assert all(_solution_hashes(batches[0]).values())
+    rows = []
+    payloads = []
+    for index, batch in enumerate(batches):
+        with SQLiteStore(
+            tmp_path / f"compact-{index}.db", project_root=TEMPLATE_DATAFLOW_FIXTURE
+        ) as store:
+            store.apply_ingestion(TEMPLATE_DATAFLOW_FIXTURE, batch)
+            rows.append(_semantic_analysis_rows(store))
+            payloads.append(
+                tuple(
+                    tuple(row)
+                    for row in store._connection.execute(
+                        "SELECT * FROM summary_solution_payloads ORDER BY summary_id"
+                    )
+                )
+            )
+    assert rows[0] == rows[1]
+    assert payloads[0] and payloads[0] == payloads[1]
+
+    for kind, message in (
+        ("data_flow_evidence_v1", "compact evidence key"),
+        ("summary_effect_v1", "compact summary effect key"),
+    ):
+        malformed = [dict(fact) for fact in compact]
+        target = next(
+            fact for fact in malformed if fact["fact"] == kind and "source_access_key" in fact
+        )
+        target["key"] += ":wrong"
+        with pytest.raises(AnalyzerProtocolError, match=message):
+            _FactBatchBuilder(TEMPLATE_DATAFLOW_FIXTURE.resolve(), configuration).build(malformed)
+
+
+def test_native_compact_access_capability_is_required_by_client() -> None:
+    hello = _fake_hello()
+    hello["capabilities"].remove("compact_access_keys_v1")
+    with pytest.raises(AnalyzerProtocolError, match="compact_access_keys_v1"):
+        NativeAnalyzerClient._validate_handshake(hello)
+
+
+@pytest.mark.parametrize("capabilities", [None, [], ["function_cfg_v1"]])
+def test_native_rejects_clients_without_compact_access_confirmation(capabilities) -> None:
+    hello = NativeAnalyzerClient._hello()
+    if capabilities is None:
+        hello.pop("required_capabilities")
+    else:
+        hello["required_capabilities"] = capabilities
+    completed = subprocess.run(
+        [analyzer_binary()],
+        input=json.dumps(hello) + "\n" + json.dumps({"type": "analyze"}) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert completed.returncode == 2
+    records = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert [record["type"] for record in records] == ["error"]
+    assert records[0]["code"] == "capability_mismatch"
 
 
 def _semantic_analysis_rows(store):
@@ -2086,6 +2202,7 @@ def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
             "points_to_v1",
             "function_summaries_v1",
             "interprocedural_bindings_v1",
+            "compact_access_keys_v1",
         ],
     }
     script = _script(
