@@ -42,6 +42,195 @@ class _Clock:
         return self.now
 
 
+@pytest.fixture
+def phase_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Deliver already timestamped events late without a real child process."""
+    clock = _Clock()
+    events: list[dict] = []
+
+    class Process:
+        pid = 999999
+        stderr = io.StringIO("")
+
+        def __init__(self, *_args, **_kwargs):
+            self.stdout = io.StringIO("".join(json.dumps(event) + "\n" for event in events))
+            clock.now += 20.0
+
+        def poll(self):
+            return 0
+
+        def wait(self, **_kwargs):
+            return 0
+
+    monkeypatch.setattr(kicad_canary.time, "monotonic", clock)
+    monkeypatch.setattr(kicad_canary.subprocess, "Popen", Process)
+    monkeypatch.setattr(kicad_canary, "_database_size", lambda _path: 0)
+    monkeypatch.setattr(kicad_canary, "_directory_size", lambda _path: 0)
+    monkeypatch.setattr(
+        kicad_canary, "_process_tree_metrics", lambda _pid: kicad_canary._TreeMetrics(0, 0, 0, ())
+    )
+    monkeypatch.setattr(kicad_canary, "_terminate_process_group", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        kicad_canary,
+        "_AnalyzerTelemetryMonitor",
+        lambda **_kwargs: SimpleNamespace(check=lambda: None, success_report=lambda: {}),
+    )
+
+    def run(payloads, *, stage="index"):
+        events[:] = payloads
+        spec = tmp_path / "spec.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "supervision_stage": stage,
+                    "gate_started_monotonic": 0,
+                    "measurement_provenance": {"source_cdb_sha256": "pinned"},
+                }
+            )
+        )
+        return kicad_canary._run_supervised(spec, tmp_path, CanaryLimits(wall_seconds=60), 2)
+
+    return run
+
+
+def test_phase_measurements_use_worker_times_not_delivery_times(
+    phase_worker, tmp_path: Path
+) -> None:
+    result = phase_worker(
+        [
+            {"event": "phase", "name": "index", "monotonic_seconds": 1},
+            {"event": "tu_staged", "completed": 1, "monotonic_seconds": 2},
+            {"event": "tu_staged", "completed": 2, "monotonic_seconds": 4},
+            {
+                "event": "phase",
+                "name": "embeddings",
+                "indexing": {"indexed_symbols": 7},
+                "monotonic_seconds": 6,
+            },
+            {
+                "event": "phase",
+                "name": "producer_checks",
+                "embedded_symbols": 5,
+                "monotonic_seconds": 9,
+            },
+            {"event": "result", "result": {}, "monotonic_seconds": 11},
+        ]
+    )
+    measured = result["phase_measurements"]
+    assert [phase["duration_seconds"] for phase in measured["phases"]] == [3, 2, 3, 2]
+    assert all(phase["status"] == "complete" for phase in measured["phases"])
+    assert measured["counts"] == {
+        "selected_tus": 2,
+        "staged_tus": 2,
+        "indexing": {"indexed_symbols": 7},
+        "embedded_symbols": 5,
+    }
+    persisted = json.loads((tmp_path / "phase-timings-index.json").read_text())
+    assert persisted["measurement_provenance"]["source_cdb_sha256"] == "pinned"
+    assert persisted["measurements"] == measured
+    validation = phase_worker(
+        [
+            {"event": "phase", "name": "validation", "monotonic_seconds": 21},
+            {"event": "result", "result": {"validated": True}, "monotonic_seconds": 24},
+        ],
+        stage="validation",
+    )["phase_measurements"]
+    assert validation["phases"][0]["duration_seconds"] == 3
+    assert validation["phases"][0]["start_seconds"] > measured["phases"][-1]["end_seconds"]
+    assert (
+        json.loads((tmp_path / "phase-timings-validation.json").read_text())["measurements"]
+        == validation
+    )
+
+
+def test_partial_tu_failure_does_not_start_finalization(phase_worker, tmp_path: Path) -> None:
+    failed = tmp_path.with_name(tmp_path.name + "-failed")
+    with (
+        pytest.raises(RuntimeError, match="injected failure"),
+        kicad_canary._gate_failure_publication(tmp_path, failed),
+    ):
+        phase_worker(
+            [
+                {"event": "phase", "name": "index", "monotonic_seconds": 1},
+                {"event": "tu_staged", "completed": 1, "monotonic_seconds": 3},
+                {"event": "error", "message": "injected failure", "monotonic_seconds": 5},
+            ]
+        )
+    measured = json.loads((failed / "phase-timings-index.json").read_text())["measurements"]
+    assert (failed / "FAILURE.json").is_file()
+    assert not (failed / "SUCCESS").exists()
+    assert measured["counts"]["staged_tus"] == 1
+    assert measured["phases"][0]["status"] == "incomplete"
+    assert measured["phases"][0]["duration_seconds"] is None
+    assert all(phase["status"] == "not_started" for phase in measured["phases"][1:])
+
+
+@pytest.mark.parametrize(
+    "stop", ["before_index", "finalization", "embeddings", "producer_checks", "validation"]
+)
+def test_phase_failure_retains_only_complete_boundaries(phase_worker, tmp_path: Path, stop) -> None:
+    events = (
+        []
+        if stop == "before_index"
+        else [
+            {
+                "event": "phase",
+                "name": "validation" if stop == "validation" else "index",
+                "monotonic_seconds": 1,
+            },
+        ]
+    )
+    if stop not in {"before_index", "validation"}:
+        events.extend(
+            [
+                {"event": "tu_staged", "completed": 1, "monotonic_seconds": 2},
+                {"event": "tu_staged", "completed": 2, "monotonic_seconds": 3},
+            ]
+        )
+    if stop in {"embeddings", "producer_checks"}:
+        events.append({"event": "phase", "name": "embeddings", "monotonic_seconds": 4})
+    if stop == "producer_checks":
+        events.append(
+            {
+                "event": "phase",
+                "name": "producer_checks",
+                "embedded_symbols": 0,
+                "monotonic_seconds": 5,
+            }
+        )
+    events.append({"event": "error", "message": "injected failure", "monotonic_seconds": 6})
+    stage = "validation" if stop == "validation" else "index"
+    with pytest.raises(RuntimeError, match="injected failure"):
+        phase_worker(events, stage=stage)
+    measured = json.loads((tmp_path / f"phase-timings-{stage}.json").read_text())["measurements"]
+    incomplete = [phase for phase in measured["phases"] if phase["status"] == "incomplete"]
+    assert len(incomplete) == (0 if stop == "before_index" else 1)
+    assert all(
+        phase["duration_seconds"] is None and phase["end_seconds"] is None for phase in incomplete
+    )
+    assert measured["counts"]["embedded_symbols"] == (0 if stop == "producer_checks" else None)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"event": "tu_staged", "completed": 2, "monotonic_seconds": 2},
+        {"event": "phase", "name": "embeddings", "monotonic_seconds": 2},
+        {"event": "tu_staged", "completed": 1, "monotonic_seconds": 0},
+        {"event": "tu_staged", "completed": 1, "monotonic_seconds": float("nan")},
+        {"event": "tu_staged", "completed": 1, "monotonic_seconds": 21},
+    ],
+)
+def test_phase_measurement_rejects_invalid_order_and_time(
+    phase_worker, tmp_path: Path, bad
+) -> None:
+    with pytest.raises(RuntimeError, match="invalid phase measurement"):
+        phase_worker([{"event": "phase", "name": "index", "monotonic_seconds": 1}, bad])
+    measured = json.loads((tmp_path / "phase-timings-index.json").read_text())["measurements"]
+    assert measured["phases"][0]["status"] == "incomplete"
+    assert measured["phases"][1]["status"] == "not_started"
+
+
 def _pipeline_event(
     sequence: int,
     at: float,
@@ -845,7 +1034,9 @@ def test_checkpoint_rejects_unknown_remaining_work(
             ]
         )
     phase_events = len(events)
-    events.append({"event": "result", "result": {}})
+    # This checkpoint exercises unfinished work, not a premature success result.
+    for event in events:
+        event["monotonic_seconds"] = 0.0
 
     class Process:
         pid = 999999
@@ -1029,6 +1220,7 @@ def test_validation_child_never_constructs_native_producer(
     assert kicad_canary._run_worker(spec) == 0
     assert called == ["validator"]
     result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert isinstance(result.pop("monotonic_seconds"), float)
     assert result == {"event": "result", "result": {"validated": True}}
 
 

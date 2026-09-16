@@ -36,6 +36,7 @@ from cpp_context_engine.models import BuildScope, BuildVariant, GraphDirection, 
 from cpp_context_engine.runtime import build_runtime
 from cpp_context_engine.search import DeterministicLocalEmbeddingProvider, SQLiteVectorSearch
 from cpp_context_engine.storage import SQLiteStore
+from cpp_context_engine.storage.sqlite import SCHEMA_VERSION
 
 REPORT_SCHEMA_VERSION = 1
 DATABASE_ARTIFACT_POLICY = (
@@ -923,6 +924,109 @@ def _require_supervisor_platform() -> None:
         )
 
 
+class _PhaseMeasurements:
+    """The fixed canary phases, measured at worker boundaries, not pipe delivery."""
+
+    def __init__(self, stage: str, started: float, stage_started: float, total_tus: int) -> None:
+        self.names = (
+            ("validation",)
+            if stage == "validation"
+            else ("tu_processing", "post_tu_finalization", "embeddings", "producer_checks")
+        )
+        self.started = started
+        self.last_timestamp = stage_started
+        self.starts: list[float | None] = [None] * len(self.names)
+        self.ends: list[float | None] = [None] * len(self.names)
+        self.current = -1
+        self.counts: dict[str, Any] = {
+            "selected_tus": total_tus,
+            "staged_tus": total_tus if stage == "validation" else 0,
+            "indexing": None,
+            "embedded_symbols": None,
+        }
+
+    def _advance(self, name: str, timestamp: float) -> None:
+        next_index = self.current + 1
+        if next_index >= len(self.names) or self.names[next_index] != name:
+            raise ValueError("out-of-order worker phase")
+        if self.current >= 0:
+            self.ends[self.current] = timestamp
+        self.current = next_index
+        self.starts[self.current] = timestamp
+
+    def observe(self, event: Mapping[str, Any], received_at: float) -> bool:
+        timestamp = event.get("monotonic_seconds")
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+            or not self.last_timestamp <= timestamp <= received_at
+        ):
+            raise ValueError("invalid worker measurement timestamp")
+        kind = event["event"]
+        changed = True
+        if kind == "phase":
+            self._advance(
+                "tu_processing" if event.get("name") == "index" else event.get("name"),
+                timestamp,
+            )
+            for field in ("indexing", "embedded_symbols"):
+                if field in event:
+                    self.counts[field] = event[field]
+        elif kind == "tu_staged":
+            completed = event.get("completed")
+            if (
+                self.names[0] != "tu_processing"
+                or self.current != 0
+                or type(completed) is not int
+                or completed != self.counts["staged_tus"] + 1
+                or completed > self.counts["selected_tus"]
+            ):
+                raise ValueError("invalid staged TU measurement")
+            self.counts["staged_tus"] = completed
+            changed = completed == self.counts["selected_tus"]
+            # A partially staged stream has not reached the global finalization tail.
+            if changed:
+                self._advance("post_tu_finalization", timestamp)
+        elif kind == "result":
+            if self.current != len(self.names) - 1 or self.ends[self.current] is not None:
+                raise ValueError("worker result before all measurement phases")
+            result = event.get("result")
+            if not isinstance(result, Mapping):
+                raise ValueError("worker measurement result must be an object")
+            snapshot = result.get("semantic_snapshot", {})
+            if not isinstance(snapshot, Mapping):
+                raise ValueError("worker measurement snapshot must be an object")
+            self.ends[self.current] = timestamp
+            if "counts" in snapshot:
+                self.counts["table_counts"] = snapshot["counts"]
+        elif kind != "error":
+            raise ValueError("unknown worker measurement event")
+        self.last_timestamp = timestamp
+        return changed
+
+    def snapshot(self) -> dict[str, Any]:
+        phases = []
+        for name, start, end in zip(self.names, self.starts, self.ends, strict=True):
+            phases.append(
+                {
+                    "name": name,
+                    "status": "not_started"
+                    if start is None
+                    else "incomplete"
+                    if end is None
+                    else "complete",
+                    "start_seconds": None if start is None else start - self.started,
+                    "end_seconds": None if end is None else end - self.started,
+                    "duration_seconds": None if end is None else end - start,
+                    "observed_seconds": None
+                    if start is None
+                    else (end if end is not None else self.last_timestamp) - start,
+                }
+            )
+        return {"phases": phases, "counts": dict(self.counts)}
+
+
 def _run_supervised(
     spec_path: Path,
     gate_directory: Path,
@@ -938,6 +1042,32 @@ def _run_supervised(
     total_wall_seconds = float(spec.get("total_wall_seconds", limits.wall_seconds))
     full_project = bool(spec.get("full_project", False))
     phase = stage
+    measurements = _PhaseMeasurements(stage, started, stage_started, total_tus)
+    peak_rss = peak_swap = peak_database = peak_disk = 0
+
+    def persist_measurements() -> None:
+        _write_report_atomic(
+            gate_directory / f"phase-timings-{stage}.json",
+            json.dumps(
+                {
+                    "schema": "cpp-context-kicad-phase-timings",
+                    "schema_version": 1,
+                    "measurement_provenance": spec.get("measurement_provenance", {}),
+                    "limits": asdict(limits),
+                    "total_wall_seconds": total_wall_seconds,
+                    "captured_at_seconds": time.monotonic() - started,
+                    "peak_rss_bytes": peak_rss,
+                    "peak_swap_bytes": peak_swap,
+                    "peak_database_bytes": peak_database,
+                    "peak_disk_bytes": peak_disk,
+                    "measurements": measurements.snapshot(),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+        )
+
+    persist_measurements()
     command = [
         sys.executable,
         "-m",
@@ -969,7 +1099,6 @@ def _run_supervised(
     last_useful = stage_started
     last_signature: tuple[int, int, int] | None = None
     completed_tus = total_tus if stage == "validation" else 0
-    peak_rss = peak_swap = peak_database = peak_disk = 0
     stderr_tail: list[str] = []
     worker_result: dict[str, Any] | None = None
     violation: str | None = None
@@ -985,8 +1114,10 @@ def _run_supervised(
     observed_groups: set[_ProcessGroupIdentity] = set()
     observed_processes: set[_ProcessIdentity] = set()
     database = gate_directory / "index.db"
+    last_measurement_write = stage_started
     try:
         while process.poll() is None or not (stdout_eof and stderr_eof):
+            measurement_transition = False
             try:
                 kind, line = messages.get(timeout=0.1)
             except queue.Empty:
@@ -1004,6 +1135,16 @@ def _run_supervised(
                 except json.JSONDecodeError:
                     violation = "worker emitted non-JSON protocol output"
                 else:
+                    if isinstance(event, Mapping) and event.get("event") in {
+                        "phase",
+                        "tu_staged",
+                        "result",
+                        "error",
+                    }:
+                        try:
+                            measurement_transition = measurements.observe(event, time.monotonic())
+                        except (KeyError, TypeError, ValueError) as error:
+                            violation = violation or f"invalid phase measurement: {error}"
                     if not isinstance(event, Mapping):
                         violation = "worker emitted a non-object protocol payload"
                     elif event.get("event") == "analyzer_pipeline":
@@ -1022,7 +1163,12 @@ def _run_supervised(
                     elif event.get("event") == "error":
                         violation = str(event.get("message", "worker failed"))
                     elif event.get("event") == "phase":
-                        if event.get("name") not in {"index", "embeddings", "validation"}:
+                        if event.get("name") not in {
+                            "index",
+                            "embeddings",
+                            "producer_checks",
+                            "validation",
+                        }:
                             violation = "worker emitted an unknown phase"
                         else:
                             phase = str(event["name"])
@@ -1041,6 +1187,9 @@ def _run_supervised(
             peak_swap = max(peak_swap, budget_tree.swap)
             peak_database = max(peak_database, database_bytes)
             peak_disk = max(peak_disk, disk_bytes)
+            if measurement_transition or time.monotonic() - last_measurement_write >= 5:
+                persist_measurements()
+                last_measurement_write = time.monotonic()
             current = limits.violation(
                 elapsed=elapsed,
                 rss=budget_tree.rss,
@@ -1110,6 +1259,7 @@ def _run_supervised(
         )
         for reader in readers:
             reader.join(timeout=1)
+        persist_measurements()
     if violation is not None:
         detail = stderr_tail[-1] if stderr_tail else ""
         raise RuntimeError(f"{violation}" + (f": {detail}" if detail else ""))
@@ -1122,6 +1272,7 @@ def _run_supervised(
         raise RuntimeError(f"analyzer pipeline telemetry did not finish safely: {error}") from None
     return {
         **worker_result,
+        "phase_measurements": measurements.snapshot(),
         **({"analyzer_pipeline": analyzer_report} if analyzer_report is not None else {}),
         "elapsed_seconds": time.monotonic() - stage_started,
         "total_elapsed_seconds": time.monotonic() - started,
@@ -1166,7 +1317,7 @@ def _write_worker_payload(payload: Mapping[str, Any]) -> None:
 
 
 def _worker_event(event: str, **fields: Any) -> None:
-    _write_worker_payload({"event": event, **fields})
+    _write_worker_payload({"event": event, "monotonic_seconds": time.monotonic(), **fields})
 
 
 def _worker_analyzer_event(event: AnalyzerPipelineEvent) -> None:
@@ -1451,13 +1602,14 @@ def _run_worker(spec_path: Path) -> int:
             indexing = ProjectIndexer(
                 _ObservedIngestor(ingestor, total), store, profile=profile
             ).index(project, cdb, build_variant=variant)
-            _worker_event("phase", name="embeddings")
+            _worker_event("phase", name="embeddings", indexing=asdict(indexing))
             embedded = SQLiteVectorSearch(
                 store,
                 DeterministicLocalEmbeddingProvider(int(spec["embedding_dimensions"])),
                 project_root=project,
                 build_scope=scope,
             ).index_missing()
+        _worker_event("phase", name="producer_checks", embedded_symbols=embedded)
         config = AppConfig(
             project_root=project,
             index_directory=database.parent,
@@ -1478,6 +1630,10 @@ def _run_worker(spec_path: Path) -> int:
         with _database_writer_exclusion(database) as connection:
             integrity = _validate_database_integrity(connection)
             database_artifact = _database_artifact_digest(database)
+        analyzer_sha256 = _sha256(analyzer)
+        expected_analyzer = spec.get("measurement_provenance", {}).get("analyzer_sha256")
+        if expected_analyzer is not None and analyzer_sha256 != expected_analyzer:
+            raise RuntimeError("analyzer changed from the phase measurement input pin")
         _worker_event(
             "result",
             result={
@@ -1497,7 +1653,7 @@ def _run_worker(spec_path: Path) -> int:
                     "protocol_version": info.protocol_version,
                     "clang_major": info.clang_major,
                     "capabilities": sorted(info.capabilities),
-                    "sha256": _sha256(analyzer),
+                    "sha256": analyzer_sha256,
                 },
                 "native_spool_budget_bytes": ingestor.max_spool_bytes,
             },
@@ -1759,6 +1915,7 @@ def run_canary(
         "gates": gate_reports,
         "baseline_parity": baseline_report is not None,
     }
+    analyzer_sha256 = _sha256(analyzer)
     baseline: Mapping[str, Any] | None = None
     baseline_gates: list[Mapping[str, Any]] = []
     if baseline_report is not None:
@@ -1794,6 +1951,18 @@ def run_canary(
             expected_translation_units = subset_metadata.normalized_configuration_count
             gate_generated_roots = canonical_generated_roots if gate == "all" else ()
             spec = {
+                "measurement_provenance": {
+                    "engine_commit": report["engine_commit"],
+                    "project_commit": report["project_commit"],
+                    "source_cdb_sha256": inspection.sha256,
+                    "subset_cdb_sha256": subset_metadata.sha256,
+                    "analyzer_sha256": analyzer_sha256,
+                    "expected_fact_schema_version": SCHEMA_VERSION,
+                    "profile": profile.value,
+                    "workers": workers,
+                    "embedding_dimensions": embedding_dimensions,
+                    "generated_source_roots": [str(root) for root in gate_generated_roots],
+                },
                 "gate_started_monotonic": gate_started,
                 "total_wall_seconds": total_timeouts[name],
                 "full_project": gate == "all",
@@ -1866,6 +2035,7 @@ def run_canary(
             if not validation.get("validated") or not validation.get("process_group_clean"):
                 raise RuntimeError("independent validator did not finish cleanly")
             gate_report["validation_elapsed_seconds"] = validation["elapsed_seconds"]
+            gate_report["validation_phase_measurements"] = validation.get("phase_measurements")
             gate_report["total_elapsed_seconds"] = validation["total_elapsed_seconds"]
             for field in (
                 "peak_rss_bytes",
