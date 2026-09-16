@@ -103,7 +103,7 @@ REQUIRED_CAPABILITIES = frozenset(
         "points_to_v1",
         "function_summaries_v1",
         "interprocedural_bindings_v1",
-        "compact_access_keys_v1",
+        "compact_structural_keys_v1",
     }
 )
 DEFAULT_TIMEOUT_SECONDS = 75.0
@@ -117,6 +117,39 @@ PROFILE_CAPABILITY = "analysis_profiles_v1"
 GENERATED_SOURCE_ROOTS_CAPABILITY = "generated_source_roots_v1"
 MAX_FACT_KINDS = 64
 _FRAME_HEADER = struct.Struct(">I")
+_WIRE_FACT_KEYS = {
+    "cfg_graph_v1": "g",
+    "cfg_block_v1": "b",
+    "cfg_element_v1": "e",
+    "data_flow_analysis_v1": "d",
+    "memory_location_v1": "m",
+    "data_access_v1": "a",
+    "data_flow_evidence_v1": "v",
+    "summary_effect_v1": "s",
+}
+_WIRE_REFERENCE_FIELDS = {
+    "graph_key": "g",
+    "entry_block_key": "b",
+    "normal_exit_block_key": "b",
+    "exceptional_exit_block_key": "b",
+    "block_key": "b",
+    "source_block_key": "b",
+    "target_block_key": "b",
+    "cfg_element_key": "e",
+    "analysis_key": "d",
+    "base_key": "m",
+    "location_key": "m",
+    "source_location_key": "m",
+    "target_location_key": "m",
+    "source_access_key": "a",
+    "target_access_key": "a",
+    "definition_access_key": "a",
+}
+
+
+def _wire_key(identity: str, family: str) -> str:
+    encoded = identity.encode("utf-8")
+    return identity if len(encoded) <= 66 else family + ":" + hashlib.sha256(encoded).hexdigest()
 
 
 class AnalyzerUnavailableError(RuntimeError):
@@ -1389,6 +1422,7 @@ class _FactBatchBuilder:
         self.memory_location_analysis_ids: dict[str, str] = {}
         self.data_access_ids: dict[str, str] = {}
         self.data_access_identity_keys: dict[str, str] = {}
+        self.wire_identities: dict[tuple[str, str], str] = {}
         self.data_access_analysis_ids: dict[str, str] = {}
         self.function_summary_ids: dict[str, str] = {}
         self.function_summary_analysis_ids: dict[str, str] = {}
@@ -1400,32 +1434,115 @@ class _FactBatchBuilder:
         if self.check_callback is not None:
             self.check_callback()
 
+    def _wire_reference(self, value: Any, family: str) -> Any:
+        if not isinstance(value, str) or not value.startswith(family + ":"):
+            return value
+        try:
+            return self.wire_identities[family, value]
+        except KeyError as error:
+            raise AnalyzerProtocolError(
+                "analyzer compact key references an unknown identity"
+            ) from error
+
+    def _prepare_wire_keys(self, facts: Iterable[Mapping[str, Any]]) -> None:
+        # Read only the six definition families; the disk registry stays compact.
+        for kind, family in tuple(_WIRE_FACT_KEYS.items())[:6]:
+            for fact in _fact_records(facts, kind):
+                self._check()
+                key = _string(fact, "key")
+                if not key.startswith(family + ":"):
+                    continue
+                if family == "g":
+                    identity = "cfg:" + _string(fact, "function_key")
+                elif family == "b":
+                    graph = self._wire_reference(_string(fact, "graph_key"), "g")
+                    identity = f"{graph}:block:{_non_negative_integer(fact, 'index')}"
+                elif family == "e":
+                    block = self._wire_reference(_string(fact, "block_key"), "b")
+                    identity = f"{block}:element:{_non_negative_integer(fact, 'index')}"
+                elif family == "d":
+                    identity = "data-flow:" + self._wire_reference(_string(fact, "graph_key"), "g")
+                elif family == "m":
+                    identity = _string(fact, "identity_key")
+                else:
+                    block = self._wire_reference(_string(fact, "block_key"), "b")
+                    identity = f"{block}:access:{_non_negative_integer(fact, 'sequence')}"
+                # A self-alias is not a shortened identity, even if its hash check is a no-op.
+                if (
+                    len(identity.encode("utf-8")) <= 66
+                    or _wire_key(identity, family) != key
+                    or (family, key) in self.wire_identities
+                ):
+                    raise AnalyzerProtocolError(
+                        "analyzer compact identity is inconsistent or duplicated"
+                    )
+                self.wire_identities[family, key] = identity
+
+    def _restore_wire_fact(self, fact: Mapping[str, Any]) -> Mapping[str, Any]:
+        restored = dict(fact)
+        for field, family in _WIRE_REFERENCE_FIELDS.items():
+            if field in restored:
+                restored[field] = self._wire_reference(restored[field], family)
+        if "parameter_location_keys" in restored:
+            restored["parameter_location_keys"] = [
+                self._wire_reference(key, "m")
+                for key in _string_list(fact, "parameter_location_keys")
+            ]
+        family = _WIRE_FACT_KEYS.get(str(fact.get("fact")))
+        key = fact.get("key")
+        if family and isinstance(key, str) and key.startswith(family + ":"):
+            if family == "v":
+                source = restored.get("source_access_key") or restored.get("source_location_key")
+                target = restored.get("target_access_key") or restored.get("target_location_key")
+                identity = (
+                    f"{_string(restored, 'analysis_key')}:evidence:"
+                    f"{_string(restored, 'relation')}:{source}:{target}"
+                )
+            elif family == "s":
+                identity = (
+                    f"{_string(restored, 'summary_key')}:effect:{_string(restored, 'kind')}:"
+                    f"{_string(restored, 'source_access_key')}"
+                )
+            else:
+                identity = self._wire_reference(key, family)
+            if _wire_key(identity, family) != key:
+                raise AnalyzerProtocolError("analyzer compact fact identity is inconsistent")
+            restored["key"] = identity
+        restored.pop("identity_key", None)
+        return restored
+
+    def _facts(self, facts: Iterable[Mapping[str, Any]], kind: str) -> Iterable[Mapping[str, Any]]:
+        for fact in _fact_records(facts, kind):
+            self._check()
+            yield self._restore_wire_fact(fact)
+
     def build(self, facts: Iterable[Mapping[str, Any]]) -> IngestionBatch:
         self._check()
-        for fact in _fact_records(facts, "file"):
+        for fact in self._facts(facts, "file"):
             self._check()
             self._file_fact(fact)
-        for fact in _fact_records(facts, "symbol"):
+        for fact in self._facts(facts, "symbol"):
             self._check()
             self._symbol_fact(fact)
-        for fact in _fact_records(facts, "include"):
+        for fact in self._facts(facts, "include"):
             if isinstance(fact.get("resolved_path"), str):
                 path = self._path(fact["resolved_path"])
                 self._file_symbol(path)
         occurrences: dict[str, SymbolOccurrence] = {}
         edges: dict[str, GraphEdge] = {}
-        for fact in _fact_records(facts, "occurrence"):
+        for fact in self._facts(facts, "occurrence"):
             self._check()
             occurrence = self._occurrence_fact(fact)
             occurrences[occurrence.id] = occurrence
         for fact_kind in ("edge", "include"):
-            for fact in _fact_records(facts, fact_kind):
+            for fact in self._facts(facts, fact_kind):
                 self._check()
                 edge = self._edge_fact(fact)
                 if edge is not None:
                     edges[edge.id] = edge
         callsites, call_targets = self._call_facts(facts)
         if self.profile is IndexProfile.FULL:
+            self._prepare_wire_keys(facts)
             cfg_graphs, cfg_blocks, cfg_elements, cfg_edges = self._cfg_facts(facts)
             analyses, locations, accesses, evidence = self._data_flow_facts(facts)
             summaries, effects, origins, argument_bindings, result_bindings = (
@@ -1493,9 +1610,9 @@ class _FactBatchBuilder:
         tuple[DataAccess, ...],
         tuple[DataFlowEvidence, ...],
     ]:
-        analysis_facts = list(_fact_records(facts, "data_flow_analysis_v1"))
-        location_facts = list(_fact_records(facts, "memory_location_v1"))
-        access_facts = list(_fact_records(facts, "data_access_v1"))
+        analysis_facts = list(self._facts(facts, "data_flow_analysis_v1"))
+        location_facts = list(self._facts(facts, "memory_location_v1"))
+        access_facts = list(self._facts(facts, "data_access_v1"))
         for fact in analysis_facts:
             key = _string(fact, "key")
             graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
@@ -1577,7 +1694,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._data_flow_evidence_fact(fact)
-                        for fact in _fact_records(facts, "data_flow_evidence_v1")
+                        for fact in self._facts(facts, "data_flow_evidence_v1")
                     ),
                     key=lambda item: (item.analysis_id, item.relation.value, item.id),
                 )
@@ -1779,7 +1896,7 @@ class _FactBatchBuilder:
         tuple[CallArgumentBinding, ...],
         tuple[CallResultBinding, ...],
     ]:
-        summary_facts = list(_fact_records(facts, "function_summary_v1"))
+        summary_facts = list(self._facts(facts, "function_summary_v1"))
         for fact in summary_facts:
             key = _string(fact, "key")
             analysis_id = self._known_data_flow_analysis(_string(fact, "analysis_key"))
@@ -1816,7 +1933,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._summary_effect_fact(fact)
-                        for fact in _fact_records(facts, "summary_effect_v1")
+                        for fact in self._facts(facts, "summary_effect_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -1825,7 +1942,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._summary_return_origin_fact(fact)
-                        for fact in _fact_records(facts, "summary_return_origin_v1")
+                        for fact in self._facts(facts, "summary_return_origin_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -1834,7 +1951,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._call_argument_binding_fact(fact)
-                        for fact in _fact_records(facts, "call_argument_binding_v1")
+                        for fact in self._facts(facts, "call_argument_binding_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -1843,7 +1960,7 @@ class _FactBatchBuilder:
                 sorted(
                     (
                         self._call_result_binding_fact(fact)
-                        for fact in _fact_records(facts, "call_result_binding_v1")
+                        for fact in self._facts(facts, "call_result_binding_v1")
                     ),
                     key=lambda item: item.id,
                 )
@@ -2035,7 +2152,7 @@ class _FactBatchBuilder:
     def _call_facts(
         self, facts: Iterable[Mapping[str, Any]]
     ) -> tuple[tuple[CallSite, ...], tuple[CallTarget, ...]]:
-        site_facts = list(_fact_records(facts, "callsite_v1"))
+        site_facts = list(self._facts(facts, "callsite_v1"))
         for fact in site_facts:
             key = _string(fact, "key")
             owner_id = self._known_id(_string(fact, "owner_key"))
@@ -2063,7 +2180,7 @@ class _FactBatchBuilder:
                 )[:32]
             )
         sites_by_key = {_string(fact, "key"): self._callsite_fact(fact) for fact in site_facts}
-        for fact in _fact_records(facts, "callsite_resolution_v1"):
+        for fact in self._facts(facts, "callsite_resolution_v1"):
             key = _string(fact, "callsite_key")
             try:
                 site = sites_by_key[key]
@@ -2083,7 +2200,7 @@ class _FactBatchBuilder:
         sites = tuple(sorted(sites_by_key.values(), key=lambda x: x.id))
         targets = tuple(
             sorted(
-                (self._call_target_fact(fact) for fact in _fact_records(facts, "call_target_v1")),
+                (self._call_target_fact(fact) for fact in self._facts(facts, "call_target_v1")),
                 key=lambda item: (item.callsite_id, item.target_symbol_id, item.id),
             )
         )
@@ -2169,8 +2286,8 @@ class _FactBatchBuilder:
         tuple[CfgElement, ...],
         tuple[CfgEdge, ...],
     ]:
-        graph_facts = list(_fact_records(facts, "cfg_graph_v1"))
-        block_facts = list(_fact_records(facts, "cfg_block_v1"))
+        graph_facts = list(self._facts(facts, "cfg_graph_v1"))
+        block_facts = list(self._facts(facts, "cfg_block_v1"))
         for fact in graph_facts:
             graph_key = _string(fact, "key")
             function_id = self._known_id(_string(fact, "function_key"))
@@ -2192,7 +2309,7 @@ class _FactBatchBuilder:
             block_graph_ids[block_key] = graph_id
             self.cfg_block_graph_ids[block_key] = graph_id
             self.cfg_block_ids[block_key] = "cfg_block_" + _hash_text(graph_id, str(index))[:32]
-        for fact in _fact_records(facts, "cfg_element_v1"):
+        for fact in self._facts(facts, "cfg_element_v1"):
             graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
             block_id = self._known_cfg_block(_string(fact, "block_key"))
             index = _non_negative_integer(fact, "index")
@@ -2217,7 +2334,7 @@ class _FactBatchBuilder:
             if any(block_graph_ids.get(key) != graph_id for key in endpoint_keys):
                 raise AnalyzerProtocolError("analyzer CFG facts have inconsistent graph references")
         for fact_kind in ("cfg_element_v1", "cfg_edge_v1"):
-            for fact in _fact_records(facts, fact_kind):
+            for fact in self._facts(facts, fact_kind):
                 if fact_kind == "cfg_element_v1":
                     graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
                     if block_graph_ids.get(_string(fact, "block_key")) != graph_id:
@@ -2245,13 +2362,13 @@ class _FactBatchBuilder:
         )
         elements = tuple(
             sorted(
-                (self._cfg_element_fact(fact) for fact in _fact_records(facts, "cfg_element_v1")),
+                (self._cfg_element_fact(fact) for fact in self._facts(facts, "cfg_element_v1")),
                 key=lambda item: (item.graph_id, item.block_id, item.index, item.id),
             )
         )
         edges = tuple(
             sorted(
-                (self._cfg_edge_fact(fact) for fact in _fact_records(facts, "cfg_edge_v1")),
+                (self._cfg_edge_fact(fact) for fact in self._facts(facts, "cfg_edge_v1")),
                 key=lambda item: (
                     item.graph_id,
                     item.source_block_id,

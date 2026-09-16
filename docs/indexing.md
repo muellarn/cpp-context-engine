@@ -39,11 +39,16 @@ are `file`, `symbol`, `occurrence`, `edge`, `include`, and the versioned
 `data_access_v1`, and `data_flow_evidence_v1` types;
 references use stable
 USR or location-derived keys that the Python adapter converts to canonical IDs.
-The mandatory `compact_access_keys_v1` capability uses block-plus-sequence access
-references, avoiding repeated analysis and storage-location strings in evidence
-and summary records. The adapter reconstructs the original identity inputs from
-the separate structural fields; persisted IDs, ordering and summary hashes remain
-unchanged. Return-origin identity keys retain their original spelling. Both peers
+The mandatory `compact_structural_keys_v1` capability projects the fixed CFG,
+analysis, access, memory-location, evidence and effect key families to typed
+SHA-256 references only when shorter than their original UTF-8 spelling. Native
+solver keys, ordering, cap selection and deduplication remain unchanged. The adapter
+reconstructs original identities from structural fields; memory definitions carry
+their original `identity_key` once because external offsets and field USRs cannot
+be reconstructed from names. Disk registries stay compact; existing typed builder
+passes resolve references and reject unknown, conflicting or duplicate aliases.
+Persisted IDs, ordering and summary hashes remain unchanged. Return-origin identity
+keys retain their original spelling. Both peers
 must confirm this capability during `hello`: rebuild the companion together with
 the Python package. Old clients are rejected before analysis, not silently given
 keys they would interpret as different graph identities.

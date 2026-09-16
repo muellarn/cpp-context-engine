@@ -98,7 +98,7 @@ def _fake_hello(*, gzip_transport: bool = False) -> dict[str, object]:
         "points_to_v1",
         "function_summaries_v1",
         "interprocedural_bindings_v1",
-        "compact_access_keys_v1",
+        "compact_structural_keys_v1",
         "analysis_profiles_v1",
     ]
     if gzip_transport:
@@ -278,7 +278,7 @@ def test_real_companion_rejects_generated_source_escape(tmp_path: Path, escape_k
         "protocol": "cpp-context-clang-facts",
         "protocol_version": 5,
         "required_clang_major": 18,
-        "required_capabilities": ["compact_access_keys_v1"],
+        "required_capabilities": ["compact_structural_keys_v1"],
     }
     analyze = {
         "type": "analyze",
@@ -319,7 +319,7 @@ def test_real_companion_accepts_v5_request_without_generated_roots(tmp_path: Pat
             "protocol": "cpp-context-clang-facts",
             "protocol_version": 5,
             "required_clang_major": 18,
-            "required_capabilities": ["compact_access_keys_v1"],
+            "required_capabilities": ["compact_structural_keys_v1"],
         },
         {
             "type": "analyze",
@@ -1043,7 +1043,7 @@ def test_native_handshake_matches_protocol_golden() -> None:
         "protocol": "cpp-context-clang-facts",
         "protocol_version": 5,
         "required_clang_major": 18,
-        "required_capabilities": ["compact_access_keys_v1"],
+        "required_capabilities": ["compact_structural_keys_v1"],
     }
     completed = subprocess.run(  # noqa: S603 - repository-built test binary
         [analyzer_binary()],
@@ -1066,7 +1066,7 @@ def test_real_companion_finalizes_gzip_when_rejecting_request() -> None:
         "protocol": "cpp-context-clang-facts",
         "protocol_version": 5,
         "required_clang_major": 18,
-        "required_capabilities": ["compact_access_keys_v1"],
+        "required_capabilities": ["compact_structural_keys_v1"],
         "response_transport": "gzip_jsonl_v1",
     }
     malformed_analyze = {"type": "analyze"}
@@ -1544,9 +1544,12 @@ def test_compact_access_wire_keys_preserve_exact_legacy_batches_and_solutions(
     configuration = CompilationDatabase.load(
         TEMPLATE_DATAFLOW_FIXTURE / "compile_commands.json"
     ).configurations[0]
-    compact = fresh_native_client(analyzer_binary(), timeout_seconds=15).analyze(
+    wire = fresh_native_client(analyzer_binary(), timeout_seconds=15).analyze(
         TEMPLATE_DATAFLOW_FIXTURE, configuration
     )
+    identities = _FactBatchBuilder(TEMPLATE_DATAFLOW_FIXTURE.resolve(), configuration)
+    identities._prepare_wire_keys(wire)
+    compact = tuple(identities._restore_wire_fact(fact) for fact in wire)
     access_keys = {}
     for fact in compact:
         if fact["fact"] == "data_access_v1":
@@ -1581,12 +1584,12 @@ def test_compact_access_wire_keys_preserve_exact_legacy_batches_and_solutions(
         len(old.encode()) - len(short.encode()) for short, old in access_keys.items()
     )
     assert minimum_saving > 0
-    assert wire_size(legacy) - wire_size(compact) >= minimum_saving
+    assert wire_size(legacy) - wire_size(wire) >= minimum_saving
     batches = [
         NativeClangIngestor._merge_batches(
             (_FactBatchBuilder(TEMPLATE_DATAFLOW_FIXTURE.resolve(), configuration).build(facts),)
         )
-        for facts in (legacy, compact)
+        for facts in (legacy, wire)
     ]
     assert batches[0] == batches[1]
     assert all(_solution_hashes(batches[0]).values())
@@ -1624,12 +1627,14 @@ def test_compact_access_wire_keys_preserve_exact_legacy_batches_and_solutions(
 
 def test_native_compact_access_capability_is_required_by_client() -> None:
     hello = _fake_hello()
-    hello["capabilities"].remove("compact_access_keys_v1")
-    with pytest.raises(AnalyzerProtocolError, match="compact_access_keys_v1"):
+    hello["capabilities"].remove("compact_structural_keys_v1")
+    with pytest.raises(AnalyzerProtocolError, match="compact_structural_keys_v1"):
         NativeAnalyzerClient._validate_handshake(hello)
 
 
-@pytest.mark.parametrize("capabilities", [None, [], ["function_cfg_v1"]])
+@pytest.mark.parametrize(
+    "capabilities", [None, [], ["function_cfg_v1"], ["compact_access_keys_v1"]]
+)
 def test_native_rejects_clients_without_compact_access_confirmation(capabilities) -> None:
     hello = NativeAnalyzerClient._hello()
     if capabilities is None:
@@ -2202,7 +2207,7 @@ def test_analyze_revalidates_the_process_handshake(tmp_path: Path) -> None:
             "points_to_v1",
             "function_summaries_v1",
             "interprocedural_bindings_v1",
-            "compact_access_keys_v1",
+            "compact_structural_keys_v1",
         ],
     }
     script = _script(

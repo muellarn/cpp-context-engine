@@ -36,9 +36,11 @@
 #include "clang/Tooling/Tooling.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "path_cache.h"
@@ -61,7 +63,7 @@ const std::vector<std::string> kCapabilities = {
     "macro_expansion_stack", "template_relationships_v1",
     "intraprocedural_dataflow_v1", "points_to_v1", "function_summaries_v1",
     "interprocedural_bindings_v1", "gzip_jsonl_v1", "analysis_profiles_v1",
-    "generated_source_roots_v1", "compact_access_keys_v1"};
+    "generated_source_roots_v1", "compact_structural_keys_v1"};
 
 class OutputWriter {
 public:
@@ -161,6 +163,50 @@ std::optional<std::string> requiredString(const llvm::json::Object &object,
   return std::nullopt;
 }
 
+std::string wireKey(llvm::StringRef key, char family) {
+  if (key.size() <= 66)
+    return key.str();
+  llvm::SHA256 digest;
+  digest.update(key);
+  return std::string(1, family) + ":" + llvm::toHex(digest.final(), true);
+}
+
+void projectWireKeys(llvm::json::Object &fact) {
+  const auto kind = fact.getString("fact").value_or("");
+  char family = 0;
+  if (kind == "cfg_graph_v1") family = 'g';
+  else if (kind == "cfg_block_v1") family = 'b';
+  else if (kind == "cfg_element_v1") family = 'e';
+  else if (kind == "data_flow_analysis_v1") family = 'd';
+  else if (kind == "memory_location_v1") family = 'm';
+  else if (kind == "data_access_v1") family = 'a';
+  else if (kind == "data_flow_evidence_v1") family = 'v';
+  else if (kind == "summary_effect_v1") family = 's';
+  if (family) {
+    if (const auto key = fact.getString("key")) {
+      const auto projected = wireKey(*key, family);
+      // External declaration offsets and field USRs are not separate fact fields.
+      if (family == 'm' && projected != *key)
+        fact["identity_key"] = key->str();
+      fact["key"] = projected;
+    }
+  }
+  static const std::pair<const char *, char> references[] = {
+      {"graph_key", 'g'}, {"entry_block_key", 'b'}, {"normal_exit_block_key", 'b'},
+      {"exceptional_exit_block_key", 'b'}, {"block_key", 'b'},
+      {"source_block_key", 'b'}, {"target_block_key", 'b'}, {"cfg_element_key", 'e'},
+      {"analysis_key", 'd'}, {"base_key", 'm'}, {"location_key", 'm'},
+      {"source_location_key", 'm'}, {"target_location_key", 'm'},
+      {"source_access_key", 'a'}, {"target_access_key", 'a'}, {"definition_access_key", 'a'}};
+  for (const auto &[field, type] : references)
+    if (const auto key = fact.getString(field))
+      fact[field] = wireKey(*key, type);
+  if (auto *locations = fact.getArray("parameter_location_keys"))
+    for (auto &location : *locations)
+      if (const auto key = location.getAsString())
+        location = wireKey(*key, 'm');
+}
+
 class FactSink {
 public:
   explicit FactSink(bool navigationOnly = false) : navigationOnly_(navigationOnly) {}
@@ -175,6 +221,8 @@ public:
     }
     if (!sortKeys_.insert(std::move(sortKey)).second)
       return;
+    // Projection must not affect native ordered sets, cap selection or dedupe.
+    projectWireKeys(fact);
     fact["type"] = "fact";
     emit(std::move(fact));
   }
@@ -2880,10 +2928,10 @@ bool handleHello(const llvm::json::Object &request) {
       std::none_of(requiredCapabilities->begin(), requiredCapabilities->end(),
                    [](const auto &value) {
                      const auto capability = value.getAsString();
-                     return capability && *capability == "compact_access_keys_v1";
+                     return capability && *capability == "compact_structural_keys_v1";
                    })) {
     // Older clients ignore added server capabilities and would derive wrong IDs.
-    emitError("capability_mismatch", "client must confirm compact_access_keys_v1");
+    emitError("capability_mismatch", "client must confirm compact_structural_keys_v1");
     return false;
   }
   llvm::json::Array capabilities;
