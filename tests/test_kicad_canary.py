@@ -6,10 +6,12 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from cpp_context_engine import kicad_canary
+from cpp_context_engine.api import DataFlowResult, FlowRequest
 from cpp_context_engine.ingestion import AnalyzerPipelineEvent, AnalyzerSlotIdleError
 from cpp_context_engine.kicad_canary import (
     CanaryLimits,
@@ -846,6 +848,7 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
                 "semantic_snapshot": {"digest": "facts"},
                 "rankings": {"query": ["symbol"]},
                 "public_orderings": {"query": {"digest": "ordered"}},
+                "summary_orderings": {"query": {"digest": "summary-ordered"}},
                 "database_provenance": {"coverage": "complete"},
                 "database_artifact_sha256": "database",
                 "database_sidecar_policy": kicad_canary.DATABASE_ARTIFACT_POLICY,
@@ -899,6 +902,12 @@ def test_baseline_comparison_pins_revision_cdb_selection_semantics_and_ranking()
             ),
             "public_orderings",
         ),
+        (
+            lambda baseline: baseline["gates"][0]["summary_orderings"]["query"].update(
+                digest="different"
+            ),
+            "summary_orderings",
+        ),
     ],
 )
 def test_baseline_comparison_requires_exact_provenance_and_gate_set(
@@ -922,6 +931,7 @@ def test_baseline_comparison_requires_exact_provenance_and_gate_set(
                 "semantic_snapshot": {"digest": "facts"},
                 "rankings": {"query": ["symbol"]},
                 "public_orderings": {"query": {"digest": "ordered"}},
+                "summary_orderings": {"query": {"digest": "summary-ordered"}},
                 "database_provenance": {"coverage": "complete"},
                 "database_artifact_sha256": "database",
                 "database_sidecar_policy": kicad_canary.DATABASE_ARTIFACT_POLICY,
@@ -945,6 +955,132 @@ def test_ordered_public_result_digest_preserves_list_order() -> None:
     assert kicad_canary._ordered_public_result_digest(first) != (
         kicad_canary._ordered_public_result_digest(reversed_result)
     )
+
+
+def test_public_summary_ordering_uses_service_order_and_baseline_pins_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effects = [{"effect_id": "first"}, {"effect_id": "second"}]
+
+    def collect(effect_order: list[dict[str, str]]) -> dict[str, object]:
+        flow = DataFlowResult.model_validate(
+            {
+                "function_symbol_id": "symbol",
+                "scope": {"variants": ["default"], "kind": "single", "label": "default"},
+                "truncated": False,
+                "analyses": [
+                    {
+                        "analysis_id": "analysis",
+                        "graph_id": "graph",
+                        "complete": True,
+                        "incomplete_reasons": [],
+                        "iteration_count": 1,
+                        "provenance": {
+                            "build_variant": "default",
+                            "build_configuration_id": "configuration",
+                            "translation_unit_id": "translation-unit",
+                        },
+                        "locations": [],
+                        "accesses": [],
+                        "evidence": [],
+                        "summary_complete": True,
+                        "summary_incomplete_reasons": [],
+                        "effects": [
+                            {
+                                **effect,
+                                "kind": "read",
+                                "location_kind": "parameter",
+                                "certainty": "certain",
+                                "reason": "fixture",
+                                "parameter_index": 0,
+                                "access_path": [],
+                                "is_local": True,
+                                "via_callsite_id": None,
+                                "target_symbol_id": None,
+                            }
+                            for effect in effect_order
+                        ],
+                        "return_origins": [],
+                        "interprocedural": [],
+                    }
+                ],
+            }
+        )
+
+        class Service:
+            def __init__(self) -> None:
+                self.requests: list[object] = []
+
+            def control_flow(self, _request: object) -> dict[str, object]:
+                return {"blocks": []}
+
+            def data_flow(self, request: object) -> object:
+                self.requests.append(request)
+                return flow
+
+            def calls(self, _request: object) -> dict[str, object]:
+                return {"calls": []}
+
+        service = Service()
+        hit = SimpleNamespace(symbol=SimpleNamespace(id="symbol"), score=1.0, source="lexical")
+        runtime = SimpleNamespace(
+            analysis_service=service,
+            query_context=lambda _request: SimpleNamespace(
+                context=SimpleNamespace(items=[SimpleNamespace(hit=hit, reason="pinned")])
+            ),
+        )
+        monkeypatch.setattr(
+            kicad_canary,
+            "build_runtime",
+            lambda _config: kicad_canary.contextlib.nullcontext(runtime),
+        )
+        config = SimpleNamespace(
+            build_scope=SimpleNamespace(variants=("default",)),
+            index_profile=IndexProfile.FULL,
+        )
+
+        _rankings, _public_orderings, summaries = kicad_canary._ranking_canaries(config, ("query",))
+
+        assert len(service.requests) == 1
+        assert isinstance(service.requests[0], FlowRequest)
+        return summaries
+
+    forward = collect(effects)
+    reverse = collect(list(reversed(effects)))
+    assert sorted(effect["effect_id"] for effect in effects) == sorted(
+        effect["effect_id"] for effect in reversed(effects)
+    )
+    assert forward != reverse
+    with pytest.raises(RuntimeError, match="summary_orderings"):
+        kicad_canary._compare_baseline_gate(
+            {"gate": 1, "summary_orderings": forward},
+            {"gate": 1, "summary_orderings": reverse},
+        )
+
+
+def test_public_summary_ordering_reports_navigation_unavailability() -> None:
+    flow = DataFlowResult.model_validate(
+        {
+            "function_symbol_id": "symbol",
+            "scope": {"variants": ["default"], "kind": "single", "label": "default"},
+            "analyses": [],
+            "truncated": False,
+            "available": False,
+            "unavailable_reason": "deep facts are not materialized",
+            "required_action": "materialize_deep_analysis",
+        }
+    )
+
+    evidence = kicad_canary._public_summary_ordering(flow, required=False)
+
+    assert evidence == {
+        "symbol_id": "symbol",
+        "available": False,
+        "unavailable_reason": "deep facts are not materialized",
+        "required_action": "materialize_deep_analysis",
+    }
+    with pytest.raises(RuntimeError, match="full-profile public summary"):
+        kicad_canary._public_summary_ordering(flow, required=True)
 
 
 def test_baseline_mismatch_never_publishes_gate_success(
@@ -1043,6 +1179,64 @@ def test_baseline_mismatch_never_publishes_gate_success(
     failed = output / ".gate-1.failed"
     assert (failed / ".running").is_file()
     assert not (failed / "SUCCESS").exists()
+
+
+def test_setup_failure_after_running_marker_is_atomically_published(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(project), "file": str(source), "arguments": ["c++", str(source)]}],
+    )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    monkeypatch.setattr(
+        kicad_canary,
+        "write_subset_database",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("sensitive failure at /private/build/root")
+        ),
+    )
+    monkeypatch.setattr(
+        kicad_canary,
+        "_run_supervised",
+        lambda *_args: pytest.fail("worker must not start after setup failure"),
+    )
+    output = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="sensitive failure"):
+        kicad_canary.run_canary(
+            project_root=project,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=output,
+            gates=(1,),
+            gate_timeouts={"1": 1.0},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            embedding_dimensions=1,
+            queries=("main",),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=1,
+        )
+
+    failed = output / ".gate-1.failed"
+    assert failed.is_dir()
+    assert (failed / ".running").is_file()
+    assert not (failed / "SUCCESS").exists()
+    failure = (failed / "FAILURE.json").read_text(encoding="utf-8")
+    assert "gate_setup" in failure
+    assert "RuntimeError" in failure
+    assert "private/build/root" not in failure
 
 
 def test_unclean_process_tree_never_publishes_gate_success(
@@ -1194,6 +1388,7 @@ def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
             ),
             "rankings": {},
             "public_orderings": {},
+            "summary_orderings": {},
             "semantic_snapshot": semantic_snapshot(database),
             "database_provenance": database_provenance(database),
             "database_artifact_sha256": kicad_canary._database_artifact_digest(database).sha256,
@@ -1221,7 +1416,7 @@ def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
 
     monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
     monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
-    monkeypatch.setattr(kicad_canary, "_ranking_canaries", lambda *_args: ({}, {}))
+    monkeypatch.setattr(kicad_canary, "_ranking_canaries", lambda *_args: ({}, {}, {}))
     output = tmp_path / "output"
     if tamper == "writer-before-publish":
         original_sha256 = kicad_canary._sha256

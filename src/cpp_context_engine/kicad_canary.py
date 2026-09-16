@@ -1116,11 +1116,57 @@ def _ordered_public_result_digest(result: Any) -> str:
     return hashlib.sha256(document.encode("utf-8")).hexdigest()
 
 
+def _public_summary_ordering(data_flow: Any, *, required: bool) -> dict[str, Any]:
+    # Row digests cannot detect changes in the public service's summary ordering.
+    payload = data_flow.model_dump(mode="json")
+    analyses = [
+        {
+            field: analysis.get(field)
+            for field in (
+                "analysis_id",
+                "summary_complete",
+                "summary_incomplete_reasons",
+                "effects",
+                "return_origins",
+                "interprocedural",
+            )
+        }
+        for analysis in payload.get("analyses", ())
+        if analysis.get("summary_complete") is not None
+    ]
+    available = bool(getattr(data_flow, "available", True)) and bool(analyses)
+    if not available:
+        if required:
+            raise RuntimeError("full-profile public summary response is unavailable")
+        return {
+            "symbol_id": data_flow.function_symbol_id,
+            "available": False,
+            "unavailable_reason": (
+                getattr(data_flow, "unavailable_reason", None)
+                or "public summary data is not materialized"
+            ),
+            "required_action": getattr(data_flow, "required_action", None),
+        }
+    summary_payload = {
+        "function_symbol_id": payload["function_symbol_id"],
+        "scope": payload["scope"],
+        "truncated": payload["truncated"],
+        "analyses": analyses,
+    }
+    return {
+        "symbol_id": data_flow.function_symbol_id,
+        "available": True,
+        "analysis_count": len(analyses),
+        "digest": _ordered_public_result_digest(summary_payload),
+    }
+
+
 def _ranking_canaries(
     config: AppConfig, queries: Sequence[str]
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     rankings: dict[str, Any] = {}
     public_orderings: dict[str, Any] = {}
+    summary_orderings: dict[str, Any] = {}
     with build_runtime(config) as runtime:
         for query in queries:
             response = runtime.query_context(
@@ -1142,6 +1188,16 @@ def _ranking_canaries(
             ]
             analyses: list[dict[str, Any]] = []
             seen_symbols: set[str] = set()
+            pinned_symbol_id = response.items[0].hit.symbol.id if response.items else None
+            if pinned_symbol_id is None:
+                if config.index_profile == IndexProfile.FULL:
+                    raise RuntimeError("full-profile canary query returned no pinned symbol")
+                summary_orderings[query] = {
+                    "symbol_id": None,
+                    "available": False,
+                    "unavailable_reason": "canary query returned no pinned symbol",
+                    "required_action": None,
+                }
             for item in response.items:
                 symbol_id = item.hit.symbol.id
                 if symbol_id in seen_symbols:
@@ -1159,6 +1215,11 @@ def _ranking_canaries(
                         builds=list(config.build_scope.variants),
                     )
                 )
+                if symbol_id == pinned_symbol_id:
+                    summary_orderings[query] = _public_summary_ordering(
+                        data_flow,
+                        required=config.index_profile == IndexProfile.FULL,
+                    )
                 incoming = runtime.analysis_service.calls(
                     CallRequest(
                         symbol_id=symbol_id,
@@ -1186,7 +1247,7 @@ def _ranking_canaries(
                 "retrieval_symbol_ids": [item.hit.symbol.id for item in response.items],
                 "analyses": analyses,
             }
-    return rankings, public_orderings
+    return rankings, public_orderings, summary_orderings
 
 
 def _revalidate_final_artifacts(
@@ -1238,10 +1299,11 @@ def _revalidate_final_artifacts(
             analyzer_max_workers=workers,
             embedding_dimensions=embedding_dimensions,
         )
-        rankings, public_orderings = _ranking_canaries(config, queries)
+        rankings, public_orderings, summary_orderings = _ranking_canaries(config, queries)
         parent_evidence = {
             "rankings": rankings,
             "public_orderings": public_orderings,
+            "summary_orderings": summary_orderings,
             "semantic_snapshot": snapshot,
             "database_provenance": provenance,
             "database_artifact_sha256": database_artifact.sha256,
@@ -1338,7 +1400,9 @@ def _run_worker(spec_path: Path) -> int:
             analyzer_max_workers=int(spec["workers"]),
             embedding_dimensions=int(spec["embedding_dimensions"]),
         )
-        rankings, public_orderings = _ranking_canaries(config, tuple(spec["queries"]))
+        rankings, public_orderings, summary_orderings = _ranking_canaries(
+            config, tuple(spec["queries"])
+        )
         snapshot = semantic_snapshot(database)
         provenance = database_provenance(database)
         with _database_writer_exclusion(database) as connection:
@@ -1351,6 +1415,7 @@ def _run_worker(spec_path: Path) -> int:
                 "embedded_symbols": embedded,
                 "rankings": rankings,
                 "public_orderings": public_orderings,
+                "summary_orderings": summary_orderings,
                 "semantic_snapshot": snapshot,
                 "database_provenance": provenance,
                 "database_artifact_sha256": database_artifact.sha256,
@@ -1464,6 +1529,7 @@ def _compare_baseline_gate(gate: Mapping[str, Any], baseline_gate: Mapping[str, 
         "semantic_snapshot",
         "rankings",
         "public_orderings",
+        "summary_orderings",
         "database_provenance",
         "database_artifact_sha256",
         "database_sidecar_policy",
@@ -1480,6 +1546,35 @@ def _compare_baseline(report: Mapping[str, Any], baseline: Mapping[str, Any]) ->
         _comparable_gates(report), _comparable_gates(baseline), strict=True
     ):
         _compare_baseline_gate(gate, baseline_gate)
+
+
+@contextlib.contextmanager
+def _gate_failure_publication(running: Path, failed: Path) -> Iterator[None]:
+    try:
+        yield
+    except BaseException as error:
+        if running.exists():
+            (running / "SUCCESS").unlink(missing_ok=True)
+            error_type = "".join(
+                character
+                for character in type(error).__name__
+                if character.isalnum() or character == "_"
+            )[:128]
+            _write_report_atomic(
+                running / "FAILURE.json",
+                json.dumps(
+                    {
+                        "schema": "cpp-context-kicad-canary-failure",
+                        "schema_version": 1,
+                        "cause": "gate_setup_or_execution_failed",
+                        "error_type": error_type or "Exception",
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+            )
+            running.rename(failed)
+        raise
 
 
 def run_canary(
@@ -1565,37 +1660,40 @@ def run_canary(
         running.mkdir()
         running_marker = running / ".running"
         _write_report_atomic(running_marker, "incomplete\n")
-        subset = running / "compile_commands.json"
-        subset_metadata = write_subset_database(inspection.compilation_database, selected, subset)
-        if gate != "all" and (
-            subset_metadata.normalized_configuration_count != subset_metadata.raw_entry_count
-        ):
-            raise RuntimeError("numeric gate did not select unique compiler configurations")
-        expected_translation_units = subset_metadata.normalized_configuration_count
-        gate_generated_roots = canonical_generated_roots if gate == "all" else ()
-        spec = {
-            "project_root": str(inspection.project_root),
-            "compilation_database": str(subset),
-            "database": str(running / "index.db"),
-            "analyzer": str(analyzer),
-            "translation_units": expected_translation_units,
-            "workers": workers,
-            "analyzer_timeout_seconds": analyzer_timeout_seconds,
-            "embedding_dimensions": embedding_dimensions,
-            "queries": list(queries),
-            "profile": profile.value,
-            "generated_source_roots": [str(root) for root in gate_generated_roots],
-        }
-        spec_path = running / "worker-spec.json"
-        _write_report_atomic(spec_path, json.dumps(spec, sort_keys=True) + "\n")
-        limits = CanaryLimits(
-            wall_seconds=gate_timeouts[name],
-            rss_bytes=rss_bytes,
-            database_bytes=database_bytes,
-            disk_bytes=disk_bytes,
-            no_progress_seconds=no_progress_seconds,
-        )
-        try:
+        # Setup used to escape the failure boundary and leave an ambiguous live gate.
+        with _gate_failure_publication(running, failed):
+            subset = running / "compile_commands.json"
+            subset_metadata = write_subset_database(
+                inspection.compilation_database, selected, subset
+            )
+            if gate != "all" and (
+                subset_metadata.normalized_configuration_count != subset_metadata.raw_entry_count
+            ):
+                raise RuntimeError("numeric gate did not select unique compiler configurations")
+            expected_translation_units = subset_metadata.normalized_configuration_count
+            gate_generated_roots = canonical_generated_roots if gate == "all" else ()
+            spec = {
+                "project_root": str(inspection.project_root),
+                "compilation_database": str(subset),
+                "database": str(running / "index.db"),
+                "analyzer": str(analyzer),
+                "translation_units": expected_translation_units,
+                "workers": workers,
+                "analyzer_timeout_seconds": analyzer_timeout_seconds,
+                "embedding_dimensions": embedding_dimensions,
+                "queries": list(queries),
+                "profile": profile.value,
+                "generated_source_roots": [str(root) for root in gate_generated_roots],
+            }
+            spec_path = running / "worker-spec.json"
+            _write_report_atomic(spec_path, json.dumps(spec, sort_keys=True) + "\n")
+            limits = CanaryLimits(
+                wall_seconds=gate_timeouts[name],
+                rss_bytes=rss_bytes,
+                database_bytes=database_bytes,
+                disk_bytes=disk_bytes,
+                no_progress_seconds=no_progress_seconds,
+            )
             measured = _run_supervised(spec_path, running, limits, expected_translation_units)
             # Never publish success while an analyzer descendant observed by the supervisor lives.
             if measured.get("process_group_clean") is not True:
@@ -1643,10 +1741,6 @@ def run_canary(
                 gate_reports.append(gate_report)
                 running_marker.unlink()
                 _write_report_atomic(running / "SUCCESS", "complete\n")
-        except BaseException:
-            if running.exists():
-                running.rename(failed)
-            raise
     if _sha256(inspection.compilation_database) != inspection.sha256:
         raise RuntimeError("source compilation database changed during the canary")
     if baseline is not None:
