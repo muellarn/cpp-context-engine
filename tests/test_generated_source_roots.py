@@ -571,7 +571,7 @@ def test_schema_14_upgrades_generated_root_provenance_without_rewriting_old_buil
         "deep_tu_cache",
         "deep_materialization_units",
     } <= tables
-    assert version == 16
+    assert version == 17
 
 
 @pytest.mark.parametrize("stage", ["column", "publication"])

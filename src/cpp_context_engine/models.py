@@ -274,6 +274,7 @@ class TranslationUnit:
     cfg_facts_complete: bool | None = None
     data_flow_facts_complete: bool | None = None
     summary_facts_complete: bool | None = None
+    analyzer_identity: str = ""
 
 
 @dataclass(frozen=True, slots=True)

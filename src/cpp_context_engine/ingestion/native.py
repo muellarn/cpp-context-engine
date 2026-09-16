@@ -421,6 +421,23 @@ def _hash_text(*values: str) -> str:
     return digest.hexdigest()
 
 
+def _file_digest(path: Path, control: Any | None = None) -> str:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                if control is not None:
+                    control.check("file hashing")
+                digest.update(chunk)
+        if control is not None:
+            control.check("file hashing")
+        return digest.hexdigest()
+    except TimeoutError:
+        raise
+    except OSError as error:
+        raise RuntimeError("analysis input is unavailable") from error
+
+
 class NativeAnalyzerClient:
     """Execute one explicitly configured binary without a shell or unbounded pipes."""
 
@@ -465,6 +482,10 @@ class NativeAnalyzerClient:
         self.external_cancelled = external_cancelled
         self.decoded_budget = decoded_budget
         self._info: AnalyzerInfo | None = None
+
+    @property
+    def analyzer_identity(self) -> str:
+        return _file_digest(self.binary)
 
     def probe(self, *, refresh: bool = False) -> AnalyzerInfo:
         if self._info is not None and not refresh:
@@ -990,6 +1011,10 @@ class NativeClangIngestor:
     analysis_backend = "clang-libtooling"
 
     @property
+    def analyzer_identity(self) -> str:
+        return getattr(self.client, "analyzer_identity", "")
+
+    @property
     def analyzer_info(self) -> AnalyzerInfo:
         return self.client.probe()
 
@@ -1021,6 +1046,7 @@ class NativeClangIngestor:
         """Pipeline analysis and conversion while publishing TU batches in input order."""
 
         root = project_root.resolve(strict=False)
+        analyzer_identity = self.analyzer_identity
         self.client.probe()
         selected = tuple(configurations)
         if not selected:
@@ -1098,6 +1124,7 @@ class NativeClangIngestor:
                     selected[index],
                     self.profile,
                     check_callback=check_request,
+                    analyzer_identity=analyzer_identity,
                 ).build(facts)
             finally:
                 facts.close()
@@ -1286,6 +1313,9 @@ class NativeClangIngestor:
                             )
                         condition.notify_all()
                     del batch
+            # A binary replacement must abort the still-uncommitted TU generation.
+            if self.analyzer_identity != analyzer_identity:
+                raise RuntimeError("analyzer changed during indexing")
         finally:
             with condition:
                 stopped = True
@@ -1400,11 +1430,13 @@ class _FactBatchBuilder:
         profile: IndexProfile = IndexProfile.FULL,
         *,
         check_callback: Callable[[], None] | None = None,
+        analyzer_identity: str = "",
     ) -> None:
         self.root = root
         self.configuration = configuration
         self.boundary = SourceBoundary(root, configuration.generated_source_roots)
         self.profile = IndexProfile(profile)
+        self.analyzer_identity = analyzer_identity
         self.unit_id = translation_unit_id(configuration)
         self.symbols: dict[str, CodeSymbol] = {}
         self.keys: dict[str, str] = {}
@@ -1569,6 +1601,7 @@ class _FactBatchBuilder:
             cfg_facts_complete=self.profile is IndexProfile.FULL,
             data_flow_facts_complete=self.profile is IndexProfile.FULL,
             summary_facts_complete=self.profile is IndexProfile.FULL,
+            analyzer_identity=self.analyzer_identity,
         )
         return IngestionBatch(
             build_configurations=(self.configuration,),

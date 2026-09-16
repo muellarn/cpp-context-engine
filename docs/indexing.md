@@ -16,13 +16,14 @@ binding and native library must have compatible major versions.
 
 ## Full Clang-18 analyzer companion
 
-After upgrading the native analyzer for semantic fixes, create a fresh index
-directory. Normal incremental indexing does not track the analyzer binary hash,
-and deep materialization can reuse existing full-profile facts; neither operation
-guarantees that unchanged source files receive corrected facts. Deep overlays and
-native test caches use binary hashes, but that does not repair an existing full index.
-Automatic upgrade invalidation is tracked separately in
-[Issue #68](https://github.com/muellarn/cpp-context-engine/issues/68).
+Schema v17 records the producing native analyzer's SHA256 per translation unit,
+including its existing build/configuration scope. After upgrading the analyzer,
+run normal incremental `index` for each enabled build variant. Changed identities
+and legacy TUs with unknown provenance are reindexed even if sources and commands
+are unchanged; matching identities keep incremental hits. Full-to-Deep reuse
+rejects stale or unknown producers and requires this refresh first. Deep overlays
+retain their own binary-bound provenance without relabeling retained navigation
+facts. No wire-protocol change is required for a semantic analyzer fix.
 
 The optional `native/clang-analyzer` executable uses Clang LibTooling's full AST,
 `SourceManager`, and `PPCallbacks`. Configure it with CMake's installed LLVM and

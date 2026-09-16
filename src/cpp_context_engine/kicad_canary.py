@@ -1144,6 +1144,10 @@ class _ObservedIngestor:
         self.analysis_backend = delegate.analysis_backend
         self.advanced_facts_complete = delegate.advanced_facts_complete
 
+    @property
+    def analyzer_identity(self) -> str:
+        return self.delegate.analyzer_identity
+
     def iter_configuration_batches(
         self, project_root: Path, configurations: Iterable[Any]
     ) -> Iterable[Any]:
