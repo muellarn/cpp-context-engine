@@ -236,6 +236,7 @@ class _AnalyzerTelemetryMonitor:
         self._started: set[int] = set()
         self._finished: set[int] = set()
         self._outcomes: dict[int, str] = {}
+        self._intervals: dict[tuple[int, str], tuple[float, float | None, str | None]] = {}
 
     def observe_payload(self, payload: Mapping[str, Any]) -> None:
         event = AnalyzerPipelineEvent.from_protocol_payload(payload)
@@ -255,7 +256,86 @@ class _AnalyzerTelemetryMonitor:
             self._finished.add(event.configuration_index)
             assert event.outcome is not None
             self._outcomes[event.configuration_index] = event.outcome
+        if event.kind != "scheduling_state":
+            assert event.configuration_index is not None
+            self._observe_interval(
+                event.configuration_index,
+                "conversion"
+                if event.kind.startswith("conversion_")
+                else "native_transport_registry",
+                event.monotonic_seconds,
+                event.outcome,
+            )
         self._event_count += 1
+
+    def _observe_interval(
+        self, index: int, name: str, timestamp: float, outcome: str | None
+    ) -> None:
+        if type(index) is not int or not 0 <= index < self._expected_configurations:
+            raise ValueError("pipeline configuration index exceeds the workload")
+        key = (index, name)
+        previous = self._intervals.get(key)
+        if outcome is None:
+            if previous is not None:
+                raise ValueError("pipeline interval started twice")
+            self._intervals[key] = (timestamp, None, None)
+        else:
+            if previous is None or previous[1] is not None or timestamp < previous[0]:
+                raise ValueError("pipeline interval finished without an active start")
+            self._intervals[key] = (previous[0], timestamp, outcome)
+
+    def observe_consumer(self, event: Mapping[str, Any], received_at: float) -> None:
+        timestamp = event.get("monotonic_seconds")
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+            or not 0 <= timestamp <= received_at
+        ):
+            raise ValueError("invalid consumer measurement timestamp")
+        completed = event["event"] == "tu_staged"
+        self._observe_interval(
+            event["completed"] - 1 if completed else event["configuration_index"],
+            "consumer_staging",
+            timestamp,
+            "succeeded" if completed else None,
+        )
+
+    def partial_report(self, started: float) -> dict[str, Any]:
+        """Snapshot observations without running success/idle gates or inventing end events."""
+        configurations = []
+        for index in range(self._expected_configurations):
+            phases = {}
+            latest: tuple[float, str | None] = (-1, None)
+            for name in ("native_transport_registry", "conversion", "consumer_staging"):
+                start, end, outcome = self._intervals.get((index, name), (None, None, None))
+                phases[name] = {
+                    "status": "unknown"
+                    if start is None
+                    else "incomplete"
+                    if end is None
+                    else "complete",
+                    "start_seconds": None if start is None else start - started,
+                    "end_seconds": None if end is None else end - started,
+                    "duration_seconds": None if end is None else end - start,
+                    "outcome": outcome,
+                }
+                if start is not None:
+                    observed_at = end if end is not None else start
+                    if observed_at >= latest[0]:
+                        latest = (observed_at, name)
+            configurations.append(
+                {"configuration_index": index, "last_observed_phase": latest[1], "phases": phases}
+            )
+        return {
+            "clock": "monotonic_seconds_relative_to_gate_start",
+            "labels": {
+                "native_transport_registry": "native execution, transport and registry ingestion",
+                "conversion": "Python batch conversion and registry cleanup",
+                "consumer_staging": "consumer/staging including validation and counting wrappers",
+            },
+            "configurations": configurations,
+        }
 
     def check(self) -> None:
         self._gate.check()
@@ -1092,10 +1172,17 @@ def _run_supervised(
     phase = stage
     measurements = _PhaseMeasurements(stage, started, stage_started, total_tus)
     peak_rss = peak_swap = peak_database = peak_disk = 0
+    analyzer_telemetry = (
+        _AnalyzerTelemetryMonitor(
+            max_idle_seconds=limits.no_progress_seconds,
+            expected_configurations=total_tus,
+        )
+        if stage == "index"
+        else None
+    )
 
-    def persist_measurements() -> None:
-        _write_report_atomic(
-            gate_directory / f"phase-timings-{stage}.json",
+    def persist_measurements(*, preserve_failure: bool = False) -> None:
+        document = (
             json.dumps(
                 {
                     "schema": "cpp-context-kicad-phase-timings",
@@ -1109,11 +1196,23 @@ def _run_supervised(
                     "peak_database_bytes": peak_database,
                     "peak_disk_bytes": peak_disk,
                     "measurements": measurements.snapshot(),
+                    **(
+                        {"ingestion_pipeline": analyzer_telemetry.partial_report(started)}
+                        if analyzer_telemetry is not None
+                        else {}
+                    ),
                 },
                 sort_keys=True,
             )
-            + "\n",
+            + "\n"
         )
+        try:
+            _write_report_atomic(gate_directory / f"phase-timings-{stage}.json", document)
+        except OSError as error:
+            # A diagnostic write must not hide the failure that stopped indexing.
+            if not preserve_failure:
+                raise
+            print(f"canary: measurement write failed: {error}", file=sys.stderr)
 
     persist_measurements()
     command = [
@@ -1150,14 +1249,6 @@ def _run_supervised(
     stderr_tail: list[str] = []
     worker_result: dict[str, Any] | None = None
     violation: str | None = None
-    analyzer_telemetry = (
-        _AnalyzerTelemetryMonitor(
-            max_idle_seconds=limits.no_progress_seconds,
-            expected_configurations=total_tus,
-        )
-        if stage == "index"
-        else None
-    )
     stdout_eof = stderr_eof = False
     observed_groups: set[_ProcessGroupIdentity] = set()
     observed_processes: set[_ProcessIdentity] = set()
@@ -1203,8 +1294,15 @@ def _run_supervised(
                             analyzer_telemetry.observe_payload(event)
                         except (RuntimeError, ValueError) as error:
                             violation = f"invalid analyzer pipeline telemetry: {error}"
-                    elif event.get("event") == "tu_staged":
-                        completed_tus = int(event["completed"])
+                    elif event.get("event") in {"tu_staging", "tu_staged"}:
+                        try:
+                            if analyzer_telemetry is None:
+                                raise ValueError("validator emitted consumer telemetry")
+                            analyzer_telemetry.observe_consumer(event, time.monotonic())
+                        except (KeyError, TypeError, ValueError) as error:
+                            violation = violation or f"invalid consumer telemetry: {error}"
+                        if event["event"] == "tu_staged":
+                            completed_tus = int(event["completed"])
                     elif event.get("event") == "result":
                         worker_result = event["result"]
                         if stage == "validation":
@@ -1239,7 +1337,11 @@ def _run_supervised(
             peak_database = max(peak_database, database_bytes)
             peak_disk = max(peak_disk, disk_bytes)
             if measurement_transition or time.monotonic() - last_measurement_write >= 5:
-                persist_measurements()
+                # Pipeline transitions share this existing cadence: rewriting all TU
+                # observations on each event would add quadratic snapshot I/O.
+                persist_measurements(
+                    preserve_failure=violation is not None or process.poll() not in (None, 0)
+                )
                 last_measurement_write = time.monotonic()
             current = limits.violation(
                 elapsed=elapsed,
@@ -1310,7 +1412,11 @@ def _run_supervised(
         )
         for reader in readers:
             reader.join(timeout=1)
-        persist_measurements()
+        persist_measurements(
+            preserve_failure=violation is not None
+            or sys.exception() is not None
+            or process.poll() not in (None, 0)
+        )
     if violation is not None:
         detail = stderr_tail[-1] if stderr_tail else ""
         raise RuntimeError(f"{violation}" + (f": {detail}" if detail else ""))
@@ -1355,6 +1461,8 @@ class _ObservedIngestor:
     ) -> Iterable[Any]:
         batches = self.delegate.iter_configuration_batches(project_root, configurations)
         for completed, batch in enumerate(batches, start=1):
+            # This bounds the existing consumer wrapper, not only the SQLite call.
+            _worker_event("tu_staging", configuration_index=completed - 1)
             yield batch
             _worker_event("tu_staged", completed=completed, total=self.total)
 

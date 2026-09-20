@@ -96,6 +96,20 @@ and supervisor cleanup are outside these phase intervals; the existing total
 elapsed time remains authoritative and is not added to the phase sum. Analyzer
 slot times overlap TU processing and must not be added either.
 
+The index timing file also contains `ingestion_pipeline.configurations`, keyed by
+the selected compilation-database index. Its overlapping per-TU intervals distinguish
+`native_transport_registry` (native execution, transport and registry ingestion),
+`conversion` (Python batch conversion and registry cleanup), and `consumer_staging`
+(including the existing validation/counting wrappers, **not** pure SQLite time).
+Worker timestamps are retained even when delivery is delayed. Missing observations
+are `unknown`; open intervals are `incomplete` with null end/duration. A completed
+interval's `outcome` can still be failed/cancelled and does not imply gate success.
+These bounded observations share the existing five-second atomic snapshot cadence,
+global-phase flushes and final cleanup flush, not a write per TU event. If the
+supervisor is killed abruptly, only its last atomic snapshot is available; no final
+write or completion event is guaranteed. Existing success and resource gates remain
+unchanged.
+
 Snapshots are atomically retained at transitions, at most once per five seconds
 between transitions, and during supervisor cleanup. They retain configured input
 pins/budgets, resource peaks and available existing counts. Embedding counts are
