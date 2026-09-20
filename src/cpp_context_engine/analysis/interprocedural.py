@@ -424,10 +424,15 @@ def _solve_variant(
             if result is not None:
                 # Same-location origins overwrite the same flow; preserve the first
                 # key position and last certainty without rebuilding its hash/model.
-                return_locations = {
-                    origin.location_id: origin for origin in current_origins.get(callee.id, ())
-                }
-                for origin in return_locations.values():
+                return_locations = {}
+                # Both projection and winner construction need bounded cancellation.
+                for origin_index, origin in enumerate(current_origins.get(callee.id, ())):
+                    if check_cancelled is not None and origin_index % 256 == 0:
+                        check_cancelled()
+                    return_locations[origin.location_id] = origin
+                for origin_index, origin in enumerate(return_locations.values()):
+                    if check_cancelled is not None and origin_index % 256 == 0:
+                        check_cancelled()
                     flow = _flow(
                         InterproceduralFlowKind.RETURN_TO_CALLER,
                         caller,
