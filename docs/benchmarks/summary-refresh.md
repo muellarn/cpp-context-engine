@@ -30,6 +30,12 @@ copies. External supervision must still bound the complete invocation, including
 untimed copying, validation, RSS, swap, visible files, anonymous temporary files
 and cleanup; the refresh alarm is not a replacement for those guards.
 
+Four flushed `summary-replay:` start markers carry monotonic timestamps: `copy`
+(including manifest and source-artifact checks), `validation`, `refresh`, and
+`aftercheck`. A supervisor may report successive marker differences; an unfinished
+last interval has no duration. Only `measurement.seconds` is the isolated committed
+refresh timer; startup, copying, checks and cleanup must not be attributed to it.
+
 ```bash
 PYTHONPATH="$BASELINE/src" timeout --kill-after=5s 180s "$PYTHON" \
   "$CANDIDATE/tools/benchmark_summary_refresh.py" \

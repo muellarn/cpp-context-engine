@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_summary_input import full_facts as full_facts
 
 
 @pytest.fixture
@@ -248,3 +249,46 @@ def test_refresh_driver_keeps_canary_success_requirement(driver, tmp_path):
     (tmp_path / "gate-32").mkdir()
     (tmp_path / "gate-32" / "SUCCESS").write_text("complete\n")
     assert driver.load_input(path) == (tmp_path / "gate-32" / "index.db", evidence, gate)
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_refresh_driver_marks_real_fixture_phases_without_completing_timeout(
+    driver, full_facts, summary_input, tmp_path, monkeypatch, capsys, timeout
+):
+    from cpp_context_engine import summary_input as validator
+
+    request, _spec, _subset, original = full_facts
+    _path, contract = summary_input
+    validated = tmp_path / "validated"
+    validated.mkdir()
+    original_hash = validator._sha256(original)
+    evidence = validator.prepare(request, validated)
+    # This offline fixture tests replay markers, not the separately tested supervisor.
+    evidence["guard"] = contract["guard"]
+    manifest = validated / "summary-input.json"
+    manifest.write_text(json.dumps(evidence))
+    if timeout:
+
+        def expired(*_args):
+            raise TimeoutError("fixture refresh deadline")
+
+        monkeypatch.setattr(driver, "refresh", expired)
+        with pytest.raises(TimeoutError, match="fixture refresh deadline"):
+            driver.run(manifest, tmp_path / "trial", None, 90)
+    else:
+        report = driver.run(manifest, tmp_path / "trial", None, 90)
+        assert report["source_parity"] is True
+        assert len(report["after"]["table_digests"]) == 28
+    markers = [
+        line.split()
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("summary-replay:")
+    ]
+    expected = ["copy", "validation", "refresh"]
+    if not timeout:
+        expected.append("aftercheck")
+    assert [marker[1] for marker in markers] == expected
+    times = [float(marker[2]) for marker in markers]
+    assert all(value > 0 for value in times)
+    assert times == sorted(times)
+    assert validator._sha256(original) == original_hash

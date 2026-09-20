@@ -198,6 +198,7 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
     )
     from cpp_context_engine.models import IndexProfile
 
+    print(f"summary-replay: copy {time.monotonic():.9f}", flush=True)
     source, evidence, gate = load_input(input_report)
     expected_artifact = gate["database_artifact_sha256"]
     if _database_artifact_digest(source).sha256 != expected_artifact:
@@ -211,6 +212,7 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
         origin.backup(destination)
     if _database_artifact_digest(source).sha256 != expected_artifact:
         raise ValueError("source database changed during the backup")
+    print(f"summary-replay: validation {time.monotonic():.9f}", flush=True)
     before = semantic_snapshot(trial)
     if before != gate["semantic_snapshot"] or before["schema_version"] != SCHEMA_VERSION:
         raise ValueError("trial facts or schema do not match the retained input")
@@ -256,10 +258,11 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
 
         if not gate["summary_orderings"] or public_ordering() != gate["summary_orderings"]:
             raise ValueError("input public summary ordering differs from the retained input")
-        print("Input verified; starting isolated solve + persist + commit", flush=True)
+        print(f"summary-replay: refresh {time.monotonic():.9f}", flush=True)
         measurement = refresh(store, project_id, functions, seconds)
         if measurement["seconds"] >= seconds:
             raise TimeoutError(f"summary refresh did not finish below {seconds:g} seconds")
+        print(f"summary-replay: aftercheck {time.monotonic():.9f}", flush=True)
         integrity = _validate_database_integrity(store._connection)
         summary_orderings = public_ordering()
     after = semantic_snapshot(trial)
