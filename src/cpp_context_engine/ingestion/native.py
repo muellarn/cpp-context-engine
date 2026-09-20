@@ -2342,14 +2342,17 @@ class _FactBatchBuilder:
             block_graph_ids[block_key] = graph_id
             self.cfg_block_graph_ids[block_key] = graph_id
             self.cfg_block_ids[block_key] = "cfg_block_" + _hash_text(graph_id, str(index))[:32]
+        element_graph_mismatch = False
         for fact in self._facts(facts, "cfg_element_v1"):
             graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
-            block_id = self._known_cfg_block(_string(fact, "block_key"))
+            block_key = _string(fact, "block_key")
+            block_id = self._known_cfg_block(block_key)
             index = _non_negative_integer(fact, "index")
             self.cfg_element_ids[_string(fact, "key")] = (
                 "cfg_element_" + _hash_text(graph_id, block_id, str(index))[:32]
             )
             self.cfg_element_graph_ids[_string(fact, "key")] = graph_id
+            element_graph_mismatch |= block_graph_ids.get(block_key) != graph_id
 
         # A compromised or mismatched companion must not be able to persist a CFG
         # relation that crosses graph boundaries while still satisfying SQLite FKs.
@@ -2366,23 +2369,16 @@ class _FactBatchBuilder:
                 endpoint_keys.append(exceptional_key)
             if any(block_graph_ids.get(key) != graph_id for key in endpoint_keys):
                 raise AnalyzerProtocolError("analyzer CFG facts have inconsistent graph references")
-        for fact_kind in ("cfg_element_v1", "cfg_edge_v1"):
-            for fact in self._facts(facts, fact_kind):
-                if fact_kind == "cfg_element_v1":
-                    graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
-                    if block_graph_ids.get(_string(fact, "block_key")) != graph_id:
-                        raise AnalyzerProtocolError(
-                            "analyzer CFG facts have inconsistent graph references"
-                        )
-                    continue
-                graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
-                if any(
-                    block_graph_ids.get(_string(fact, key)) != graph_id
-                    for key in ("source_block_key", "target_block_key")
-                ):
-                    raise AnalyzerProtocolError(
-                        "analyzer CFG facts have inconsistent graph references"
-                    )
+        # Keep endpoint-error precedence without decoding the element spool again.
+        if element_graph_mismatch:
+            raise AnalyzerProtocolError("analyzer CFG facts have inconsistent graph references")
+        for fact in self._facts(facts, "cfg_edge_v1"):
+            graph_id = self._known_cfg_graph(_string(fact, "graph_key"))
+            if any(
+                block_graph_ids.get(_string(fact, key)) != graph_id
+                for key in ("source_block_key", "target_block_key")
+            ):
+                raise AnalyzerProtocolError("analyzer CFG facts have inconsistent graph references")
 
         graphs = tuple(
             sorted((self._cfg_graph_fact(fact) for fact in graph_facts), key=lambda item: item.id)
