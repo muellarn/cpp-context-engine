@@ -1,13 +1,21 @@
 # Real KiCad summary refresh (issue #47)
 
-This local benchmark depends on the issue #29 canary harness (PR #56) in the
-baseline and candidate revisions; merge #56 and rebase #47 before running it.
-First retain a successful **full-profile** real KiCad
+This local benchmark depends on the issue #29 canary harness in the baseline and
+candidate revisions. Its original input is a successful **full-profile** real KiCad
 `gate-32/index.db`, its `SUCCESS` marker and the parent `report.json`. Navigation
 databases and synthetic graphs are not acceptance workloads. The report pins the
 32 source TUs, compiler commands, KiCad commit, native analyzer binary, coverage,
 database artifact and canonical semantic hashes. Include fmt/template cases in
 the retained corpus and the existing focused semantic regressions.
+
+Alternatively, use the distinct `summary-input.json` and adjacent `index.db`
+produced by the [independent full32 summary-input validator](summary-input.md)
+(#82). That manifest must have completed guard/cleanup evidence, exact producer
+pins, all 28 semantic table digests and available deterministic public summaries.
+The replay driver rejects incomplete manifests and `candidate.json`; it never
+opens the manifest's failed `source_database` or reuses that original inode.
+This path does not require or create canary `SUCCESS`, complete embeddings or a
+successful whole index. Existing canary reports still require `SUCCESS`.
 
 Use the same committed driver, Python environment, input report and quiet machine
 for all three commands below. `BASELINE` and `CANDIDATE` are clean worktrees on
@@ -15,6 +23,12 @@ the main revision containing #29 and the #47 revision respectively. `CANARY` is
 the retained full canary output directory. `RUNS` must have space for three copies
 of the input database plus WAL/spool headroom; use native Linux storage. No Clang
 process is started by the refresh driver.
+
+For a validated summary input, replace each `--input-report` value below with its
+`summary-input.json`. Use the same input for baseline and both fresh candidate
+copies. External supervision must still bound the complete invocation, including
+untimed copying, validation, RSS, swap, visible files, anonymous temporary files
+and cleanup; the refresh alarm is not a replacement for those guards.
 
 ```bash
 PYTHONPATH="$BASELINE/src" timeout --kill-after=5s 180s "$PYTHON" \

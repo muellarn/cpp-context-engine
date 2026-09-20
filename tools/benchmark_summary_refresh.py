@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import platform
+import re
 import resource
 import signal
 import sqlite3
@@ -48,6 +49,137 @@ def refresh(store: SQLiteStore, project_id: int, functions: set[str], seconds: f
     return {"seconds": elapsed, "summaries_refreshed": count, "budget_seconds": seconds}
 
 
+def load_input(input_report: Path) -> tuple[Path, dict, dict]:
+    """Accept a successful canary or the distinct, guarded #82 input contract."""
+    from cpp_context_engine.kicad_canary import (
+        _SEMANTIC_TABLES,
+        CanaryLimits,
+        _validate_profile_provenance,
+    )
+    from cpp_context_engine.models import IndexProfile
+
+    evidence = json.loads(input_report.read_text())
+    if not isinstance(evidence, dict):
+        raise ValueError("summary input report must be an object")
+    if evidence.get("schema") == "cpp-context-validated-summary-input":
+        try:
+            if (
+                input_report.name != "summary-input.json"
+                or evidence["schema_version"] != 1
+                or evidence["scope"] != "full32-facts-and-summaries-only"
+                or evidence["producer_outcome"] != "failed"
+                or evidence["whole_index_success"] is not False
+                or evidence["embedding_completeness"] != "not_validated"
+                or evidence["database_integrity"] != "ok"
+            ):
+                raise ValueError("a published validated summary input is required")
+            pins = evidence["producer_pins"]
+            if pins["profile"] != "full" or pins["expected_fact_schema_version"] != SCHEMA_VERSION:
+                raise ValueError("summary input producer profile/schema mismatch")
+            for name in (
+                "engine_commit",
+                "project_commit",
+                "analyzer_sha256",
+                "source_cdb_sha256",
+                "subset_cdb_sha256",
+            ):
+                size = 40 if name.endswith("commit") else 64
+                if not re.fullmatch(rf"[0-9a-f]{{{size}}}", pins[name]):
+                    raise ValueError("summary input producer pin is malformed")
+            snapshot = evidence["semantic_snapshot"]
+            if (
+                snapshot["schema_version"] != SCHEMA_VERSION
+                or set(snapshot["table_digests"]) != set(_SEMANTIC_TABLES)
+                or set(snapshot["counts"]) != set(_SEMANTIC_TABLES)
+                or any(type(count) is not int or count < 0 for count in snapshot["counts"].values())
+                or snapshot["counts"]["translation_units"] != 32
+                or snapshot["counts"]["function_summaries"] < 1
+            ):
+                raise ValueError("summary input must retain all full32 semantic tables")
+            hashes = [
+                evidence["database_artifact_sha256"],
+                snapshot["digest"],
+                *snapshot["table_digests"].values(),
+            ]
+            evidence_hashes = evidence["producer_evidence_sha256"]
+            if len(evidence_hashes) != 3 or {Path(p).name for p in evidence_hashes} != {
+                "worker-spec.json",
+                "phase-timings-index.json",
+                "compile_commands.json",
+            }:
+                raise ValueError("summary input producer evidence is incomplete")
+            hashes.extend(evidence_hashes.values())
+            original = evidence["source_files"]["index.db"]
+            hashes.append(original["sha256"])
+            if type(original["bytes"]) is not int or original["bytes"] < 1:
+                raise ValueError("summary input original-file provenance is incomplete")
+            orderings = evidence["summary_orderings"]
+            if not 1 <= len(orderings) <= 8:
+                raise ValueError("summary input public selections are missing")
+            for symbol_id, item in orderings.items():
+                if (
+                    not symbol_id
+                    or item["symbol_id"] != symbol_id
+                    or item["available"] is not True
+                    or type(item["analysis_count"]) is not int
+                    or item["analysis_count"] < 1
+                ):
+                    raise ValueError("summary input public selection is incomplete")
+                hashes.append(item["digest"])
+            if any(not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in hashes):
+                raise ValueError("summary input semantic hash is malformed")
+            _validate_profile_provenance(evidence["database_provenance"], IndexProfile.FULL, 32)
+            guard = evidence["guard"]
+            limits = CanaryLimits(**guard["limits"])
+            peaks = guard["peak_bytes"]
+            if (
+                guard["processes_clean"] is not True
+                or guard["failure"] is not None
+                or not math.isfinite(guard["elapsed_seconds"])
+                or not 0 < guard["elapsed_seconds"] < limits.wall_seconds
+                or any(
+                    type(peaks[name]) is not int or peaks[name] < 0
+                    for name in ("rss", "swap", "database", "disk", "anonymous")
+                )
+                or peaks["anonymous"] > peaks["disk"]
+                or limits.violation(
+                    elapsed=guard["elapsed_seconds"],
+                    **{key: peaks[key] for key in ("rss", "swap", "database", "disk")},
+                )
+            ):
+                raise ValueError("summary input resource guard did not complete safely")
+            source = input_report.parent / "index.db"
+            identity = original["identity"]
+            if any(type(identity[k]) is not int or identity[k] < 0 for k in ("device", "inode")):
+                raise ValueError("summary input original identity is malformed")
+            state = source.stat()
+            # Never follow the failed producer path or replay its original inode.
+            if (
+                source.is_symlink()
+                or source.resolve() == Path(evidence["source_database"]).resolve()
+                or (state.st_dev, state.st_ino) == (identity["device"], identity["inode"])
+            ):
+                raise ValueError("summary replay requires the independently validated copy")
+        except (KeyError, TypeError, AttributeError, RuntimeError) as error:
+            raise ValueError("incomplete or malformed validated summary input") from error
+        return source, evidence, evidence
+
+    gates = [gate for gate in evidence.get("gates", ()) if gate["gate"] == 32]
+    if (
+        evidence.get("schema") != "cpp-context-kicad-canary-report"
+        or evidence.get("schema_version") != 1
+        or evidence.get("profile") != "full"
+        or len(gates) != 1
+        or gates[0].get("translation_units") != 32
+        or len(set(gates[0].get("selected_sources", ()))) != 32
+    ):
+        raise ValueError("a successful real 32-source-TU full-profile canary report is required")
+    source = input_report.parent / "gate-32" / "index.db"
+    if not (source.parent / "SUCCESS").is_file():
+        raise ValueError("retained bench32 gate lacks its SUCCESS marker")
+    return source, evidence, gates[0]
+
+
 def run(input_report: Path, output: Path, baseline: Path | None, seconds: float) -> dict:
     role = "candidate" if baseline is not None else "baseline"
     limit = 30 if baseline is not None else 90
@@ -66,24 +198,10 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
     )
     from cpp_context_engine.models import IndexProfile
 
-    evidence = json.loads(input_report.read_text())
-    gates = [gate for gate in evidence["gates"] if gate["gate"] == 32]
-    if (
-        evidence.get("schema") != "cpp-context-kicad-canary-report"
-        or evidence.get("schema_version") != 1
-        or evidence.get("profile") != "full"
-        or len(gates) != 1
-        or gates[0].get("translation_units") != 32
-        or len(set(gates[0].get("selected_sources", ()))) != 32
-    ):
-        raise ValueError("a successful real 32-source-TU full-profile canary report is required")
-    gate = gates[0]
-    source = input_report.parent / "gate-32" / "index.db"
-    if not (source.parent / "SUCCESS").is_file():
-        raise ValueError("retained bench32 gate lacks its SUCCESS marker")
+    source, evidence, gate = load_input(input_report)
     expected_artifact = gate["database_artifact_sha256"]
     if _database_artifact_digest(source).sha256 != expected_artifact:
-        raise ValueError("source database does not match the pinned canary artifact")
+        raise ValueError("source database does not match the pinned input artifact")
     output.mkdir(parents=True, exist_ok=False)
     trial = output / "index.db"
     with (
@@ -95,7 +213,7 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
         raise ValueError("source database changed during the backup")
     before = semantic_snapshot(trial)
     if before != gate["semantic_snapshot"] or before["schema_version"] != SCHEMA_VERSION:
-        raise ValueError("trial facts or schema do not match the retained canary")
+        raise ValueError("trial facts or schema do not match the retained input")
     provenance = database_provenance(trial)
     _validate_profile_provenance(provenance, IndexProfile.FULL, 32)
     expected = json.loads(baseline.read_text()) if baseline else None
@@ -137,7 +255,7 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
             }
 
         if not gate["summary_orderings"] or public_ordering() != gate["summary_orderings"]:
-            raise ValueError("input public summary ordering differs from the retained canary")
+            raise ValueError("input public summary ordering differs from the retained input")
         print("Input verified; starting isolated solve + persist + commit", flush=True)
         measurement = refresh(store, project_id, functions, seconds)
         if measurement["seconds"] >= seconds:
@@ -151,9 +269,23 @@ def run(input_report: Path, output: Path, baseline: Path | None, seconds: float)
         "engine_commit": _git_revision(Path(cpp_context_engine.__file__).resolve().parents[2]),
         "python": platform.python_version(),
         "zlib": zlib.ZLIB_RUNTIME_VERSION,
-        "canary_report": str(input_report.resolve()),
-        "project_commit": evidence["project_commit"],
-        "analyzer": gate["analyzer"],
+        "input_report": str(input_report.resolve()),
+        "input_schema": evidence["schema"],
+        **(
+            {
+                "project_commit": evidence["producer_pins"]["project_commit"],
+                "analyzer": {"sha256": evidence["producer_pins"]["analyzer_sha256"]},
+                "producer_pins": evidence["producer_pins"],
+                "producer_evidence_sha256": evidence["producer_evidence_sha256"],
+                "whole_index_success": False,
+            }
+            if evidence["schema"] == "cpp-context-validated-summary-input"
+            else {
+                "canary_report": str(input_report.resolve()),
+                "project_commit": evidence["project_commit"],
+                "analyzer": gate["analyzer"],
+            }
+        ),
         "source_artifact_sha256": expected_artifact,
         "provenance": provenance,
         "measurement": measurement,
