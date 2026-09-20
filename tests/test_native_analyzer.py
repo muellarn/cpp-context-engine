@@ -64,6 +64,7 @@ CFG_FIXTURE = Path(__file__).parent / "fixtures" / "cfg_project"
 IMPLICIT_FIXTURE = Path(__file__).parent / "fixtures" / "implicit_project"
 TEMPLATE_DATAFLOW_FIXTURE = Path(__file__).parent / "fixtures" / "template_dataflow_project"
 DATAFLOW_FIXTURE = Path(__file__).parent / "fixtures" / "dataflow_project"
+DISPATCH_FIXTURE = Path(__file__).parent / "fixtures" / "dispatch_project"
 pytestmark = pytest.mark.native
 
 
@@ -1215,7 +1216,7 @@ def test_navigation_profile_preserves_dataflow_resolved_indirect_call_targets() 
 
 @pytest.mark.parametrize(
     "project",
-    [DATAFLOW_FIXTURE, TEMPLATE_DATAFLOW_FIXTURE, IMPLICIT_FIXTURE, CFG_FIXTURE],
+    [DATAFLOW_FIXTURE, TEMPLATE_DATAFLOW_FIXTURE, IMPLICIT_FIXTURE, CFG_FIXTURE, DISPATCH_FIXTURE],
 )
 def test_navigation_profile_retains_exact_ordered_facts_across_advanced_fixtures(
     project: Path,

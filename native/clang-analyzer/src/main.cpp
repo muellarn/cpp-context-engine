@@ -1811,6 +1811,14 @@ private:
         addReads(expression, "read", anchor.first, anchor.second, statement);
     }
 
+    // Collection above can emit navigation symbols; preserve it and its order.
+    // Without indirect calls or tracked locations, the solver cannot refine a
+    // call or evaluate points-to expressions that might emit further symbols.
+    if (navigationOnly_ && indirectCalls.empty() &&
+        std::none_of(locations.begin(), locations.end(),
+                     [](const auto &entry) { return entry.second.tracksPointsTo; }))
+      return;
+
     std::map<std::string, const clang::CFGBlock *> keyToBlock;
     std::map<std::string, std::vector<std::string>> predecessors;
     for (const auto *block : blocks) {
