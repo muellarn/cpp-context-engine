@@ -325,6 +325,140 @@ def _solution_snapshot(store: SQLiteStore) -> tuple[tuple[object, ...], ...]:
     )
 
 
+def test_identical_refresh_preserves_payload_bytes_without_mutations(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        project_id = _seed_star(store, root, caller_count=2)
+        connection = store._connection
+        with connection:
+            store._refresh_summary_solutions(project_id, "default", {"f0", "f1", "f2"})
+        before = _solution_snapshot(store)
+        connection.execute("CREATE TEMP TABLE payload_mutations(kind TEXT)")
+        for operation in ("DELETE", "INSERT", "UPDATE"):
+            connection.execute(
+                f"CREATE TEMP TRIGGER observe_payload_{operation.lower()} "
+                f"AFTER {operation} ON summary_solution_payloads BEGIN "
+                f"INSERT INTO payload_mutations VALUES ('{operation}'); END"
+            )
+        with connection:
+            assert store._refresh_summary_solutions(project_id, "default", {"f0", "f1", "f2"}) == 3
+        assert _solution_snapshot(store) == before
+        assert list(connection.execute("SELECT kind FROM payload_mutations")) == []
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("encoding", "different-encoding"),
+        ("effect_count", 99),
+        ("origin_count", 99),
+        ("uncompressed_bytes", 99),
+        ("payload_hash", "different-hash"),
+        ("payload", b"different bytes with the original hash retained"),
+        ("missing", None),
+    ],
+)
+def test_refresh_repairs_each_changed_payload_field_and_missing_rows(
+    tmp_path: Path, column: str, value: object
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        project_id = _seed_star(store, root, caller_count=2)
+        connection = store._connection
+        with connection:
+            store._refresh_summary_solutions(project_id, "default", {"f0", "f1", "f2"})
+        before = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM summary_solution_payloads ORDER BY summary_id"
+            )
+        )
+        with connection:
+            if column == "missing":
+                connection.execute("DELETE FROM summary_solution_payloads WHERE summary_id='s1'")
+            else:
+                connection.execute(
+                    f"UPDATE summary_solution_payloads SET {column}=? WHERE summary_id='s1'",
+                    (value,),
+                )
+        with connection:
+            store._refresh_summary_solutions(project_id, "default", {"f0", "f1", "f2"})
+        assert (
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT * FROM summary_solution_payloads ORDER BY summary_id"
+                )
+            )
+            == before
+        )
+
+
+def test_changed_to_empty_deletes_only_the_affected_payload(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        project_id = _seed_star(store, root, caller_count=2)
+        _seed_star(store, root, caller_count=1, prefix="alt-", build_variant="alternative")
+        connection = store._connection
+        with connection:
+            store._refresh_summary_solutions(project_id, "default", {"f0", "f1", "f2"})
+            store._refresh_summary_solutions(project_id, "alternative", {"f0", "f1"})
+        untouched = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM summary_solution_payloads WHERE summary_id!='s1' ORDER BY summary_id"
+            )
+        )
+        with connection:
+            # Removing this caller's call makes its former propagated payload empty.
+            connection.execute("DELETE FROM callsites WHERE id='c1'")
+            store._refresh_summary_solutions(project_id, "default", {"f1"})
+        assert not connection.execute(
+            "SELECT 1 FROM summary_solution_payloads WHERE summary_id='s1'"
+        ).fetchall()
+        assert (
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT * FROM summary_solution_payloads ORDER BY summary_id"
+                )
+            )
+            == untouched
+        )
+
+
+@pytest.mark.parametrize("phase", ["comparison", "metadata"])
+def test_unchanged_payload_skip_still_observes_cancellation(tmp_path: Path, phase: str) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        project_id = _seed_star(store, root, caller_count=1)
+        connection = store._connection
+        with connection:
+            store._refresh_summary_solutions(project_id, "default", {"f0", "f1"})
+        before = _solution_snapshot(store)
+        cancelled = threading.Event()
+        boundary = (
+            "FROM summary_solution_payloads WHERE project_id ="
+            if phase == "comparison"
+            else "UPDATE function_summaries SET"
+        )
+
+        def cancel_at_boundary(sql):
+            if boundary in sql:
+                cancelled.set()
+
+        connection.set_trace_callback(cancel_at_boundary)
+        with pytest.raises(RuntimeError, match="indexing was cancelled"), connection:
+            store._refresh_summary_solutions(project_id, "default", {"f1"}, cancelled=cancelled)
+        assert cancelled.is_set()
+        assert not connection.in_transaction
+        assert _solution_snapshot(store) == before
+
+
 def test_refresh_uses_projected_inputs_and_deterministic_bounded_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -440,7 +574,7 @@ def test_refresh_uses_projected_inputs_and_deterministic_bounded_batches(
             store._refresh_summary_solutions(  # noqa: SLF001
                 project_id, "default", {"f0", "f1", "f2", "f3"}
             )
-        assert batch_sizes == [2, 1]
+        assert batch_sizes == []
         assert _solution_snapshot(store) == first
 
 
@@ -465,6 +599,9 @@ def test_refresh_batch_failure_and_cancellation_roll_back_atomically(
 
         monkeypatch.setattr(store, "_write_summary_solution_batch", fail_batch)
         with pytest.raises(RuntimeError, match="summary batch failure"), store._connection:  # noqa: SLF001
+            store._connection.execute(
+                "UPDATE summary_effects SET access_path_json='[\"changed\"]' WHERE is_local=1"
+            )
             store._refresh_summary_solutions(  # noqa: SLF001
                 project_id, "default", {"f0", "f1", "f2", "f3"}
             )
@@ -478,6 +615,9 @@ def test_refresh_batch_failure_and_cancellation_roll_back_atomically(
 
         monkeypatch.setattr(store, "_write_summary_solution_batch", cancel_after_batch)
         with pytest.raises(RuntimeError, match="indexing was cancelled"), store._connection:  # noqa: SLF001
+            store._connection.execute(
+                "UPDATE summary_effects SET access_path_json='[\"changed\"]' WHERE is_local=1"
+            )
             store._refresh_summary_solutions(  # noqa: SLF001
                 project_id,
                 "default",

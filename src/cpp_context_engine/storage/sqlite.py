@@ -362,7 +362,9 @@ class _SummaryPayloadSpool:
             self._executor.shutdown()
             self._finished = True
 
-    def rows(self, project_id: int) -> Iterator[tuple[object, ...]]:
+    def rows(
+        self, project_id: int, *, summary_ids: set[str] | None = None
+    ) -> Iterator[tuple[object, ...]]:
         self.finish()
         for (
             summary_id,
@@ -373,6 +375,8 @@ class _SummaryPayloadSpool:
             offset,
             payload_size,
         ) in sorted(self._records):
+            if summary_ids is not None and summary_id not in summary_ids:
+                continue
             self._file.seek(offset)
             payload = self._file.read(payload_size)
             if len(payload) != payload_size:
@@ -5031,6 +5035,22 @@ class SQLiteStore:
                 emit_summary=emit_summary,
                 retain_emitted_facts=False,
             )
+            # Delete/reinsert rewrites identical compressed BLOBs into the WAL.
+            # Compare every persisted field; changed-to-empty summaries stay in the delete set.
+            changed_payload_ids = impacted_ids.copy()
+            for row in spool.rows(project_id):
+                check_cancelled()
+                previous = self._connection.execute(
+                    """
+                    SELECT project_id, summary_id, encoding, effect_count, origin_count,
+                           uncompressed_bytes, payload_hash, payload
+                    FROM summary_solution_payloads WHERE project_id = ? AND summary_id = ?
+                    """,
+                    row[:2],
+                ).fetchone()
+                if previous is not None and tuple(previous) == row:
+                    changed_payload_ids.discard(row[1])
+            check_cancelled()
             impacted_placeholders = ",".join("?" for _ in impacted_ids)
             parameters = (project_id, *sorted(impacted_ids))
             self._connection.execute(
@@ -5048,11 +5068,13 @@ class SQLiteStore:
                 f"AND summary_id IN ({impacted_placeholders})",
                 parameters,
             )
-            self._connection.execute(
-                f"DELETE FROM summary_solution_payloads WHERE project_id = ? "
-                f"AND summary_id IN ({impacted_placeholders})",
-                parameters,
-            )
+            if changed_payload_ids:
+                changed_placeholders = ",".join("?" for _ in changed_payload_ids)
+                self._connection.execute(
+                    f"DELETE FROM summary_solution_payloads WHERE project_id = ? "
+                    f"AND summary_id IN ({changed_placeholders})",
+                    (project_id, *sorted(changed_payload_ids)),
+                )
             solved = [item for item in solution.summaries if item.id in impacted_ids]
             self._connection.executemany(
                 """
@@ -5088,8 +5110,11 @@ class SQLiteStore:
                 (item for item in solution.flows if item.caller_summary_id in impacted_ids),
             )
             self._write_summary_solution_rows_batched(
-                spool.rows(project_id), check_cancelled=check_cancelled
+                spool.rows(project_id, summary_ids=changed_payload_ids),
+                check_cancelled=check_cancelled,
             )
+            # An entirely skipped payload write still needs a final cancellation poll.
+            check_cancelled()
             return len(impacted_ids)
         finally:
             spool.close()
