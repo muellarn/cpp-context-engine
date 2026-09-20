@@ -436,7 +436,12 @@ def _solve_variant(
                 flows[flow.id] = flow
             result = result_by_pair.get((caller.id, site.id))
             if result is not None:
-                for origin in current_origins.get(callee.id, ()):
+                # Same-location origins overwrite the same flow; preserve the first
+                # key position and last certainty without rebuilding its hash/model.
+                return_locations = {
+                    origin.location_id: origin for origin in current_origins.get(callee.id, ())
+                }
+                for origin in return_locations.values():
                     flow = _flow(
                         InterproceduralFlowKind.RETURN_TO_CALLER,
                         caller,

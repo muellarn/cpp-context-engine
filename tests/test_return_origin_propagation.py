@@ -17,6 +17,7 @@ from cpp_context_engine.models import (
     CallTargetCertainty,
     DataFlowCertainty,
     FunctionSummary,
+    InterproceduralFlowKind,
     MemoryLocationKind,
     SourceSpan,
     SummaryEffect,
@@ -207,6 +208,90 @@ def _fingerprint(solution) -> str:
     # Cover every model field, tuple ordering, solution hashes and exact payload bytes.
     raw = json.dumps((asdict(solution), payloads), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("duplicate_unknown", (False, True))
+def test_return_flows_construct_only_last_location_winners(monkeypatch, duplicate_unknown) -> None:
+    inputs = list(_inputs())
+    source = next(item for item in inputs[2] if item.id == "leaf-origin")
+    inputs[2] += tuple(
+        replace(
+            source,
+            id=f"zz-duplicate-location-{index}",
+            access_path=(f"field-{index}",),
+            certainty=DataFlowCertainty.POSSIBLE if index == 2 else DataFlowCertainty.CERTAIN,
+        )
+        for index in range(3)
+    )
+    if duplicate_unknown:
+        unknown = next(item for item in inputs[2] if item.id == "unknown-origin")
+        inputs[2] += (replace(unknown, id="zz-unknown", certainty=DataFlowCertainty.POSSIBLE),)
+    created = []
+    original = interprocedural._flow
+
+    def counted(*args, **kwargs):
+        flow = original(*args, **kwargs)
+        if flow.kind == InterproceduralFlowKind.RETURN_TO_CALLER:
+            created.append(flow)
+        return flow
+
+    monkeypatch.setattr(interprocedural, "_flow", counted)
+    solution = interprocedural.solve_interprocedural(*inputs)
+    fingerprint = _fingerprint(solution)
+    assert len(created) == 5, fingerprint
+    # Keep the first location's position but the last origin's certainty, per edge.
+    assert [(item.callsite_id, item.callee_location_id) for item in created] == [
+        ("first", "global-a"),
+        ("first", None),
+        ("first", "global-b"),
+        ("later", "global-a"),
+        ("later", None),
+    ]
+    assert all(
+        item.certainty == DataFlowCertainty.POSSIBLE
+        for item in created
+        if item.callee_location_id == "global-a" or duplicate_unknown
+    )
+    assert solution.flows == tuple(sorted(created, key=lambda item: item.id))
+    # Full models, solution hashes and encoded bytes captured from main 5f8cde2.
+    assert fingerprint == (
+        "c9ae7e87b1a73a4bcc338825a311fbc6986fb9a33af779873599740ab48e7388"
+        if duplicate_unknown
+        else "ab1ca16792b8c1669ff1c5c3efdde9eacff713215aa2a5d2d43e0e1acfbc7215"
+    )
+
+
+def test_return_flow_projection_stays_within_each_build() -> None:
+    inputs = _inputs()
+    expected = interprocedural.solve_interprocedural(*inputs)
+    both_builds = tuple(
+        records + tuple(replace(item, build_variant="alternative") for item in records)
+        for records in inputs
+    )
+    combined = interprocedural.solve_interprocedural(*both_builds)
+    for variant in ("default", "alternative"):
+        assert tuple(item for item in combined.flows if item.build_variant == variant) == tuple(
+            replace(item, build_variant=variant) for item in expected.flows
+        )
+
+
+def test_return_flow_creation_preserves_cancellation(monkeypatch) -> None:
+    created = False
+    original = interprocedural._flow
+
+    def mark_created(*args, **kwargs):
+        nonlocal created
+        flow = original(*args, **kwargs)
+        created = True
+        return flow
+
+    def check_cancelled():
+        if created:
+            raise InterruptedError("cancelled after return-flow construction")
+
+    monkeypatch.setattr(interprocedural, "_flow", mark_created)
+    with pytest.raises(InterruptedError, match="cancelled after return-flow construction"):
+        interprocedural.solve_interprocedural(*_inputs(), check_cancelled=check_cancelled)
 
 
 @pytest.mark.parametrize(
