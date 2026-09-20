@@ -224,6 +224,31 @@ def test_measurement_write_failure_preserves_original_error(
     assert report["measurements"]["counts"]["staged_tus"] == 0
 
 
+def test_measurement_write_failure_preserves_worker_sigterm(
+    phase_worker, tmp_path, monkeypatch
+) -> None:
+    write = kicad_canary._write_report_atomic
+    writes = 0
+
+    def fail_after_initial_snapshot(path, document):
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            raise OSError("simulated diagnostic disk error")
+        write(path, document)
+
+    monkeypatch.setattr(kicad_canary, "_write_report_atomic", fail_after_initial_snapshot)
+    with pytest.raises(RuntimeError, match="exit -15"):
+        phase_worker(
+            [{"event": "phase", "name": "index", "monotonic_seconds": 1}],
+            return_code=-15,
+        )
+    assert writes >= 3  # Initial, phase/tick and final flush were all attempted.
+    assert (
+        json.loads((tmp_path / "phase-timings-index.json").read_text())["captured_at_seconds"] == 0
+    )
+
+
 def test_pipeline_snapshots_use_existing_write_tick(
     phase_worker, tmp_path: Path, monkeypatch
 ) -> None:

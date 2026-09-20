@@ -1339,7 +1339,9 @@ def _run_supervised(
             if measurement_transition or time.monotonic() - last_measurement_write >= 5:
                 # Pipeline transitions share this existing cadence: rewriting all TU
                 # observations on each event would add quadratic snapshot I/O.
-                persist_measurements(preserve_failure=violation is not None)
+                persist_measurements(
+                    preserve_failure=violation is not None or process.poll() not in (None, 0)
+                )
                 last_measurement_write = time.monotonic()
             current = limits.violation(
                 elapsed=elapsed,
