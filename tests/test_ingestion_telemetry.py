@@ -13,7 +13,7 @@ from cpp_context_engine.ingestion import (
     AnalyzerTelemetryError,
     NativeClangIngestor,
 )
-from cpp_context_engine.ingestion.native import _TelemetryDispatcher
+from cpp_context_engine.ingestion.native import _FactBatchBuilder, _TelemetryDispatcher
 from cpp_context_engine.models import BuildConfiguration
 
 
@@ -269,6 +269,78 @@ def test_optional_observer_preserves_results_and_emits_balanced_sanitized_lifecy
     assert starts.keys() == finishes.keys() == set(range(5))
     assert all(starts[index].slot_id == finishes[index].slot_id for index in starts)
     assert all(event.outcome == "succeeded" for event in finishes.values())
+    conversion_starts = {
+        event.configuration_index: event for event in events if event.kind == "conversion_started"
+    }
+    conversion_finishes = {
+        event.configuration_index: event for event in events if event.kind == "conversion_finished"
+    }
+    assert conversion_starts.keys() == conversion_finishes.keys() == starts.keys()
+    for index in starts:
+        assert finishes[index].monotonic_seconds <= conversion_starts[index].monotonic_seconds
+        assert (
+            conversion_starts[index].monotonic_seconds
+            <= conversion_finishes[index].monotonic_seconds
+        )
+        assert conversion_finishes[index].outcome == "succeeded"
+        assert conversion_starts[index].slot_id is conversion_finishes[index].slot_id is None
+    assert not _live_telemetry_threads()
+
+
+def test_conversion_failure_is_observed_and_registry_is_closed(tmp_path: Path, monkeypatch) -> None:
+    registries = []
+    events = []
+
+    def fail(_builder, registry):
+        registries.append(registry)
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(_FactBatchBuilder, "build", fail)
+    batches = NativeClangIngestor(
+        _EmptyClient(), observer=events.append
+    ).iter_configuration_batches(tmp_path, _configurations(tmp_path, 1))
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        list(batches)
+    conversion = [event for event in events if event.kind.startswith("conversion_")]
+    assert [event.kind for event in conversion] == ["conversion_started", "conversion_finished"]
+    assert conversion[-1].outcome == "failed"
+    assert registries and all(registry._closed for registry in registries)
+    assert not _live_telemetry_threads()
+
+
+def test_closing_pipeline_records_active_converter_cancellation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    converting = threading.Event()
+    registries = []
+    events = []
+    build = _FactBatchBuilder.build
+
+    def blocked_build(builder, registry):
+        registries.append(registry)
+        if builder.configuration.id == "build-0":
+            assert converting.wait(timeout=2)
+            return build(builder, registry)
+        converting.set()
+        # Event waits give the caller a chance to close the first yielded batch.
+        for _ in range(200):
+            threading.Event().wait(0.005)
+            builder._check()
+        raise AssertionError("converter was not cancelled")
+
+    monkeypatch.setattr(_FactBatchBuilder, "build", blocked_build)
+    batches = NativeClangIngestor(
+        _EmptyClient(), max_workers=2, observer=events.append
+    ).iter_configuration_batches(tmp_path, _configurations(tmp_path, 2))
+    next(batches)
+    batches.close()
+    finished = {
+        event.configuration_index: event.outcome
+        for event in events
+        if event.kind == "conversion_finished"
+    }
+    assert finished == {0: "succeeded", 1: "cancelled"}
+    assert len(registries) == 2 and all(registry._closed for registry in registries)
     assert not _live_telemetry_threads()
 
 

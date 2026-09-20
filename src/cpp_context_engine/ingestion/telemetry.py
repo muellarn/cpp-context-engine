@@ -12,6 +12,8 @@ AnalyzerEventKind = Literal[
     "scheduling_state",
     "analyzer_started",
     "analyzer_finished",
+    "conversion_started",
+    "conversion_finished",
 ]
 AnalyzerOutcome = Literal["succeeded", "failed", "cancelled"]
 
@@ -63,6 +65,8 @@ class AnalyzerPipelineEvent:
             "scheduling_state",
             "analyzer_started",
             "analyzer_finished",
+            "conversion_started",
+            "conversion_finished",
         }:
             raise ValueError("analyzer telemetry kind is invalid")
         for name in (
@@ -85,16 +89,16 @@ class AnalyzerPipelineEvent:
             ):
                 raise ValueError("scheduling state telemetry cannot name a slot or outcome")
             return
-        if (
-            type(self.slot_id) is not int
-            or not 0 <= self.slot_id < self.slot_count
-            or type(self.configuration_index) is not int
-            or self.configuration_index < 0
-        ):
+        if type(self.configuration_index) is not int or self.configuration_index < 0:
             raise ValueError("analyzer lifecycle telemetry has an invalid slot or input index")
-        if self.kind == "analyzer_started" and self.outcome is not None:
+        if self.kind.startswith("conversion_"):
+            if self.slot_id is not None:
+                raise ValueError("conversion telemetry cannot claim an analyzer slot")
+        elif type(self.slot_id) is not int or not 0 <= self.slot_id < self.slot_count:
+            raise ValueError("analyzer lifecycle telemetry has an invalid slot or input index")
+        if self.kind.endswith("_started") and self.outcome is not None:
             raise ValueError("analyzer start telemetry cannot have an outcome")
-        if self.kind == "analyzer_finished" and self.outcome not in {
+        if self.kind.endswith("_finished") and self.outcome not in {
             "succeeded",
             "failed",
             "cancelled",

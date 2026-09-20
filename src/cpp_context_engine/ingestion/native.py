@@ -910,6 +910,15 @@ class _TelemetryDispatcher:
                     )
         return self.failure
 
+    def conversion(self, *, configuration_index: int, outcome: AnalyzerOutcome | None) -> None:
+        with self._lock:
+            self._enqueue_locked(
+                kind="conversion_started" if outcome is None else "conversion_finished",
+                slot_id=None,
+                configuration_index=configuration_index,
+                outcome=outcome,
+            )
+
     def _enqueue_locked(
         self,
         *,
@@ -1119,16 +1128,26 @@ class NativeClangIngestor:
                 )
 
         def convert(index: int, facts: _FactRegistry) -> IngestionBatch:
+            if telemetry is not None:
+                telemetry.conversion(configuration_index=index, outcome=None)
+            outcome: AnalyzerOutcome = "failed"
             try:
-                return _FactBatchBuilder(
+                batch = _FactBatchBuilder(
                     root,
                     selected[index],
                     self.profile,
                     check_callback=check_request,
                     analyzer_identity=analyzer_identity,
                 ).build(facts)
+                outcome = "cancelled" if cancelled.is_set() else "succeeded"
+                return batch
+            except BaseException:
+                outcome = "cancelled" if cancelled.is_set() else "failed"
+                raise
             finally:
                 facts.close()
+                if telemetry is not None:
+                    telemetry.conversion(configuration_index=index, outcome=outcome)
 
         converter_count = min(self.max_domain_batches, len(selected))
         analyzer_executor = ThreadPoolExecutor(
