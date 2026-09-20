@@ -163,3 +163,35 @@ def test_writeback_projection_preserves_cancellation(monkeypatch):
         interprocedural.solve_interprocedural(
             *_writeback_inputs(None), check_cancelled=check_cancelled
         )
+
+
+@pytest.mark.parametrize("cancel_after,expected_calls", [(1, 256), (257, 512)])
+def test_writeback_winner_construction_polls_every_256(monkeypatch, cancel_after, expected_calls):
+    inputs = _writeback_inputs(None)
+    inputs[1] = tuple(
+        replace(
+            inputs[1][0],
+            id=f"effect-{index:03d}",
+            source_access_id=f"access-{index:03d}",
+            location_id=f"location-{index:03d}",
+        )
+        for index in range(600)
+    )
+    calls = 0
+    original = interprocedural._flow
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        flow = original(*args, **kwargs)
+        if flow.kind == InterproceduralFlowKind.WRITEBACK:
+            calls += 1
+        return flow
+
+    def check_cancelled():
+        if calls >= cancel_after:
+            raise InterruptedError("cancelled while constructing writeback winners")
+
+    monkeypatch.setattr(interprocedural, "_flow", counted)
+    with pytest.raises(InterruptedError, match="constructing writeback winners"):
+        interprocedural.solve_interprocedural(*inputs, check_cancelled=check_cancelled)
+    assert calls == expected_calls

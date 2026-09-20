@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,8 +70,10 @@ class ProjectIndexer:
         compilation_database: Path,
         *,
         build_variant: BuildVariant | None = None,
+        cancelled: threading.Event | None = None,
         finalization_observer: Callable[[str, str], None] | None = None,
     ) -> IndexingResult:
+        _check_cancelled(cancelled)
         project_root = project_root.resolve(strict=False)
         variant = build_variant or BuildVariant(DEFAULT_BUILD_VARIANT, compilation_database)
         if variant.compilation_database != compilation_database.resolve(strict=False):
@@ -112,6 +115,7 @@ class ProjectIndexer:
 
         def counted_batches() -> Iterator[IngestionBatch]:
             for batch in batch_stream:
+                _check_cancelled(cancelled)
                 if any(
                     unit.analyzer_identity != analyzer_identity for unit in batch.translation_units
                 ):
@@ -124,6 +128,7 @@ class ProjectIndexer:
                     # Do not retain an already staged TU while the producer is
                     # blocked building the next potentially large batch.
                     del batch
+                _check_cancelled(cancelled)
 
         removed = len(set(previous) - current_ids)
         try:
@@ -136,6 +141,7 @@ class ProjectIndexer:
                 ),
                 build_variant=variant,
                 index_profile=self._profile,
+                cancelled=cancelled,
                 **(
                     {"finalization_observer": finalization_observer}
                     if finalization_observer is not None
@@ -186,6 +192,11 @@ class ProjectIndexer:
             if not path.is_file() or _file_hash(path) != expected_hash:
                 return True
         return False
+
+
+def _check_cancelled(cancelled: threading.Event | None) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError("indexing was cancelled")
 
 
 def _file_hash(path: Path) -> str:

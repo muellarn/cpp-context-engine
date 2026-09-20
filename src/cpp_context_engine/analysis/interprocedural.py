@@ -45,10 +45,12 @@ class InterproceduralSolution:
 
 
 def _id(prefix: str, *values: object) -> str:
-    digest = hashlib.sha256()
-    for value in values:
-        digest.update(str(value).encode("utf-8", errors="surrogateescape"))
-        digest.update(b"\0")
+    # One hash update preserves the exact NUL-delimited fingerprint while avoiding
+    # millions of Python-to-OpenSSL calls on large propagated summary closures.
+    digest = hashlib.sha256(
+        b"\0".join([str(value).encode("utf-8", errors="surrogateescape") for value in values])
+        + b"\0"
+    )
     return f"{prefix}_{digest.hexdigest()[:32]}"
 
 
@@ -114,6 +116,18 @@ def solve_interprocedural(
     *,
     limits: InterproceduralLimits | None = None,
     check_cancelled: Callable[[], None] | None = None,
+    emit_summary: (
+        Callable[
+            [
+                FunctionSummary,
+                tuple[SummaryEffect, ...],
+                tuple[SummaryReturnOrigin, ...],
+            ],
+            None,
+        ]
+        | None
+    ) = None,
+    retain_emitted_facts: bool = True,
 ) -> InterproceduralSolution:
     """Solve per-build summaries; an omitted fact always reduces completeness."""
 
@@ -139,6 +153,8 @@ def solve_interprocedural(
             tuple(item for item in call_targets if item.build_variant == variant),
             selected_limits,
             check_cancelled,
+            emit_summary,
+            retain_emitted_facts,
         )
         solved_summaries.extend(solution.summaries)
         solved_effects.extend(solution.effects)
@@ -163,13 +179,27 @@ def _solve_variant(
     callsites: tuple[CallSite, ...],
     targets: tuple[CallTarget, ...],
     limits: InterproceduralLimits,
-    check_callback: Callable[[], None] | None = None,
+    check_cancelled: Callable[[], None] | None = None,
+    emit_summary: (
+        Callable[
+            [
+                FunctionSummary,
+                tuple[SummaryEffect, ...],
+                tuple[SummaryReturnOrigin, ...],
+            ],
+            None,
+        ]
+        | None
+    ) = None,
+    retain_emitted_facts: bool = True,
 ) -> InterproceduralSolution:
+    if not retain_emitted_facts and emit_summary is None:
+        raise ValueError("discarding solved facts requires a summary emitter")
     summary_by_id = {item.id: item for item in summaries}
     summaries_by_function: dict[str, list[FunctionSummary]] = defaultdict(list)
     for summary in summaries:
-        if check_callback is not None:
-            check_callback()
+        if check_cancelled is not None:
+            check_cancelled()
         summaries_by_function[summary.function_symbol_id].append(summary)
     for bodies in summaries_by_function.values():
         bodies.sort(key=lambda item: item.id)
@@ -218,15 +248,15 @@ def _solve_variant(
         list
     )
     for caller in summaries:
-        if check_callback is not None:
-            check_callback()
+        if check_cancelled is not None:
+            check_cancelled()
         for site in owner_sites(caller):
             for target in targets_by_site.get(site.id, ()):
                 callees, body_ambiguous = callee_bodies(caller, target)
                 for callee in callees:
                     adjacency[caller.id].add(callee.id)
                     call_edges[caller.id].append((site, target, callee, body_ambiguous))
-    components = _tarjan(tuple(summary_by_id), adjacency, check_callback)
+    components = _tarjan(tuple(summary_by_id), adjacency, check_cancelled)
     recursive_ids = {
         member for component in components if len(component) > 1 for member in component
     } | {node for node in summary_by_id if node in adjacency.get(node, set())}
@@ -260,16 +290,16 @@ def _solve_variant(
     def transfer(
         caller: FunctionSummary,
     ) -> tuple[tuple[SummaryEffect, ...], tuple[SummaryReturnOrigin, ...], set[str]]:
-        if check_callback is not None:
-            check_callback()
+        if check_cancelled is not None:
+            check_cancelled()
         reasons = set(caller.local_incomplete_reasons)
         if caller.id in oversized_ids:
             reasons.add("scc_size_cap_exceeded")
         effects = {item.id: item for item in local_effect_map[caller.id]}
         origins = {item.id: item for item in local_origin_map[caller.id]}
         for site in owner_sites(caller):
-            if check_callback is not None:
-                check_callback()
+            if check_cancelled is not None:
+                check_cancelled()
             site_targets = targets_by_site.get(site.id, ())
             if not site.target_set_complete or not site_targets:
                 reasons.add("unknown_or_external_call_target")
@@ -291,7 +321,9 @@ def _solve_variant(
                             reasons.add("incomplete_call_argument_binding")
                     if current_reasons.get(callee.id):
                         reasons.add("callee_summary_incomplete")
-                    for effect in current_effects.get(callee.id, ()):
+                    for effect_index, effect in enumerate(current_effects.get(callee.id, ())):
+                        if check_cancelled is not None and effect_index % 256 == 0:
+                            check_cancelled()
                         propagated = _propagate_effect(
                             caller,
                             site,
@@ -310,7 +342,11 @@ def _solve_variant(
                         and origin.callsite_id == site.id
                         for origin in origins.values()
                     ):
-                        for callee_origin in current_origins.get(callee.id, ()):
+                        for origin_index, callee_origin in enumerate(
+                            current_origins.get(callee.id, ())
+                        ):
+                            if check_cancelled is not None and origin_index % 256 == 0:
+                                check_cancelled()
                             propagated_origin = _propagate_origin(
                                 caller,
                                 site,
@@ -327,69 +363,9 @@ def _solve_variant(
             reasons.add("summary_effect_cap_exceeded")
         return ordered_effects, tuple(sorted(origins.values(), key=lambda item: item.id)), reasons
 
-    # Tarjan emits callees before callers for this caller-to-callee graph, so each
-    # component consumes stable downstream summaries and iterates only its recursive SCC.
-    for component in components:
-        if check_callback is not None:
-            check_callback()
-        members = tuple(summary_by_id[summary_id] for summary_id in component)
-        component_converged = False
-        iteration_limit = (
-            1 if any(item.id in oversized_ids for item in members) else limits.max_scc_iterations
-        )
-        for iteration_count in range(1, iteration_limit + 1):
-            if check_callback is not None:
-                check_callback()
-            next_values = {caller.id: transfer(caller) for caller in members}
-            if all(
-                next_values[caller.id]
-                == (
-                    current_effects[caller.id],
-                    current_origins[caller.id],
-                    current_reasons[caller.id],
-                )
-                for caller in members
-            ):
-                component_converged = True
-            for caller in members:
-                (
-                    current_effects[caller.id],
-                    current_origins[caller.id],
-                    current_reasons[caller.id],
-                ) = next_values[caller.id]
-                iteration_counts[caller.id] = iteration_count
-            if component_converged:
-                break
-        if not component_converged and not any(item.id in oversized_ids for item in members):
-            for caller in members:
-                current_reasons[caller.id].add("scc_iteration_cap_exceeded")
-
-    final_summaries: list[FunctionSummary] = []
-    for summary in summaries:
-        if check_callback is not None:
-            check_callback()
-        reasons = tuple(sorted(current_reasons[summary.id]))
-        fingerprint = _solution_hash(
-            current_effects[summary.id], current_origins[summary.id], reasons
-        )
-        final_summaries.append(
-            replace(
-                summary,
-                complete=not reasons,
-                incomplete_reasons=reasons,
-                recursive=summary.id in recursive_ids,
-                iteration_count=iteration_counts.get(summary.id, 0),
-                max_scc_iterations=limits.max_scc_iterations,
-                max_scc_size=limits.max_scc_size,
-                max_summary_effects=limits.max_summary_effects,
-                solution_hash=fingerprint,
-            )
-        )
-
     flows: dict[str, InterproceduralFlow] = {}
-    for caller in summaries:
-        if check_callback is not None:
-            check_callback()
+
+    def record_flows(caller: FunctionSummary) -> None:
         for site, target, callee, body_ambiguous in call_edges.get(caller.id, ()):
             for index, callee_location in enumerate(callee.parameter_location_ids):
                 binding = bindings_by_pair.get((caller.id, site.id, index))
@@ -411,7 +387,9 @@ def _solve_variant(
                 )
                 flows[flow.id] = flow
             writebacks = {}
-            for effect in current_effects.get(callee.id, ()):
+            for effect_index, effect in enumerate(current_effects.get(callee.id, ())):
+                if check_cancelled is not None and effect_index % 256 == 0:
+                    check_cancelled()
                 if effect.kind != SummaryEffectKind.WRITE or effect.parameter_index is None:
                     continue
                 mode = callee.parameter_modes[effect.parameter_index]
@@ -423,7 +401,10 @@ def _solve_variant(
                 # Only eligible effects can win; keep the first key position and
                 # last certainty without rebuilding an overwritten flow hash/model.
                 writebacks[(effect.parameter_index, effect.location_id)] = (effect, binding)
-            for effect, binding in writebacks.values():
+            for writeback_index, (effect, binding) in enumerate(writebacks.values()):
+                # Winner construction is a separate pass; retain bounded cancellation.
+                if check_cancelled is not None and writeback_index % 256 == 0:
+                    check_cancelled()
                 flow = _flow(
                     InterproceduralFlowKind.WRITEBACK,
                     caller,
@@ -443,10 +424,15 @@ def _solve_variant(
             if result is not None:
                 # Same-location origins overwrite the same flow; preserve the first
                 # key position and last certainty without rebuilding its hash/model.
-                return_locations = {
-                    origin.location_id: origin for origin in current_origins.get(callee.id, ())
-                }
-                for origin in return_locations.values():
+                return_locations = {}
+                # Both projection and winner construction need bounded cancellation.
+                for origin_index, origin in enumerate(current_origins.get(callee.id, ())):
+                    if check_cancelled is not None and origin_index % 256 == 0:
+                        check_cancelled()
+                    return_locations[origin.location_id] = origin
+                for origin_index, origin in enumerate(return_locations.values()):
+                    if check_cancelled is not None and origin_index % 256 == 0:
+                        check_cancelled()
                     flow = _flow(
                         InterproceduralFlowKind.RETURN_TO_CALLER,
                         caller,
@@ -460,10 +446,136 @@ def _solve_variant(
                         caller_access_id=result.definition_access_id,
                     )
                     flows[flow.id] = flow
+
+    component_by_member = {
+        member: component_index
+        for component_index, component in enumerate(components)
+        for member in component
+    }
+    remaining_callers: dict[str, int] = defaultdict(int)
+    for caller_id, callee_ids in adjacency.items():
+        for callee_id in callee_ids:
+            if component_by_member[caller_id] != component_by_member[callee_id]:
+                remaining_callers[callee_id] += 1
+
+    final_summaries: list[FunctionSummary] = []
+    # Tarjan emits callees before callers for this caller-to-callee graph, so each
+    # component consumes stable downstream summaries and iterates only its recursive SCC.
+    for component_index, component in enumerate(components):
+        if check_cancelled is not None:
+            check_cancelled()
+        members = tuple(summary_by_id[summary_id] for summary_id in component)
+        if len(members) == 1 and members[0].id not in adjacency.get(members[0].id, set()):
+            # Tarjan orders callees before callers. A non-recursive singleton therefore
+            # cannot change after its first transfer; the former equality iteration only
+            # rebuilt the same (potentially large) propagated solution. Preserve its
+            # historical iteration metadata without repeating that allocation.
+            caller = members[0]
+            next_effects, next_origins, next_reasons = transfer(caller)
+            changed = (
+                next_effects,
+                next_origins,
+                next_reasons,
+            ) != (
+                current_effects[caller.id],
+                current_origins[caller.id],
+                current_reasons[caller.id],
+            )
+            if changed and limits.max_scc_iterations == 1:
+                # The skipped equality pass used to hit the configured iteration cap.
+                # Retain that externally visible incompleteness and iteration count.
+                next_reasons.add("scc_iteration_cap_exceeded")
+            current_effects[caller.id] = next_effects
+            current_origins[caller.id] = next_origins
+            current_reasons[caller.id] = next_reasons
+            iteration_counts[caller.id] = 2 if changed and limits.max_scc_iterations > 1 else 1
+        else:
+            component_converged = False
+            iteration_limit = (
+                1
+                if any(item.id in oversized_ids for item in members)
+                else limits.max_scc_iterations
+            )
+            for iteration_count in range(1, iteration_limit + 1):
+                if check_cancelled is not None:
+                    check_cancelled()
+                next_values = {caller.id: transfer(caller) for caller in members}
+                if all(
+                    next_values[caller.id]
+                    == (
+                        current_effects[caller.id],
+                        current_origins[caller.id],
+                        current_reasons[caller.id],
+                    )
+                    for caller in members
+                ):
+                    component_converged = True
+                for caller in members:
+                    (
+                        current_effects[caller.id],
+                        current_origins[caller.id],
+                        current_reasons[caller.id],
+                    ) = next_values[caller.id]
+                    iteration_counts[caller.id] = iteration_count
+                if component_converged:
+                    break
+            if not component_converged and not any(item.id in oversized_ids for item in members):
+                for caller in members:
+                    current_reasons[caller.id].add("scc_iteration_cap_exceeded")
+
+        for summary in members:
+            if check_cancelled is not None:
+                check_cancelled()
+            record_flows(summary)
+            reasons = tuple(sorted(current_reasons[summary.id]))
+            fingerprint = _solution_hash(
+                current_effects[summary.id], current_origins[summary.id], reasons
+            )
+            solved_summary = replace(
+                summary,
+                complete=not reasons,
+                incomplete_reasons=reasons,
+                recursive=summary.id in recursive_ids,
+                iteration_count=iteration_counts.get(summary.id, 0),
+                max_scc_iterations=limits.max_scc_iterations,
+                max_scc_size=limits.max_scc_size,
+                max_summary_effects=limits.max_summary_effects,
+                solution_hash=fingerprint,
+            )
+            final_summaries.append(solved_summary)
+            if emit_summary is not None:
+                emit_summary(
+                    solved_summary,
+                    current_effects[summary.id],
+                    current_origins[summary.id],
+                )
+        if not retain_emitted_facts:
+            for caller in members:
+                for callee_id in adjacency.get(caller.id, ()):
+                    if component_by_member[callee_id] == component_index:
+                        continue
+                    remaining_callers[callee_id] -= 1
+                    if remaining_callers[callee_id] == 0:
+                        current_effects.pop(callee_id, None)
+                        current_origins.pop(callee_id, None)
+                        current_reasons.pop(callee_id, None)
+            for member in component:
+                if remaining_callers[member] == 0:
+                    current_effects.pop(member, None)
+                    current_origins.pop(member, None)
+                    current_reasons.pop(member, None)
     return InterproceduralSolution(
         tuple(sorted(final_summaries, key=lambda item: item.id)),
-        tuple(item for key in sorted(current_effects) for item in current_effects[key]),
-        tuple(item for key in sorted(current_origins) for item in current_origins[key]),
+        (
+            tuple(item for key in sorted(current_effects) for item in current_effects[key])
+            if retain_emitted_facts
+            else ()
+        ),
+        (
+            tuple(item for key in sorted(current_origins) for item in current_origins[key])
+            if retain_emitted_facts
+            else ()
+        ),
         tuple(sorted(flows.values(), key=lambda item: item.id)),
     )
 

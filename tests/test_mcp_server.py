@@ -110,7 +110,10 @@ def _seed_index(config: AppConfig) -> None:
         )
 
 
-def _fake_index(config: AppConfig) -> IndexOperationResult:
+def _fake_index(
+    config: AppConfig, *, cancelled: threading.Event | None = None
+) -> IndexOperationResult:
+    assert cancelled is None or not cancelled.is_set()
     _seed_index(config)
     return IndexOperationResult(
         IndexingResult(
@@ -410,6 +413,64 @@ def test_materialization_executor_propagates_cancel_and_waits_cleanup(tmp_path: 
         assert scope.cancel_called
         assert started.is_set()
         assert cleaned.wait(1)
+
+    anyio.run(scenario)
+
+
+def test_mcp_index_cancellation_rolls_back_and_waits_for_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cpp_context_engine.mcp import server as mcp_server
+
+    project = tmp_path / "project"
+    project.mkdir()
+    config = _config(project, tmp_path / "index.db")
+    assert config.compilation_database is not None
+    config.compilation_database.write_text("[]", encoding="utf-8")
+    _seed_index(config)
+    started = threading.Event()
+    finished = threading.Event()
+
+    def cancellable_index(
+        selected: AppConfig, *, cancelled: threading.Event | None = None
+    ) -> IndexOperationResult:
+        assert cancelled is not None
+        assert selected.database_path is not None
+        try:
+            with (
+                SQLiteStore(selected.database_path, project_root=selected.project_root) as store,
+                store._connection,
+            ):  # noqa: SLF001
+                store._connection.execute(  # noqa: SLF001
+                    "UPDATE symbols SET source_text = 'unpublished' WHERE id = 'cxx:callee'"
+                )
+                started.set()
+                assert cancelled.wait(2)
+                raise RuntimeError("injected cancellation")
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(mcp_server, "run_project_index", cancellable_index)
+
+    async def scenario() -> None:
+        async with Client(mcp_server.create_mcp_server(config), mode="legacy") as client:
+
+            async def invoke_index() -> None:
+                await client.call_tool("index_project", {})
+
+            before = anyio.current_time()
+            with anyio.fail_after(2):
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(invoke_index)
+                    assert await anyio.to_thread.run_sync(lambda: started.wait(1))
+                    tasks.cancel_scope.cancel()
+            with anyio.fail_after(1):
+                assert await anyio.to_thread.run_sync(finished.wait)
+            elapsed = anyio.current_time() - before
+            assert elapsed < 1
+            result = await client.call_tool("read_symbol", {"symbol_id": "cxx:callee"})
+            assert not result.is_error
+            assert result.structured_content["source_text"] == "int callee() { return 7; }"
 
     anyio.run(scenario)
 

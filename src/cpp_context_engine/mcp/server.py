@@ -90,7 +90,9 @@ from .contracts import (
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+CancellationT = TypeVar("CancellationT")
 MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS = 5.0
+MCP_CANCEL_CLEANUP_SECONDS = 5.0
 
 
 def _new_event() -> threading.Event:
@@ -162,7 +164,7 @@ class ProjectServerState:
             if runtime is not None:
                 done = self._materialization_done
                 if done is not None and not done.is_set():
-                    # An uncooperative worker must finish before its SQLite runtime
+                    # An uncooperative cancelled worker must finish before its SQLite runtime
                     # can be closed.  Keep shutdown bounded while still arranging
                     # eventual cleanup without racing that worker.
                     threading.Thread(
@@ -182,32 +184,67 @@ class ProjectServerState:
 
     async def execute_materialization(self, operation: Callable[[DeepCancellation], T]) -> T:
         """Propagate cancellation to Clang and wait for bounded process cleanup."""
-        cancelled = DeepCancellation()
-        done = _new_event()
+        return await self._execute_cancellable(
+            operation,
+            DeepCancellation(),
+            cleanup_timeout=MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS,
+        )
 
-        def run() -> T:
-            try:
-                return operation(cancelled)
-            finally:
-                done.set()
+    async def execute_cancellable(
+        self,
+        operation: Callable[[threading.Event], T],
+        *,
+        on_success: Callable[[T], None] | None = None,
+    ) -> T:
+        """Signal worker cancellation and boundedly wait for transactional cleanup."""
+        return await self._execute_cancellable(
+            operation,
+            threading.Event(),
+            cleanup_timeout=MCP_CANCEL_CLEANUP_SECONDS,
+            on_success=on_success,
+        )
+
+    async def _execute_cancellable(
+        self,
+        operation: Callable[[CancellationT], T],
+        cancelled: CancellationT,
+        *,
+        cleanup_timeout: float,
+        on_success: Callable[[T], None] | None = None,
+    ) -> T:
+        """Run one cancellable mutation without releasing unverified shared state."""
 
         async with self.lock:
             self._require_healthy()
+            stopped = _new_event()
+
+            def guarded_operation() -> T:
+                try:
+                    return operation(cancelled)
+                finally:
+                    stopped.set()
+
             try:
-                return await anyio.to_thread.run_sync(run, abandon_on_cancel=True)
+                result = await anyio.to_thread.run_sync(guarded_operation, abandon_on_cancel=True)
+                # There is no cancellation checkpoint between worker completion and
+                # publication, so a cancelled request cannot publish a late runtime.
+                if on_success is not None:
+                    on_success(result)
+                return result
             except anyio.get_cancelled_exc_class():
                 cancelled.set()
                 with anyio.CancelScope(shield=True):
-                    finished = await anyio.to_thread.run_sync(
-                        done.wait,
-                        MATERIALIZATION_CLEANUP_TIMEOUT_SECONDS,
+                    cleaned_up = await anyio.to_thread.run_sync(
+                        stopped.wait,
+                        cleanup_timeout,
                         abandon_on_cancel=False,
                     )
-                if not finished:
+                if not cleaned_up:
                     # Never allow another operation to reuse SQLite or analyzer
                     # state while cleanup remains unverified.
                     self.materialization_poisoned = True
-                    self._materialization_done = done
+                    self._materialization_done = stopped
+                    logger.error("Cancelled worker did not stop within cleanup budget")
                 raise
 
     def require_runtime(self) -> Runtime:
@@ -221,7 +258,7 @@ class ProjectServerState:
     def _require_healthy(self) -> None:
         if self.materialization_poisoned:
             raise PublicToolFailure(
-                "Deep-analysis cleanup could not be verified; restart the MCP server before "
+                "Cancelled-operation cleanup could not be verified; restart the MCP server before "
                 "using this project index again."
             )
 
@@ -395,24 +432,26 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
         profile: IndexProfile | None = None,
     ) -> IndexProjectResult:
         state = _state(ctx)
+        selected_config = replace(state.config, index_profile=profile or state.config.index_profile)
+        replacement: Runtime | None = None
 
-        def operation() -> IndexProjectResult:
-            selected_config = replace(
-                state.config, index_profile=profile or state.config.index_profile
-            )
+        def operation(cancelled: threading.Event) -> IndexProjectResult:
+            nonlocal replacement
             if any(
                 not variant.compilation_database.is_file()
                 for variant in selected_config.build_variants
             ):
                 raise PublicToolFailure(MISSING_COMPILATION_DATABASE_ERROR)
-            previous, state.runtime = state.runtime, None
-            if previous is not None:
-                previous.close()
-            result = run_project_index(selected_config)
-            state.config = selected_config
-            state.runtime = build_runtime(selected_config)
+            result = run_project_index(selected_config, cancelled=cancelled)
+            if cancelled.is_set():
+                raise RuntimeError("indexing was cancelled")
+            replacement = build_runtime(selected_config)
+            if cancelled.is_set():
+                replacement.close()
+                replacement = None
+                raise RuntimeError("indexing was cancelled")
             indexing = result.indexing
-            return IndexProjectResult(
+            response = IndexProjectResult(
                 indexed_translation_units=indexing.indexed_translation_units,
                 skipped_translation_units=indexing.skipped_translation_units,
                 removed_translation_units=indexing.removed_translation_units,
@@ -426,13 +465,33 @@ def create_mcp_server(config: AppConfig) -> MCPServer[ProjectServerState]:
                 analyzer_capabilities=list(result.analyzer_capabilities),
                 index_profile=result.index_profile,
             )
+            if cancelled.is_set():
+                replacement.close()
+                replacement = None
+                raise RuntimeError("indexing was cancelled")
+            return response
 
-        return await _call_tool(
-            state,
-            "index_project",
-            operation,
-            "Indexing failed; verify the server's project and compilation database configuration.",
-        )
+        def publish(_result: IndexProjectResult) -> None:
+            nonlocal replacement
+            assert replacement is not None
+            previous = state.runtime
+            state.config = selected_config
+            state.runtime, replacement = replacement, None
+            if previous is not None:
+                previous.close()
+
+        try:
+            return await _call_cancellable_tool(
+                state,
+                "index_project",
+                operation,
+                "Indexing failed; verify the server's project and compilation database "
+                "configuration.",
+                on_success=publish,
+            )
+        finally:
+            if replacement is not None:
+                replacement.close()
 
     @server.tool(
         title="Materialize bounded deep compiler analysis",
@@ -756,6 +815,23 @@ async def _call_tool(
         raise ToolError(str(exc)) from None
     except Exception as exc:
         # Provider/database exception messages may contain credentials or host paths.
+        logger.error("MCP tool %s failed (%s)", tool_name, type(exc).__name__)
+        raise ToolError(public_error) from None
+
+
+async def _call_cancellable_tool(
+    state: ProjectServerState,
+    tool_name: str,
+    operation: Callable[[threading.Event], T],
+    public_error: str,
+    *,
+    on_success: Callable[[T], None] | None = None,
+) -> T:
+    try:
+        return await state.execute_cancellable(operation, on_success=on_success)
+    except PublicToolFailure as exc:
+        raise ToolError(str(exc)) from None
+    except Exception as exc:
         logger.error("MCP tool %s failed (%s)", tool_name, type(exc).__name__)
         raise ToolError(public_error) from None
 

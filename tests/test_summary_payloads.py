@@ -575,14 +575,15 @@ def test_v11_migration_and_payload_persistence_failures_roll_back_atomically(
         indexer = ProjectIndexer(_ingestor(), store)
         indexer.index(project, project / "compile_commands.json")
         before = _solution_rows(store)
+        original_batch = store._write_summary_solution_batch  # noqa: SLF001
         changed = project / "src" / "leaf.cpp"
         changed.write_text(changed.read_text() + "\n// payload rollback\n", encoding="utf-8")
 
-        def fail_after_write(project_id, summary_id, effects, origins):
-            original(store, project_id, summary_id, effects, origins)
+        def fail_after_write(rows):
+            original_batch(rows)
             raise RuntimeError("injected summary payload persistence failure")
 
-        monkeypatch.setattr(store, "_write_summary_solution_payload", fail_after_write)
+        monkeypatch.setattr(store, "_write_summary_solution_batch", fail_after_write)
         with pytest.raises(RuntimeError, match="payload persistence failure"):
             indexer.index(project, project / "compile_commands.json")
         assert _solution_rows(store) == before

@@ -16,6 +16,7 @@ import time
 import zlib
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -83,6 +84,8 @@ SUMMARY_PAYLOAD_ENCODING = "zlib-json-v1"
 MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES = 16 * 1024 * 1024
 MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_SUMMARY_PAYLOAD_RECORDS = 65_536
+SUMMARY_PAYLOAD_WRITE_BATCH_SIZE = 64
+SUMMARY_PAYLOAD_WRITE_BATCH_BYTES = 16 * 1024 * 1024
 _TRANSLATION_UNIT_DELETE_ORDER = (
     "deep_materialization_units",
     "deep_tu_cache",
@@ -167,6 +170,11 @@ def _request_interrupted(control: Any, stage: str) -> bool:
     except (RuntimeError, TimeoutError):
         return True
     return False
+
+
+def _check_index_cancelled(cancelled: threading.Event | None) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError("indexing was cancelled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,8 +277,128 @@ class SchemaIndexClassification:
     create_sql: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _SummaryCallSiteProjection:
+    """Only callsite columns consumed by the interprocedural solver."""
+
+    id: str
+    owner_symbol_id: str
+    target_set_complete: bool
+    translation_unit_id: str
+    build_configuration_id: str
+    build_variant: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SummaryCallTargetProjection:
+    """Only target columns consumed by the interprocedural solver."""
+
+    id: str
+    callsite_id: str
+    target_symbol_id: str
+    certainty: CallTargetCertainty
+    build_variant: str
+
+
 class SummaryPayloadError(RuntimeError):
     """A persisted propagated-summary payload is corrupt or exceeds hard limits."""
+
+
+class _SummaryPayloadSpool:
+    """Bound encoded payload memory and retain only a small sortable offset index."""
+
+    def __init__(self, check_cancelled: Callable[[], None] | None = None) -> None:
+        self._file = tempfile.SpooledTemporaryFile(  # noqa: SIM115 - closed by close()
+            max_size=SUMMARY_PAYLOAD_WRITE_BATCH_BYTES
+        )
+        self._records: list[tuple[str, int, int, int, str, int, int]] = []
+        self._check_cancelled = check_cancelled
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="summary-payload")
+        self._pending: deque[tuple[str, Future[tuple[int, int, int, str, bytes]]]] = deque()
+        self._finished = False
+
+    def add(
+        self,
+        summary_id: str,
+        effects: tuple[SummaryEffect, ...],
+        origins: tuple[SummaryReturnOrigin, ...],
+    ) -> None:
+        propagated_effects = tuple(item for item in effects if not item.is_local)
+        propagated_origins = tuple(item for item in origins if not item.is_local)
+        if not propagated_effects and not propagated_origins:
+            return
+        future = self._executor.submit(
+            _encode_summary_payload,
+            summary_id,
+            propagated_effects,
+            propagated_origins,
+            check_cancelled=self._check_cancelled,
+        )
+        self._pending.append((summary_id, future))
+        if len(self._pending) >= 4:
+            self._drain_one()
+
+    def _drain_one(self) -> None:
+        summary_id, future = self._pending.popleft()
+        effect_count, origin_count, raw_size, payload_hash, payload = future.result()
+        offset = self._file.tell()
+        self._file.write(payload)
+        self._records.append(
+            (
+                summary_id,
+                effect_count,
+                origin_count,
+                raw_size,
+                payload_hash,
+                offset,
+                len(payload),
+            )
+        )
+
+    def finish(self) -> None:
+        while self._pending:
+            self._drain_one()
+        if not self._finished:
+            self._executor.shutdown()
+            self._finished = True
+
+    def rows(
+        self, project_id: int, *, summary_ids: set[str] | None = None
+    ) -> Iterator[tuple[object, ...]]:
+        self.finish()
+        for (
+            summary_id,
+            effect_count,
+            origin_count,
+            raw_size,
+            payload_hash,
+            offset,
+            payload_size,
+        ) in sorted(self._records):
+            if summary_ids is not None and summary_id not in summary_ids:
+                continue
+            self._file.seek(offset)
+            payload = self._file.read(payload_size)
+            if len(payload) != payload_size:
+                raise SummaryPayloadError("summary payload spool was truncated")
+            yield (
+                project_id,
+                summary_id,
+                SUMMARY_PAYLOAD_ENCODING,
+                effect_count,
+                origin_count,
+                raw_size,
+                payload_hash,
+                payload,
+            )
+
+    def close(self) -> None:
+        if not self._finished:
+            for _, future in self._pending:
+                future.cancel()
+            self._executor.shutdown(cancel_futures=True)
+            self._finished = True
+        self._file.close()
 
 
 class SQLiteStore:
@@ -284,6 +412,7 @@ class SQLiteStore:
         *,
         project_root: Path | None = None,
         build_scope: BuildScope | None = None,
+        cancelled: threading.Event | None = None,
     ) -> Iterator[SQLiteStore]:
         """Stage a missing database privately; existing databases retain WAL readers.
 
@@ -322,6 +451,8 @@ class SQLiteStore:
             raise FileExistsError("SQLite sidecar appeared at fresh generation destination")
         # Linking on the same filesystem publishes atomically and refuses a racing writer.
         # The connection is closed first so no WAL can be opened under the staging name.
+        # Cancellation may arrive during WAL restoration or close, after runtime's last check.
+        _check_index_cancelled(cancelled)
         os.link(staged, path)
         staged.unlink()
         private.rmdir()
@@ -2391,6 +2522,7 @@ class SQLiteStore:
         current_translation_unit_ids: frozenset[str] | None = None,
         build_variant: BuildVariant | None = None,
         index_profile: IndexProfile = IndexProfile.FULL,
+        cancelled: threading.Event | None = None,
     ) -> int:
         """Atomically replace changed units and optionally remove stale units."""
 
@@ -2406,6 +2538,7 @@ class SQLiteStore:
             changed_translation_unit_ids=frozenset(unit.id for unit in batch.translation_units),
             build_variant=selected_variant,
             index_profile=index_profile,
+            cancelled=cancelled,
         )
 
     def apply_ingestion_batches(
@@ -2417,10 +2550,12 @@ class SQLiteStore:
         changed_translation_unit_ids: frozenset[str] | None = None,
         build_variant: BuildVariant | None = None,
         index_profile: IndexProfile = IndexProfile.FULL,
+        cancelled: threading.Event | None = None,
         finalization_observer: Callable[[str, str], None] | None = None,
     ) -> int:
         """Atomically stage and retire TU-sized batches before global finalization."""
 
+        _check_index_cancelled(cancelled)
         root = str(project_root.resolve(strict=False))
         selected_variant = build_variant or BuildVariant(DEFAULT_BUILD_VARIANT, Path("."))
         # Canonical symbols are derived once from the newly inserted variants at
@@ -2436,6 +2571,7 @@ class SQLiteStore:
                 # observable or survive a failed fresh generation.
                 self._connection.execute("BEGIN IMMEDIATE")
                 self._connection.execute("PRAGMA defer_foreign_keys = ON")
+                _check_index_cancelled(cancelled)
                 if fresh_generation:
                     deferred_indexes = self._drop_fresh_generation_indexes()
                     self._defer_variant_fts = True
@@ -2472,6 +2608,7 @@ class SQLiteStore:
                     self._delete_translation_units(project_id, replaced_ids)
 
                 for batch in batches:
+                    _check_index_cancelled(cancelled)
                     batch_unit_ids = {unit.id for unit in batch.translation_units}
                     if remaining_changed_ids is not None:
                         unexpected = batch_unit_ids - remaining_changed_ids
@@ -2487,6 +2624,7 @@ class SQLiteStore:
                         )
                         self._delete_translation_units(project_id, batch_unit_ids)
                     self._stage_ingestion_batch(project_id, batch, index_profile, selected_variant)
+                    _check_index_cancelled(cancelled)
                     # Release TU-local tuples before requesting the next batch;
                     # Python for-loops otherwise retain the previous loop value.
                     del batch
@@ -2494,6 +2632,7 @@ class SQLiteStore:
                 if remaining_changed_ids:
                     raise ValueError("ingestion stream ended before every changed translation unit")
 
+                _check_index_cancelled(cancelled)
                 if fresh_generation:
                     if finalization_observer is not None:
                         finalization_observer("restore_deferred_indexes", "started")
@@ -2519,7 +2658,10 @@ class SQLiteStore:
                 if finalization_observer is not None:
                     finalization_observer("refresh_summaries", "started")
                 invalidated_summaries = self._refresh_summary_solutions(
-                    project_id, selected_variant.name, affected_functions
+                    project_id,
+                    selected_variant.name,
+                    affected_functions,
+                    cancelled=cancelled,
                 )
                 # A failing/cancelled call must not emit completion; callbacks stay
                 # inside the transaction so observer failures also roll back.
@@ -2545,6 +2687,7 @@ class SQLiteStore:
                 self._clear_ingestion_tracking()
                 if fresh_generation:
                     self._validate_fresh_generation()
+                _check_index_cancelled(cancelled)
                 return invalidated_summaries
         finally:
             self._defer_variant_fts = False
@@ -4432,6 +4575,50 @@ class SQLiteStore:
             _propagated_summary_groups(origins, summary_ids),
         )
 
+    def _write_summary_solution_batch(
+        self,
+        rows: Sequence[tuple[object, ...]],
+    ) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO summary_solution_payloads(
+                project_id, summary_id, encoding, effect_count, origin_count,
+                uncompressed_bytes, payload_hash, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    def _write_summary_solution_rows_batched(
+        self,
+        rows: Iterable[tuple[object, ...]],
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> None:
+        batch: list[tuple[object, ...]] = []
+        payload_bytes = 0
+        for row in rows:
+            if check_cancelled is not None:
+                check_cancelled()
+            payload = row[-1]
+            if not isinstance(payload, bytes):
+                raise TypeError("summary payload row requires encoded bytes")
+            if batch and (
+                len(batch) >= SUMMARY_PAYLOAD_WRITE_BATCH_SIZE
+                or payload_bytes + len(payload) > SUMMARY_PAYLOAD_WRITE_BATCH_BYTES
+            ):
+                self._write_summary_solution_batch(batch)
+                batch = []
+                payload_bytes = 0
+                if check_cancelled is not None:
+                    check_cancelled()
+            batch.append(row)
+            payload_bytes += len(payload)
+        if batch:
+            self._write_summary_solution_batch(batch)
+            if check_cancelled is not None:
+                check_cancelled()
+
     def _write_summary_solution_groups(
         self,
         project_id: int,
@@ -4468,28 +4655,29 @@ class SQLiteStore:
                 build_variant
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                (
-                    project_id,
-                    item.id,
-                    item.kind.value,
-                    item.caller_summary_id,
-                    item.callee_summary_id,
-                    item.callsite_id,
-                    item.target_symbol_id,
-                    item.target_certainty.value,
-                    item.certainty.value,
-                    item.reason,
-                    item.argument_index,
-                    item.caller_location_id,
-                    item.callee_location_id,
-                    item.caller_access_id,
-                    item.translation_unit_id,
-                    item.build_configuration_id,
-                    item.build_variant,
-                )
-                for item in flows
-            ),
+            (self._interprocedural_flow_row(project_id, item) for item in flows),
+        )
+
+    @staticmethod
+    def _interprocedural_flow_row(project_id: int, item: InterproceduralFlow) -> tuple[object, ...]:
+        return (
+            project_id,
+            item.id,
+            item.kind.value,
+            item.caller_summary_id,
+            item.callee_summary_id,
+            item.callsite_id,
+            item.target_symbol_id,
+            item.target_certainty.value,
+            item.certainty.value,
+            item.reason,
+            item.argument_index,
+            item.caller_location_id,
+            item.callee_location_id,
+            item.caller_access_id,
+            item.translation_unit_id,
+            item.build_configuration_id,
+            item.build_variant,
         )
 
     def _reverse_summary_callers(
@@ -4550,8 +4738,236 @@ class SQLiteStore:
             closure.update(frontier)
         return closure
 
+    def _load_summary_solver_inputs(
+        self,
+        project_id: int,
+        build_variant: str,
+        selected_functions: set[str],
+    ) -> tuple[
+        tuple[FunctionSummary, ...],
+        tuple[SummaryEffect, ...],
+        tuple[SummaryReturnOrigin, ...],
+        tuple[CallArgumentBinding, ...],
+        tuple[CallResultBinding, ...],
+        tuple[_SummaryCallSiteProjection, ...],
+        tuple[_SummaryCallTargetProjection, ...],
+    ]:
+        """Load only columns consumed by the solver, omitting source-span reconstruction."""
+
+        placeholders = ",".join("?" for _ in selected_functions)
+        function_parameters = (project_id, build_variant, *sorted(selected_functions))
+        summaries = tuple(
+            FunctionSummary(
+                id=row["id"],
+                function_symbol_id=row["function_symbol_id"],
+                graph_id=row["graph_id"],
+                analysis_id=row["analysis_id"],
+                parameter_modes=tuple(json.loads(row["parameter_modes_json"])),
+                parameter_location_ids=tuple(json.loads(row["parameter_location_ids_json"])),
+                local_complete=bool(row["local_complete"]),
+                local_incomplete_reasons=tuple(json.loads(row["local_incomplete_reasons_json"])),
+                complete=bool(row["local_complete"]),
+                incomplete_reasons=tuple(json.loads(row["local_incomplete_reasons_json"])),
+                recursive=False,
+                iteration_count=0,
+                max_scc_iterations=1,
+                max_scc_size=1,
+                max_summary_effects=1,
+                translation_unit_id=row["translation_unit_id"],
+                build_configuration_id=row["build_configuration_id"],
+                build_variant=row["build_variant"],
+            )
+            for row in self._connection.execute(
+                f"""
+                SELECT id, function_symbol_id, graph_id, analysis_id,
+                       parameter_modes_json, parameter_location_ids_json,
+                       local_complete, local_incomplete_reasons_json,
+                       translation_unit_id, build_configuration_id, build_variant
+                FROM function_summaries
+                WHERE project_id = ? AND build_variant = ?
+                  AND function_symbol_id IN ({placeholders})
+                ORDER BY id
+                """,
+                function_parameters,
+            )
+        )
+        if not summaries:
+            return (), (), (), (), (), (), ()
+        summary_ids = {item.id for item in summaries}
+        summary_placeholders = ",".join("?" for _ in summary_ids)
+        summary_parameters = (project_id, *sorted(summary_ids))
+        effects = tuple(
+            SummaryEffect(
+                id=row["id"],
+                summary_id=row["summary_id"],
+                kind=SummaryEffectKind(row["kind"]),
+                location_kind=MemoryLocationKind(row["location_kind"]),
+                certainty=DataFlowCertainty(row["certainty"]),
+                reason=row["reason"],
+                parameter_index=row["parameter_index"],
+                access_path=tuple(json.loads(row["access_path_json"])),
+                location_id=row["location_id"],
+                source_access_id=row["source_access_id"],
+                is_local=True,
+                translation_unit_id=row["translation_unit_id"],
+                build_configuration_id=row["build_configuration_id"],
+                build_variant=row["build_variant"],
+            )
+            for row in self._connection.execute(
+                f"""
+                SELECT id, summary_id, kind, location_kind, certainty, reason,
+                       parameter_index, access_path_json, location_id,
+                       source_access_id, translation_unit_id,
+                       build_configuration_id, build_variant
+                FROM summary_effects
+                WHERE project_id = ? AND is_local = 1
+                  AND summary_id IN ({summary_placeholders})
+                ORDER BY id
+                """,
+                summary_parameters,
+            )
+        )
+        origins = tuple(
+            SummaryReturnOrigin(
+                id=row["id"],
+                summary_id=row["summary_id"],
+                kind=SummaryReturnOriginKind(row["kind"]),
+                certainty=DataFlowCertainty(row["certainty"]),
+                reason=row["reason"],
+                location_kind=(
+                    MemoryLocationKind(row["location_kind"]) if row["location_kind"] else None
+                ),
+                parameter_index=row["parameter_index"],
+                access_path=tuple(json.loads(row["access_path_json"])),
+                location_id=row["location_id"],
+                callsite_id=row["callsite_id"],
+                is_local=True,
+                translation_unit_id=row["translation_unit_id"],
+                build_configuration_id=row["build_configuration_id"],
+                build_variant=row["build_variant"],
+            )
+            for row in self._connection.execute(
+                f"""
+                SELECT id, summary_id, kind, certainty, reason, location_kind,
+                       parameter_index, access_path_json, location_id,
+                       callsite_id, translation_unit_id,
+                       build_configuration_id, build_variant
+                FROM summary_return_origins
+                WHERE project_id = ? AND is_local = 1
+                  AND summary_id IN ({summary_placeholders})
+                ORDER BY id
+                """,
+                summary_parameters,
+            )
+        )
+        arguments = tuple(
+            CallArgumentBinding(
+                id=row["id"],
+                caller_summary_id=row["caller_summary_id"],
+                callsite_id=row["callsite_id"],
+                argument_index=row["argument_index"],
+                location_id=row["location_id"],
+                location_kind=MemoryLocationKind(row["location_kind"]),
+                parameter_index=row["parameter_index"],
+                access_path=tuple(json.loads(row["access_path_json"])),
+                writeback_candidate=bool(row["writeback_candidate"]),
+                complete=bool(row["complete"]),
+                incomplete_reason=row["incomplete_reason"],
+                translation_unit_id=row["translation_unit_id"],
+                build_configuration_id=row["build_configuration_id"],
+                build_variant=row["build_variant"],
+            )
+            for row in self._connection.execute(
+                f"""
+                SELECT id, caller_summary_id, callsite_id, argument_index,
+                       location_id, location_kind, parameter_index,
+                       access_path_json, writeback_candidate, complete,
+                       incomplete_reason, translation_unit_id,
+                       build_configuration_id, build_variant
+                FROM call_argument_bindings
+                WHERE project_id = ?
+                  AND caller_summary_id IN ({summary_placeholders})
+                ORDER BY id
+                """,
+                summary_parameters,
+            )
+        )
+        results = tuple(
+            CallResultBinding(
+                id=row["id"],
+                caller_summary_id=row["caller_summary_id"],
+                callsite_id=row["callsite_id"],
+                location_id=row["location_id"],
+                definition_access_id=row["definition_access_id"],
+                translation_unit_id=row["translation_unit_id"],
+                build_configuration_id=row["build_configuration_id"],
+                build_variant=row["build_variant"],
+            )
+            for row in self._connection.execute(
+                f"""
+                SELECT id, caller_summary_id, callsite_id, location_id,
+                       definition_access_id, translation_unit_id,
+                       build_configuration_id, build_variant
+                FROM call_result_bindings
+                WHERE project_id = ?
+                  AND caller_summary_id IN ({summary_placeholders})
+                ORDER BY id
+                """,
+                summary_parameters,
+            )
+        )
+        sites = tuple(
+            _SummaryCallSiteProjection(
+                id=row["id"],
+                owner_symbol_id=row["owner_symbol_id"],
+                target_set_complete=bool(row["target_set_complete"]),
+                translation_unit_id=row["translation_unit_id"],
+                build_configuration_id=row["build_configuration_id"],
+                build_variant=row["build_variant"],
+            )
+            for row in self._connection.execute(
+                f"""
+                SELECT id, owner_symbol_id, target_set_complete,
+                       translation_unit_id, build_configuration_id, build_variant
+                FROM callsites
+                WHERE project_id = ? AND build_variant = ?
+                  AND owner_symbol_id IN ({placeholders})
+                ORDER BY id
+                """,
+                function_parameters,
+            )
+        )
+        site_ids = {item.id for item in sites}
+        if not site_ids:
+            return summaries, effects, origins, arguments, results, sites, ()
+        site_placeholders = ",".join("?" for _ in site_ids)
+        targets = tuple(
+            _SummaryCallTargetProjection(
+                id=row["id"],
+                callsite_id=row["callsite_id"],
+                target_symbol_id=row["target_symbol_id"],
+                certainty=CallTargetCertainty(row["certainty"]),
+                build_variant=row["build_variant"],
+            )
+            for row in self._connection.execute(
+                f"""
+                SELECT id, callsite_id, target_symbol_id, certainty, build_variant
+                FROM call_targets
+                WHERE project_id = ? AND callsite_id IN ({site_placeholders})
+                ORDER BY id
+                """,
+                (project_id, *sorted(site_ids)),
+            )
+        )
+        return summaries, effects, origins, arguments, results, sites, targets
+
     def _refresh_summary_solutions(
-        self, project_id: int, build_variant: str, affected_functions: set[str]
+        self,
+        project_id: int,
+        build_variant: str,
+        affected_functions: set[str],
+        *,
+        cancelled: threading.Event | None = None,
     ) -> int:
         if not affected_functions:
             return 0
@@ -4573,162 +4989,161 @@ class SQLiteStore:
             selected_functions = self._forward_summary_callees(
                 project_id, build_variant, affected_functions
             )
-        placeholders = ",".join("?" for _ in selected_functions)
-        summary_rows = self._connection.execute(
-            f"""
-            SELECT * FROM function_summaries
-            WHERE project_id = ? AND build_variant = ?
-              AND function_symbol_id IN ({placeholders})
-            ORDER BY id
-            """,
-            (project_id, build_variant, *sorted(selected_functions)),
-        ).fetchall()
-        summaries = tuple(self._row_to_function_summary(row) for row in summary_rows)
+        (
+            summaries,
+            effects,
+            origins,
+            arguments,
+            results,
+            sites,
+            targets,
+        ) = self._load_summary_solver_inputs(project_id, build_variant, selected_functions)
         if not summaries:
             return 0
-        summary_ids = {item.id for item in summaries}
-        summary_placeholders = ",".join("?" for _ in summary_ids)
-        effects = tuple(
-            self._row_to_summary_effect(row)
-            for row in self._connection.execute(
-                f"""
-                SELECT * FROM summary_effects
-                WHERE project_id = ? AND is_local = 1
-                  AND summary_id IN ({summary_placeholders}) ORDER BY id
-                """,
-                (project_id, *sorted(summary_ids)),
-            )
-        )
-        origins = tuple(
-            self._row_to_summary_return_origin(row)
-            for row in self._connection.execute(
-                f"""
-                SELECT * FROM summary_return_origins
-                WHERE project_id = ? AND is_local = 1
-                  AND summary_id IN ({summary_placeholders}) ORDER BY id
-                """,
-                (project_id, *sorted(summary_ids)),
-            )
-        )
-        arguments = tuple(
-            self._row_to_call_argument_binding(row)
-            for row in self._connection.execute(
-                f"""
-                SELECT * FROM call_argument_bindings
-                WHERE project_id = ? AND caller_summary_id IN ({summary_placeholders})
-                ORDER BY id
-                """,
-                (project_id, *sorted(summary_ids)),
-            )
-        )
-        results = tuple(
-            self._row_to_call_result_binding(row)
-            for row in self._connection.execute(
-                f"""
-                SELECT * FROM call_result_bindings
-                WHERE project_id = ? AND caller_summary_id IN ({summary_placeholders})
-                ORDER BY id
-                """,
-                (project_id, *sorted(summary_ids)),
-            )
-        )
-        sites = tuple(
-            self._row_to_callsite(row)
-            for row in self._connection.execute(
-                f"""
-                SELECT * FROM callsites
-                WHERE project_id = ? AND build_variant = ?
-                  AND owner_symbol_id IN ({placeholders}) ORDER BY id
-                """,
-                (project_id, build_variant, *sorted(selected_functions)),
-            )
-        )
-        site_ids = {item.id for item in sites}
-        if site_ids:
-            site_placeholders = ",".join("?" for _ in site_ids)
-            targets = tuple(
-                self._row_to_call_target(row)
-                for row in self._connection.execute(
-                    f"""
-                    SELECT * FROM call_targets WHERE project_id = ?
-                      AND callsite_id IN ({site_placeholders}) ORDER BY id
-                    """,
-                    (project_id, *sorted(site_ids)),
-                )
-            )
-        else:
-            targets = ()
-        solution = solve_interprocedural(
-            summaries, effects, origins, arguments, results, sites, targets
-        )
         impacted_ids = {
             item.id for item in summaries if item.function_symbol_id in affected_functions
         }
         if not impacted_ids:
             return 0
-        impacted_placeholders = ",".join("?" for _ in impacted_ids)
-        parameters = (project_id, *sorted(impacted_ids))
-        self._connection.execute(
-            f"DELETE FROM interprocedural_flows WHERE project_id = ? "
-            f"AND caller_summary_id IN ({impacted_placeholders})",
-            parameters,
-        )
-        self._connection.execute(
-            f"DELETE FROM summary_effects WHERE project_id = ? AND is_local = 0 "
-            f"AND summary_id IN ({impacted_placeholders})",
-            parameters,
-        )
-        self._connection.execute(
-            f"DELETE FROM summary_return_origins WHERE project_id = ? AND is_local = 0 "
-            f"AND summary_id IN ({impacted_placeholders})",
-            parameters,
-        )
-        self._connection.execute(
-            f"DELETE FROM summary_solution_payloads WHERE project_id = ? "
-            f"AND summary_id IN ({impacted_placeholders})",
-            parameters,
-        )
-        solved = [item for item in solution.summaries if item.id in impacted_ids]
-        self._connection.executemany(
-            """
-            UPDATE function_summaries SET
-                complete = ?, incomplete_reasons_json = ?, recursive = ?,
-                iteration_count = ?, max_scc_iterations = ?, max_scc_size = ?,
-                max_summary_effects = ?, solution_hash = ?
-            WHERE project_id = ? AND id = ?
-            """,
-            (
-                (
-                    int(item.complete),
-                    json.dumps(item.incomplete_reasons),
-                    int(item.recursive),
-                    item.iteration_count,
-                    item.max_scc_iterations,
-                    item.max_scc_size,
-                    item.max_summary_effects,
-                    item.solution_hash,
-                    project_id,
-                    item.id,
+
+        def check_cancelled() -> None:
+            _check_index_cancelled(cancelled)
+
+        spool = _SummaryPayloadSpool(check_cancelled)
+        try:
+
+            def emit_summary(
+                summary: FunctionSummary,
+                summary_effects: tuple[SummaryEffect, ...],
+                summary_origins: tuple[SummaryReturnOrigin, ...],
+            ) -> None:
+                if summary.id not in impacted_ids:
+                    return
+                check_cancelled()
+                spool.add(summary.id, summary_effects, summary_origins)
+                check_cancelled()
+
+            check_cancelled()
+            solution = solve_interprocedural(
+                summaries,
+                effects,
+                origins,
+                arguments,
+                results,
+                sites,
+                targets,
+                check_cancelled=check_cancelled,
+                emit_summary=emit_summary,
+                retain_emitted_facts=False,
+            )
+            # Delete/reinsert rewrites identical compressed BLOBs into the WAL.
+            # Compare every persisted field; changed-to-empty summaries stay in the delete set.
+            changed_payload_ids = impacted_ids.copy()
+            for row in spool.rows(project_id):
+                check_cancelled()
+                previous = self._connection.execute(
+                    """
+                    SELECT project_id, summary_id, encoding, effect_count, origin_count,
+                           uncompressed_bytes, payload_hash, payload
+                    FROM summary_solution_payloads WHERE project_id = ? AND summary_id = ?
+                    """,
+                    row[:2],
+                ).fetchone()
+                if previous is not None and tuple(previous) == row:
+                    changed_payload_ids.discard(row[1])
+            check_cancelled()
+            impacted_placeholders = ",".join("?" for _ in impacted_ids)
+            parameters = (project_id, *sorted(impacted_ids))
+            # Identical refreshes need not rewrite every flow and its indexes.
+            # Compare all persisted fields in solver ID order, not just IDs or payload hashes.
+            previous_flows = self._connection.execute(
+                "SELECT project_id, id, kind, caller_summary_id, callee_summary_id, "
+                "callsite_id, target_symbol_id, target_certainty, certainty, reason, "
+                "argument_index, caller_location_id, callee_location_id, caller_access_id, "
+                "translation_unit_id, build_configuration_id, build_variant "
+                "FROM interprocedural_flows WHERE project_id = ? "
+                f"AND caller_summary_id IN ({impacted_placeholders}) ORDER BY id",
+                parameters,
+            )
+            flows_unchanged = True
+            try:
+                for item in solution.flows:
+                    check_cancelled()
+                    if item.caller_summary_id not in impacted_ids:
+                        continue
+                    previous = previous_flows.fetchone()
+                    if previous is None or tuple(previous) != self._interprocedural_flow_row(
+                        project_id, item
+                    ):
+                        flows_unchanged = False
+                        break
+                else:
+                    flows_unchanged = previous_flows.fetchone() is None
+            finally:
+                previous_flows.close()
+            check_cancelled()
+            if not flows_unchanged:
+                self._connection.execute(
+                    f"DELETE FROM interprocedural_flows WHERE project_id = ? "
+                    f"AND caller_summary_id IN ({impacted_placeholders})",
+                    parameters,
                 )
-                for item in solved
-            ),
-        )
-        self._put_summary_facts(
-            project_id,
-            (),
-            (),
-            (),
-            (),
-            (),
-            (item for item in solution.flows if item.caller_summary_id in impacted_ids),
-        )
-        self._put_summary_solution_payloads(
-            project_id,
-            impacted_ids,
-            solution.effects,
-            solution.return_origins,
-        )
-        return len(impacted_ids)
+            self._connection.execute(
+                f"DELETE FROM summary_effects WHERE project_id = ? AND is_local = 0 "
+                f"AND summary_id IN ({impacted_placeholders})",
+                parameters,
+            )
+            self._connection.execute(
+                f"DELETE FROM summary_return_origins WHERE project_id = ? AND is_local = 0 "
+                f"AND summary_id IN ({impacted_placeholders})",
+                parameters,
+            )
+            if changed_payload_ids:
+                changed_placeholders = ",".join("?" for _ in changed_payload_ids)
+                self._connection.execute(
+                    f"DELETE FROM summary_solution_payloads WHERE project_id = ? "
+                    f"AND summary_id IN ({changed_placeholders})",
+                    (project_id, *sorted(changed_payload_ids)),
+                )
+            solved = [item for item in solution.summaries if item.id in impacted_ids]
+            self._connection.executemany(
+                """
+                UPDATE function_summaries SET
+                    complete = ?, incomplete_reasons_json = ?, recursive = ?,
+                    iteration_count = ?, max_scc_iterations = ?, max_scc_size = ?,
+                    max_summary_effects = ?, solution_hash = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (
+                    (
+                        int(item.complete),
+                        json.dumps(item.incomplete_reasons),
+                        int(item.recursive),
+                        item.iteration_count,
+                        item.max_scc_iterations,
+                        item.max_scc_size,
+                        item.max_summary_effects,
+                        item.solution_hash,
+                        project_id,
+                        item.id,
+                    )
+                    for item in solved
+                ),
+            )
+            if not flows_unchanged:
+                self._put_interprocedural_flows(
+                    project_id,
+                    (item for item in solution.flows if item.caller_summary_id in impacted_ids),
+                )
+            self._write_summary_solution_rows_batched(
+                spool.rows(project_id, summary_ids=changed_payload_ids),
+                check_cancelled=check_cancelled,
+            )
+            # An entirely skipped payload write still needs a final cancellation poll.
+            check_cancelled()
+            return len(impacted_ids)
+        finally:
+            spool.close()
 
     @staticmethod
     def _row_to_function_summary(row: sqlite3.Row) -> FunctionSummary:
@@ -8079,13 +8494,17 @@ def _encode_summary_payload(
     summary_id: str,
     effects: Sequence[SummaryEffect],
     origins: Sequence[SummaryReturnOrigin],
+    *,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> tuple[int, int, int, str, bytes]:
     """Return deterministic bounded metadata and bytes for one propagated solution."""
 
     if len(effects) + len(origins) > MAX_SUMMARY_PAYLOAD_RECORDS:
         raise SummaryPayloadError("summary payload record limit exceeded")
     effect_records: list[list[object]] = []
-    for item in effects:
+    for index, item in enumerate(effects):
+        if check_cancelled is not None and index % 256 == 0:
+            check_cancelled()
         if item.is_local or item.summary_id != summary_id:
             raise SummaryPayloadError("summary payload contains an invalid propagated effect")
         effect_records.append(
@@ -8096,7 +8515,7 @@ def _encode_summary_payload(
                 item.certainty.value,
                 item.reason,
                 item.parameter_index,
-                list(item.access_path),
+                item.access_path,
                 item.location_id,
                 item.source_access_id,
                 item.via_callsite_id,
@@ -8107,7 +8526,9 @@ def _encode_summary_payload(
             ]
         )
     origin_records: list[list[object]] = []
-    for item in origins:
+    for index, item in enumerate(origins):
+        if check_cancelled is not None and index % 256 == 0:
+            check_cancelled()
         if item.is_local or item.summary_id != summary_id:
             raise SummaryPayloadError("summary payload contains an invalid propagated origin")
         origin_records.append(
@@ -8118,7 +8539,7 @@ def _encode_summary_payload(
                 item.reason,
                 item.location_kind.value if item.location_kind else None,
                 item.parameter_index,
-                list(item.access_path),
+                item.access_path,
                 item.location_id,
                 item.callsite_id,
                 item.via_callsite_id,
@@ -8135,7 +8556,19 @@ def _encode_summary_payload(
     ).encode("utf-8")
     if len(raw) > MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES:
         raise SummaryPayloadError("summary payload decompressed-size limit exceeded")
-    compressed = zlib.compress(raw, level=6)
+    if check_cancelled is None:
+        compressed = zlib.compress(raw, level=6)
+    else:
+        compressor = zlib.compressobj(level=6)
+        chunks: list[bytes] = []
+        for offset in range(0, len(raw), 1024 * 1024):
+            check_cancelled()
+            chunk = compressor.compress(raw[offset : offset + 1024 * 1024])
+            if chunk:
+                chunks.append(chunk)
+        chunks.append(compressor.flush())
+        compressed = b"".join(chunks)
+        check_cancelled()
     if len(compressed) > MAX_SUMMARY_PAYLOAD_COMPRESSED_BYTES:
         raise SummaryPayloadError("summary payload compressed-size limit exceeded")
     return (

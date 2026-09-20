@@ -10,6 +10,7 @@ import pytest
 from cpp_context_engine.analysis import interprocedural
 from cpp_context_engine.analysis.interprocedural import InterproceduralLimits
 from cpp_context_engine.models import (
+    CallArgumentBinding,
     CallDispatchKind,
     CallResultBinding,
     CallSite,
@@ -292,6 +293,72 @@ def test_return_flow_creation_preserves_cancellation(monkeypatch) -> None:
     monkeypatch.setattr(interprocedural, "_flow", mark_created)
     with pytest.raises(InterruptedError, match="cancelled after return-flow construction"):
         interprocedural.solve_interprocedural(*_inputs(), check_cancelled=check_cancelled)
+
+
+@pytest.mark.parametrize("phase", ("projection", "construction"))
+def test_return_flow_passes_poll_every_256(monkeypatch, phase):
+    inputs = list(_inputs())
+    inputs[0] = tuple(
+        replace(item, parameter_modes=("reference",), parameter_location_ids=("p0",))
+        if item.id == "leaf-a"
+        else item
+        for item in inputs[0]
+    )
+    active = False
+    reads = 0
+    constructions = 0
+
+    class CountedOrigin(SummaryReturnOrigin):
+        def __getattribute__(self, name):
+            nonlocal reads
+            if name == "location_id" and active:
+                reads += 1
+            return super().__getattribute__(name)
+
+    source = next(item for item in inputs[2] if item.id == "leaf-origin")
+    inputs[2] = tuple(item for item in inputs[2] if item.summary_id != "leaf-a") + tuple(
+        CountedOrigin(**asdict(replace(source, id=f"origin-{index:03d}", location_id=f"g{index}")))
+        for index in range(600)
+    )
+    inputs[3] = tuple(
+        CallArgumentBinding(
+            id=f"argument-{site}",
+            caller_summary_id="caller",
+            callsite_id=site,
+            argument_index=0,
+            location_id="caller-location",
+            location_kind=MemoryLocationKind.GLOBAL,
+            parameter_index=None,
+            access_path=(),
+            writeback_candidate=True,
+            complete=True,
+            translation_unit_id="unit",
+            build_configuration_id="config",
+        )
+        for site in ("first", "later")
+    )
+    original = interprocedural._flow
+
+    def counted(*args, **kwargs):
+        nonlocal active, constructions
+        flow = original(*args, **kwargs)
+        if flow.kind == InterproceduralFlowKind.ARGUMENT_TO_PARAMETER:
+            # This edge is now entering return-flow projection, after solver transfers.
+            active = True
+        elif flow.kind == InterproceduralFlowKind.RETURN_TO_CALLER:
+            constructions += 1
+        return flow
+
+    def check_cancelled():
+        if (reads if phase == "projection" else constructions) >= 1:
+            raise InterruptedError("cancelled during return-flow pass")
+
+    monkeypatch.setattr(interprocedural, "_flow", counted)
+    with pytest.raises(InterruptedError, match="return-flow pass"):
+        interprocedural.solve_interprocedural(*inputs, check_cancelled=check_cancelled)
+    assert (reads if phase == "projection" else constructions) == 256
+    if phase == "projection":
+        assert constructions == 0
 
 
 @pytest.mark.parametrize(
