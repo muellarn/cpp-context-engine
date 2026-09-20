@@ -47,6 +47,9 @@ def phase_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Deliver already timestamped events late without a real child process."""
     clock = _Clock()
     events: list[dict] = []
+    monitor_type = kicad_canary._AnalyzerTelemetryMonitor
+    interrupt_on_wait = False
+    worker_return_code = 0
 
     class Process:
         pid = 999999
@@ -57,10 +60,12 @@ def phase_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             clock.now += 20.0
 
         def poll(self):
-            return 0
+            return worker_return_code
 
         def wait(self, **_kwargs):
-            return 0
+            if interrupt_on_wait:
+                raise KeyboardInterrupt
+            return worker_return_code
 
     monkeypatch.setattr(kicad_canary.time, "monotonic", clock)
     monkeypatch.setattr(kicad_canary.subprocess, "Popen", Process)
@@ -73,10 +78,33 @@ def phase_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         kicad_canary,
         "_AnalyzerTelemetryMonitor",
-        lambda **_kwargs: SimpleNamespace(check=lambda: None, success_report=lambda: {}),
+        lambda **_kwargs: SimpleNamespace(
+            check=lambda: None,
+            success_report=lambda: {},
+            partial_report=lambda _started: {},
+            observe_consumer=lambda *_args: None,
+        ),
     )
 
-    def run(payloads, *, stage="index"):
+    def run(
+        payloads,
+        *,
+        stage="index",
+        pipeline=False,
+        total_tus=2,
+        wall_seconds=60,
+        interrupt=False,
+        return_code=0,
+    ):
+        nonlocal interrupt_on_wait, worker_return_code
+        interrupt_on_wait = interrupt
+        worker_return_code = return_code
+        if pipeline:
+            monkeypatch.setattr(
+                kicad_canary,
+                "_AnalyzerTelemetryMonitor",
+                lambda **kwargs: monitor_type(**kwargs, clock=clock),
+            )
         events[:] = payloads
         spec = tmp_path / "spec.json"
         spec.write_text(
@@ -88,9 +116,242 @@ def phase_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 }
             )
         )
-        return kicad_canary._run_supervised(spec, tmp_path, CanaryLimits(wall_seconds=60), 2)
+        return kicad_canary._run_supervised(
+            spec, tmp_path, CanaryLimits(wall_seconds=wall_seconds), total_tus
+        )
 
     return run
+
+
+@pytest.mark.parametrize("stop", ["timeout", "interrupt", "worker_sigterm"])
+def test_timeout_preserves_mixed_per_tu_pipeline_intervals(
+    phase_worker, tmp_path: Path, stop: str
+) -> None:
+    events = [{"event": "phase", "name": "index", "monotonic_seconds": 1}]
+    transitions = [
+        (2, "analyzer_started", 0, 0, None),
+        (3, "analyzer_started", 1, 1, None),
+        (4, "analyzer_started", 2, 2, None),
+        (5, "analyzer_finished", 0, 0, "succeeded"),
+        (6, "conversion_started", None, 0, None),
+        (7, "analyzer_finished", 1, 1, "succeeded"),
+        (8, "conversion_started", None, 1, None),
+        (9, "conversion_finished", None, 0, "succeeded"),
+    ]
+    for sequence, (at, kind, slot, index, outcome) in enumerate(transitions, start=1):
+        events.append(
+            {
+                "event": "analyzer_pipeline",
+                "sequence": sequence,
+                "monotonic_seconds": at,
+                "kind": kind,
+                "slot_id": slot,
+                "configuration_index": index,
+                "outcome": outcome,
+                "unscheduled_count": 0,
+                "held_registries": 3,
+                "max_spool_registries": 6,
+                "slot_count": 3,
+            }
+        )
+    events.append({"event": "tu_staging", "configuration_index": 0, "monotonic_seconds": 10})
+    failed = tmp_path.with_name(tmp_path.name + f"-{stop}-failed")
+    with (
+        pytest.raises(KeyboardInterrupt if stop == "interrupt" else RuntimeError) as error,
+        kicad_canary._gate_failure_publication(tmp_path, failed),
+    ):
+        phase_worker(
+            events,
+            pipeline=True,
+            total_tus=3,
+            wall_seconds=10 if stop == "timeout" else 60,
+            interrupt=stop == "interrupt",
+            return_code=-15 if stop == "worker_sigterm" else 0,
+        )
+    report = json.loads((failed / "phase-timings-index.json").read_text())
+    units = report["ingestion_pipeline"]["configurations"]
+    if stop == "timeout":
+        assert "wall time exceeded 10 seconds" in str(error.value)
+    elif stop == "worker_sigterm":
+        assert "exit -15" in str(error.value)
+    assert [unit["configuration_index"] for unit in units] == [0, 1, 2]
+    assert [unit["last_observed_phase"] for unit in units] == [
+        "consumer_staging",
+        "conversion",
+        "native_transport_registry",
+    ]
+    for index, name, start in [
+        (0, "consumer_staging", 10),
+        (1, "conversion", 8),
+        (2, "native_transport_registry", 4),
+    ]:
+        interval = units[index]["phases"][name]
+        assert interval == {
+            "status": "incomplete",
+            "start_seconds": start,
+            "end_seconds": None,
+            "duration_seconds": None,
+            "outcome": None,
+        }
+    assert units[0]["phases"]["native_transport_registry"]["duration_seconds"] == 3
+    assert units[0]["phases"]["conversion"]["duration_seconds"] == 3
+    assert units[2]["phases"]["conversion"]["status"] == "unknown"
+    assert (failed / "FAILURE.json").exists()
+    assert not (failed / "SUCCESS").exists()
+
+
+def test_measurement_write_failure_preserves_original_error(
+    phase_worker, tmp_path, monkeypatch
+) -> None:
+    write = kicad_canary._write_report_atomic
+
+    def fail_late_write(path, document):
+        if json.loads(document)["measurements"]["counts"]["staged_tus"]:
+            raise OSError("simulated diagnostic disk error")
+        write(path, document)
+
+    monkeypatch.setattr(kicad_canary, "_write_report_atomic", fail_late_write)
+    with pytest.raises(RuntimeError, match="original worker failure"):
+        phase_worker(
+            [
+                {"event": "phase", "name": "index", "monotonic_seconds": 1},
+                {"event": "tu_staged", "completed": 1, "monotonic_seconds": 2},
+                {"event": "error", "message": "original worker failure", "monotonic_seconds": 3},
+            ]
+        )
+    # The earlier valid atomic snapshot survives failed later diagnostic writes.
+    report = json.loads((tmp_path / "phase-timings-index.json").read_text())
+    assert report["measurements"]["counts"]["staged_tus"] == 0
+
+
+def test_measurement_write_failure_preserves_worker_sigterm(
+    phase_worker, tmp_path, monkeypatch
+) -> None:
+    write = kicad_canary._write_report_atomic
+    writes = 0
+
+    def fail_after_initial_snapshot(path, document):
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            raise OSError("simulated diagnostic disk error")
+        write(path, document)
+
+    monkeypatch.setattr(kicad_canary, "_write_report_atomic", fail_after_initial_snapshot)
+    with pytest.raises(RuntimeError, match="exit -15"):
+        phase_worker(
+            [{"event": "phase", "name": "index", "monotonic_seconds": 1}],
+            return_code=-15,
+        )
+    assert writes >= 3  # Initial, phase/tick and final flush were all attempted.
+    assert (
+        json.loads((tmp_path / "phase-timings-index.json").read_text())["captured_at_seconds"] == 0
+    )
+
+
+def test_pipeline_snapshots_use_existing_write_tick(
+    phase_worker, tmp_path: Path, monkeypatch
+) -> None:
+    writes = []
+    write = kicad_canary._write_report_atomic
+
+    def observe_write(path, document):
+        writes.append(path)
+        write(path, document)
+
+    monkeypatch.setattr(kicad_canary, "_write_report_atomic", observe_write)
+    events = [{"event": "phase", "name": "index", "monotonic_seconds": 1}]
+    for index in range(20):
+        for offset, kind, outcome in [
+            (0, "analyzer_started", None),
+            (1, "analyzer_finished", "succeeded"),
+            (2, "conversion_started", None),
+            (3, "conversion_finished", "succeeded"),
+        ]:
+            events.append(
+                _pipeline_event(
+                    index * 4 + offset + 1,
+                    2 + index / 10 + offset / 100,
+                    kind,
+                    slot_id=None if kind.startswith("conversion") else 0,
+                    configuration_index=index,
+                    outcome=outcome,
+                    slot_count=1,
+                    unscheduled_count=0,
+                ).to_protocol_payload()
+            )
+    with pytest.raises(RuntimeError, match="wall time exceeded"):
+        phase_worker(events, pipeline=True, total_tus=20, wall_seconds=10)
+    assert len(writes) == 3  # Initial, global phase transition, final; not 80 event writes.
+    report = json.loads((tmp_path / "phase-timings-index.json").read_text())
+    assert len(report["ingestion_pipeline"]["configurations"]) == 20
+    assert all(
+        unit["phases"]["conversion"]["status"] == "complete"
+        for unit in report["ingestion_pipeline"]["configurations"]
+    )
+
+
+def test_consumer_staging_boundaries_do_not_complete_on_close(capsys) -> None:
+    delegate = SimpleNamespace(
+        analysis_backend="test",
+        advanced_facts_complete=False,
+        iter_configuration_batches=lambda *_args: iter(("first", "second")),
+    )
+    batches = kicad_canary._ObservedIngestor(delegate, 2).iter_configuration_batches(Path(), ())
+    assert next(batches) == "first"
+    assert next(batches) == "second"
+    batches.close()
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event["event"] for event in events] == ["tu_staging", "tu_staged", "tu_staging"]
+    assert events[0]["configuration_index"] == 0
+    assert events[1]["completed"] == 1
+    assert events[2]["configuration_index"] == 1
+
+
+def test_pipeline_snapshot_uses_worker_times_across_observer_delivery_order() -> None:
+    clock = _Clock()
+    clock.now = 10
+    monitor = kicad_canary._AnalyzerTelemetryMonitor(
+        max_idle_seconds=10, expected_configurations=1, clock=clock
+    )
+    for sequence, kind, slot, outcome in [
+        (1, "analyzer_started", 0, None),
+        (2, "analyzer_finished", 0, "succeeded"),
+        (3, "conversion_started", None, None),
+    ]:
+        monitor.observe_payload(
+            _pipeline_event(
+                sequence,
+                sequence,
+                kind,
+                slot_id=slot,
+                configuration_index=0,
+                outcome=outcome,
+                unscheduled_count=0,
+            ).to_protocol_payload()
+        )
+    # Consumer writes directly; converter completion can still be in the observer queue.
+    monitor.observe_consumer(
+        {"event": "tu_staging", "configuration_index": 0, "monotonic_seconds": 5}, 10
+    )
+    monitor.observe_consumer({"event": "tu_staged", "completed": 1, "monotonic_seconds": 6}, 10)
+    monitor.observe_payload(
+        _pipeline_event(
+            4,
+            4,
+            "conversion_finished",
+            configuration_index=0,
+            outcome="succeeded",
+            unscheduled_count=0,
+        ).to_protocol_payload()
+    )
+    unit = monitor.partial_report(1)["configurations"][0]
+    assert unit["last_observed_phase"] == "consumer_staging"
+    assert all(
+        phase["status"] == "complete" and phase["duration_seconds"] == 1
+        for phase in unit["phases"].values()
+    )
+    assert unit["phases"]["consumer_staging"]["end_seconds"] == 5
 
 
 def test_phase_measurements_use_worker_times_not_delivery_times(
@@ -679,6 +940,9 @@ def test_canary_monitor_rejects_non_successful_history_after_slot_reuse(
 
     with pytest.raises(RuntimeError, match="non-successful"):
         monitor.success_report()
+    units = monitor.partial_report(0)["configurations"]
+    assert units[0]["phases"]["native_transport_registry"]["outcome"] == first_outcome
+    assert units[1]["phases"]["native_transport_registry"]["outcome"] == "succeeded"
 
 
 def test_canary_monitor_success_report_is_deterministic_and_has_provenance() -> None:
@@ -1181,7 +1445,12 @@ def test_checkpoint_rejects_unknown_remaining_work(
     monkeypatch.setattr(
         kicad_canary,
         "_AnalyzerTelemetryMonitor",
-        lambda **_kwargs: SimpleNamespace(check=lambda: None, success_report=lambda: {}),
+        lambda **_kwargs: SimpleNamespace(
+            check=lambda: None,
+            success_report=lambda: {},
+            partial_report=lambda _started: {},
+            observe_consumer=lambda *_args: None,
+        ),
     )
     (tmp_path / "spec.json").write_text('{"full_project": true}', encoding="utf-8")
 

@@ -961,8 +961,9 @@ private:
                  {"derivation", derivation.str()},
                  {"evidence_span", std::move(*source_.span(range, false))}});
     }
+    // The stack depends on the callsite, not on each macro record we match against it.
+    auto stack = source_.expansionStack(range.getBegin(), macroExpansions_);
     for (const auto &frame : macroExpansions_) {
-      auto stack = source_.expansionStack(range.getBegin(), macroExpansions_);
       for (const auto &value : stack) {
         const auto *object = value.getAsObject();
         auto macroKey = object ? object->getString("macro_key") : std::nullopt;
