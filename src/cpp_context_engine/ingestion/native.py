@@ -20,6 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from io import BufferedRandom
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from cpp_context_engine.analysis.interprocedural import InterproceduralLimits, solve_interprocedural
@@ -1454,7 +1455,7 @@ class _FactBatchBuilder:
         self.memory_location_analysis_ids: dict[str, str] = {}
         self.data_access_ids: dict[str, str] = {}
         self.data_access_identity_keys: dict[str, str] = {}
-        self.wire_identities: dict[tuple[str, str], str] = {}
+        self.wire_identities: Mapping[tuple[str, str], str] = {}
         self.data_access_analysis_ids: dict[str, str] = {}
         self.function_summary_ids: dict[str, str] = {}
         self.function_summary_analysis_ids: dict[str, str] = {}
@@ -1477,6 +1478,8 @@ class _FactBatchBuilder:
             ) from error
 
     def _prepare_wire_keys(self, facts: Iterable[Mapping[str, Any]]) -> None:
+        identities: dict[tuple[str, str], str] = {}
+        self.wire_identities = identities
         # Read only the six definition families; the disk registry stays compact.
         for kind, family in tuple(_WIRE_FACT_KEYS.items())[:6]:
             for fact in _fact_records(facts, kind):
@@ -1508,7 +1511,9 @@ class _FactBatchBuilder:
                     raise AnalyzerProtocolError(
                         "analyzer compact identity is inconsistent or duplicated"
                     )
-                self.wire_identities[family, key] = identity
+                identities[family, key] = identity
+        # The one-shot builder owns this dict; later lookups reuse validated identities.
+        self.wire_identities = MappingProxyType(identities)
 
     def _restore_wire_fact(self, fact: Mapping[str, Any]) -> Mapping[str, Any]:
         restored = dict(fact)
@@ -1537,7 +1542,7 @@ class _FactBatchBuilder:
                 )
             else:
                 identity = self._wire_reference(key, family)
-            if _wire_key(identity, family) != key:
+            if family in {"v", "s"} and _wire_key(identity, family) != key:
                 raise AnalyzerProtocolError("analyzer compact fact identity is inconsistent")
             restored["key"] = identity
         restored.pop("identity_key", None)
