@@ -190,13 +190,16 @@ def _validate_facts(database: Path, spec: dict, subset: Path) -> dict:
     if len(configurations) != 32 or len({c.source_path for c in configurations.values()}) != 32:
         raise RuntimeError("summary input requires exactly 32 unique full-profile source TUs")
     # Only this private copy is opened. The first read permits ordinary SQLite rollback.
+    print("summary-input: integrity", file=sys.stderr, flush=True)
     with contextlib.closing(sqlite3.connect(database, timeout=0)) as connection:
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise RuntimeError("summary input schema mismatch; migration is forbidden")
         integrity = _validate_database_integrity(connection)
+        print("summary-input: initial-digests", file=sys.stderr, flush=True)
         snapshot = semantic_snapshot(database, _connection=connection)
         if set(snapshot["table_digests"]) != set(_SEMANTIC_TABLES):
             raise RuntimeError("summary input is missing semantic tables")
+        print("summary-input: metadata", file=sys.stderr, flush=True)
         provenance = database_provenance(database, _connection=connection)
         _validate_profile_provenance(provenance, IndexProfile.FULL, 32)
         projects = connection.execute("SELECT id, root FROM projects").fetchall()
@@ -249,19 +252,22 @@ def _validate_facts(database: Path, spec: dict, subset: Path) -> dict:
         ).fetchone()[0]:
             raise RuntimeError("summary input still requires reindexing")
     # Exact current schema was checked first: this constructor cannot migrate the copy.
+    print("summary-input: summary-payloads", file=sys.stderr, flush=True)
     with SQLiteStore(database) as store:
         for row in store._connection.execute("SELECT * FROM function_summaries"):
             summary = store._row_to_function_summary(row)
             propagated_effects, propagated_origins = store._summary_solution_payload(
                 project_id, summary.id, ("default",)
             )
+            # These indexes begin with project_id; summary_id alone scans each entire table.
             effects = {
                 item.id: item
                 for item in (
                     store._row_to_summary_effect(local)
                     for local in store._connection.execute(
-                        "SELECT * FROM summary_effects WHERE summary_id=? AND is_local=1",
-                        (summary.id,),
+                        "SELECT * FROM summary_effects "
+                        "WHERE project_id=? AND summary_id=? AND is_local=1",
+                        (project_id, summary.id),
                     )
                 )
             }
@@ -270,8 +276,9 @@ def _validate_facts(database: Path, spec: dict, subset: Path) -> dict:
                 for item in (
                     store._row_to_summary_return_origin(local)
                     for local in store._connection.execute(
-                        "SELECT * FROM summary_return_origins WHERE summary_id=? AND is_local=1",
-                        (summary.id,),
+                        "SELECT * FROM summary_return_origins "
+                        "WHERE project_id=? AND summary_id=? AND is_local=1",
+                        (project_id, summary.id),
                     )
                 )
             }
@@ -288,6 +295,7 @@ def _validate_facts(database: Path, spec: dict, subset: Path) -> dict:
                 != summary.solution_hash
             ):
                 raise RuntimeError("summary solution hash does not match persisted facts/payload")
+        print("summary-input: public-summaries", file=sys.stderr, flush=True)
         selected = store._connection.execute(
             "SELECT DISTINCT s.function_symbol_id FROM function_summaries s JOIN symbols y "
             "ON y.project_id=s.project_id AND y.id=s.function_symbol_id "
@@ -303,8 +311,10 @@ def _validate_facts(database: Path, spec: dict, subset: Path) -> dict:
             )
             for (symbol_id,) in selected
         }
+        print("summary-input: final-digests", file=sys.stderr, flush=True)
         if semantic_snapshot(database, _connection=store._connection) != snapshot:
             raise RuntimeError("summary validation changed the copied facts")
+    print("summary-input: final-pins", file=sys.stderr, flush=True)
     input_files = {**dependencies, **{row[2]: row[3] for row in units}}
     if any(_sha256(Path(path)) != digest for path, digest in input_files.items()):
         raise RuntimeError("source/dependency files changed during validation")
@@ -341,6 +351,7 @@ def prepare(request: dict, output: Path) -> dict:
     producer = Path(request["producer_engine"])
     evidence_hashes = {str(p): _sha256(p) for p in (spec_path, phase_path, subset)}
     pins = _pins(spec, source_cdb, subset, producer)
+    print("summary-input: copy", file=sys.stderr, flush=True)
     source_files = copy_file_set(original, output)
     database = output / original.name
     validation = _validate_facts(database, spec, subset)

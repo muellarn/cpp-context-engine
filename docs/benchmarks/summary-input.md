@@ -60,3 +60,8 @@ guard completion, identifies a validated input. `candidate.json` and any partial
 files are not acceptance artifacts. The immutable source-file hashes and new
 copied-database artifact hash are separate; source and copy need not have the same
 physical hash after normal transaction rollback. Retain all failure evidence.
+
+`worker.stderr` contains eight coarse stage-start markers from copying through
+final pin checks. The last marker identifies the unfinished interval on failure,
+not a completed phase, timing measurement, or accepted input. Local summary lookups
+use the existing project-prefixed indexes; all validation criteria remain intact.

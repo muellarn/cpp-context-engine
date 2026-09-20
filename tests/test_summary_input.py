@@ -22,8 +22,14 @@ from cpp_context_engine.models import (
     CfgGraph,
     CodeSymbol,
     DataFlowAnalysis,
+    DataFlowCertainty,
     FunctionSummary,
+    MemoryLocationKind,
     SourceSpan,
+    SummaryEffect,
+    SummaryEffectKind,
+    SummaryReturnOrigin,
+    SummaryReturnOriginKind,
     SymbolKind,
     TranslationUnit,
 )
@@ -335,6 +341,27 @@ def full_facts(tmp_path):
         cfg_blocks=blocks,
         data_flow_analyses=(analysis,),
         function_summaries=(summary,),
+        summary_effects=(
+            SummaryEffect(
+                "local-effect",
+                summary.id,
+                SummaryEffectKind.READ,
+                MemoryLocationKind.GLOBAL,
+                DataFlowCertainty.CERTAIN,
+                "fixture local read",
+                **scope,
+            ),
+        ),
+        summary_return_origins=(
+            SummaryReturnOrigin(
+                "local-origin",
+                summary.id,
+                SummaryReturnOriginKind.CONSTANT,
+                DataFlowCertainty.CERTAIN,
+                "fixture constant return",
+                **scope,
+            ),
+        ),
     )
     with SQLiteStore(database) as store:
         store.apply_ingestion(root, batch, build_variant=BuildVariant("default", cdb))
@@ -410,6 +437,51 @@ def test_full_facts_produce_distinct_input_without_embeddings(full_facts, tmp_pa
     assert summary_input._sha256(original) == before
     assert (output / "summary-input.json").is_file()
     assert not (output / "SUCCESS").exists()
+    assert (output / "worker.stderr").read_text().splitlines() == [
+        f"summary-input: {stage}"
+        for stage in (
+            "copy",
+            "integrity",
+            "initial-digests",
+            "metadata",
+            "summary-payloads",
+            "public-summaries",
+            "final-digests",
+            "final-pins",
+        )
+    ]
+
+
+@pytest.mark.parametrize("table", ["summary_effects", "summary_return_origins"])
+def test_local_summary_validation_uses_project_index(full_facts, tmp_path, monkeypatch, table):
+    _request, spec, subset, original = full_facts
+    output = tmp_path / "copy"
+    output.mkdir()
+    summary_input.copy_file_set(original, output)
+    copied = output / "index.db"
+    before = summary_input.semantic_snapshot(copied)
+    assert before["counts"][table] == 1
+    plans = []
+
+    class ObservedStore(SQLiteStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+            def observe(sql):
+                if sql.startswith(f"SELECT * FROM {table} WHERE"):
+                    plans.append(
+                        [row[3] for row in self._connection.execute("EXPLAIN QUERY PLAN " + sql)]
+                    )
+
+            self._connection.set_trace_callback(observe)
+
+    monkeypatch.setattr(summary_input, "SQLiteStore", ObservedStore)
+    result = summary_input._validate_facts(copied, spec, subset)
+    assert result["semantic_snapshot"] == before  # All 28 fact/payload/solution digests unchanged.
+    assert len(plans) == 1
+    assert len(plans[0]) == 1
+    assert plans[0][0].startswith(f"SEARCH {table} USING INDEX {table}_summary_order")
+    assert "project_id=? AND summary_id=? AND is_local=?" in plans[0][0]
 
 
 @pytest.mark.parametrize(
@@ -423,6 +495,7 @@ def test_full_facts_produce_distinct_input_without_embeddings(full_facts, tmp_pa
         "payload",
         "foreign-key",
         "corruption",
+        "extra-project",
     ],
 )
 def test_strict_fact_validation_fails_closed(full_facts, tmp_path, failure):
@@ -445,6 +518,7 @@ def test_strict_fact_validation_fails_closed(full_facts, tmp_path, failure):
                     "payload": "INSERT INTO summary_solution_payloads VALUES "
                     "(1,'summary','zlib-json-v1',1,0,1,'wrong',X'00')",
                     "foreign-key": "UPDATE cfg_blocks SET graph_id='missing'",
+                    "extra-project": "INSERT INTO projects(root) VALUES ('unrelated-project')",
                 }[failure]
             )
             connection.commit()
