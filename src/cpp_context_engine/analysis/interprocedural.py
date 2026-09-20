@@ -410,6 +410,7 @@ def _solve_variant(
                     callee_location_id=callee_location,
                 )
                 flows[flow.id] = flow
+            writebacks = {}
             for effect in current_effects.get(callee.id, ()):
                 if effect.kind != SummaryEffectKind.WRITE or effect.parameter_index is None:
                     continue
@@ -419,6 +420,10 @@ def _solve_variant(
                 binding = bindings_by_pair.get((caller.id, site.id, effect.parameter_index))
                 if binding is None or not binding.writeback_candidate:
                     continue
+                # Only eligible effects can win; keep the first key position and
+                # last certainty without rebuilding an overwritten flow hash/model.
+                writebacks[(effect.parameter_index, effect.location_id)] = (effect, binding)
+            for effect, binding in writebacks.values():
                 flow = _flow(
                     InterproceduralFlowKind.WRITEBACK,
                     caller,
