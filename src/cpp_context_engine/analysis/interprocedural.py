@@ -335,12 +335,13 @@ def _solve_variant(
                         )
                         if propagated is not None:
                             effects[propagated.id] = propagated
-                    for origin in tuple(origins.values()):
-                        if (
-                            origin.kind != SummaryReturnOriginKind.CALL_RESULT
-                            or origin.callsite_id != site.id
-                        ):
-                            continue
+                    # Markers only enable propagation; repeating it per marker creates
+                    # identical origins. Inspect current values to preserve ID overwrites.
+                    if any(
+                        origin.kind == SummaryReturnOriginKind.CALL_RESULT
+                        and origin.callsite_id == site.id
+                        for origin in origins.values()
+                    ):
                         for origin_index, callee_origin in enumerate(
                             current_origins.get(callee.id, ())
                         ):
