@@ -20,9 +20,13 @@ successful whole index. Existing canary reports still require `SUCCESS`.
 Use the same committed driver, Python environment, input report and quiet machine
 for all three commands below. `BASELINE` and `CANDIDATE` are clean worktrees on
 the main revision containing #29 and the #47 revision respectively. `CANARY` is
-the retained full canary output directory. `RUNS` must have space for three copies
-of the input database plus WAL/spool headroom; use native Linux storage. No Clang
-process is started by the refresh driver.
+the retained full canary output directory. Run trials sequentially: `RUNS` needs
+space for one active copy plus WAL/spool headroom; use native Linux storage.
+Before the next trial, preserve the complete small report (all table digests and
+public answers), guard evidence and logs. Verify the completed trial's own database
+path/inode is distinct from the input, then remove only that derived database.
+Keep reports, the baseline report and the original/validated input unchanged.
+No Clang process is started by the refresh driver.
 
 For a validated summary input, replace each `--input-report` value below with its
 `summary-input.json`. Use the same input for baseline and both fresh candidate
@@ -37,19 +41,26 @@ last interval has no duration. Only `measurement.seconds` is the isolated commit
 refresh timer; startup, copying, checks and cleanup must not be attributed to it.
 
 ```bash
-PYTHONPATH="$BASELINE/src" timeout --kill-after=5s 180s "$PYTHON" \
+PYTHONPATH="$BASELINE/src" timeout --signal=INT --kill-after=5s 175s "$PYTHON" \
   "$CANDIDATE/tools/benchmark_summary_refresh.py" \
   --input-report "$CANARY/report.json" --output-directory "$RUNS/baseline" \
   --max-refresh-seconds 90
-PYTHONPATH="$CANDIDATE/src" timeout --kill-after=5s 90s "$PYTHON" \
+# Secure baseline evidence and clean only its verified own copy before continuing.
+PYTHONPATH="$CANDIDATE/src" timeout --signal=INT --kill-after=5s 175s "$PYTHON" \
   "$CANDIDATE/tools/benchmark_summary_refresh.py" \
   --input-report "$CANARY/report.json" --output-directory "$RUNS/trial-1" \
   --baseline-report "$RUNS/baseline/report.json"
-PYTHONPATH="$CANDIDATE/src" timeout --kill-after=5s 90s "$PYTHON" \
+# Secure trial-1 evidence and clean only its verified own copy before continuing.
+PYTHONPATH="$CANDIDATE/src" timeout --signal=INT --kill-after=5s 175s "$PYTHON" \
   "$CANDIDATE/tools/benchmark_summary_refresh.py" \
   --input-report "$CANARY/report.json" --output-directory "$RUNS/trial-2" \
   --baseline-report "$RUNS/baseline/report.json"
 ```
+
+The outer allowance is 175 seconds for work plus five seconds for cleanup,
+180 seconds hard, including copying and before/after validation. It does not
+change the candidate's strict internal 30-second refresh limit. Stop on failure;
+do not automatically retry or advance to another trial.
 
 Each invocation copies the pinned input using SQLite backup. Input validation,
 copying and exact hashes are outside the timer. The timer includes loading solver
