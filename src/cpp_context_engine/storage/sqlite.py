@@ -4655,28 +4655,29 @@ class SQLiteStore:
                 build_variant
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                (
-                    project_id,
-                    item.id,
-                    item.kind.value,
-                    item.caller_summary_id,
-                    item.callee_summary_id,
-                    item.callsite_id,
-                    item.target_symbol_id,
-                    item.target_certainty.value,
-                    item.certainty.value,
-                    item.reason,
-                    item.argument_index,
-                    item.caller_location_id,
-                    item.callee_location_id,
-                    item.caller_access_id,
-                    item.translation_unit_id,
-                    item.build_configuration_id,
-                    item.build_variant,
-                )
-                for item in flows
-            ),
+            (self._interprocedural_flow_row(project_id, item) for item in flows),
+        )
+
+    @staticmethod
+    def _interprocedural_flow_row(project_id: int, item: InterproceduralFlow) -> tuple[object, ...]:
+        return (
+            project_id,
+            item.id,
+            item.kind.value,
+            item.caller_summary_id,
+            item.callee_summary_id,
+            item.callsite_id,
+            item.target_symbol_id,
+            item.target_certainty.value,
+            item.certainty.value,
+            item.reason,
+            item.argument_index,
+            item.caller_location_id,
+            item.callee_location_id,
+            item.caller_access_id,
+            item.translation_unit_id,
+            item.build_configuration_id,
+            item.build_variant,
         )
 
     def _reverse_summary_callers(
@@ -5053,11 +5054,40 @@ class SQLiteStore:
             check_cancelled()
             impacted_placeholders = ",".join("?" for _ in impacted_ids)
             parameters = (project_id, *sorted(impacted_ids))
-            self._connection.execute(
-                f"DELETE FROM interprocedural_flows WHERE project_id = ? "
-                f"AND caller_summary_id IN ({impacted_placeholders})",
+            # Identical refreshes need not rewrite every flow and its indexes.
+            # Compare all persisted fields in solver ID order, not just IDs or payload hashes.
+            previous_flows = self._connection.execute(
+                "SELECT project_id, id, kind, caller_summary_id, callee_summary_id, "
+                "callsite_id, target_symbol_id, target_certainty, certainty, reason, "
+                "argument_index, caller_location_id, callee_location_id, caller_access_id, "
+                "translation_unit_id, build_configuration_id, build_variant "
+                "FROM interprocedural_flows WHERE project_id = ? "
+                f"AND caller_summary_id IN ({impacted_placeholders}) ORDER BY id",
                 parameters,
             )
+            flows_unchanged = True
+            try:
+                for item in solution.flows:
+                    check_cancelled()
+                    if item.caller_summary_id not in impacted_ids:
+                        continue
+                    previous = previous_flows.fetchone()
+                    if previous is None or tuple(previous) != self._interprocedural_flow_row(
+                        project_id, item
+                    ):
+                        flows_unchanged = False
+                        break
+                else:
+                    flows_unchanged = previous_flows.fetchone() is None
+            finally:
+                previous_flows.close()
+            check_cancelled()
+            if not flows_unchanged:
+                self._connection.execute(
+                    f"DELETE FROM interprocedural_flows WHERE project_id = ? "
+                    f"AND caller_summary_id IN ({impacted_placeholders})",
+                    parameters,
+                )
             self._connection.execute(
                 f"DELETE FROM summary_effects WHERE project_id = ? AND is_local = 0 "
                 f"AND summary_id IN ({impacted_placeholders})",
@@ -5100,15 +5130,11 @@ class SQLiteStore:
                     for item in solved
                 ),
             )
-            self._put_summary_facts(
-                project_id,
-                (),
-                (),
-                (),
-                (),
-                (),
-                (item for item in solution.flows if item.caller_summary_id in impacted_ids),
-            )
+            if not flows_unchanged:
+                self._put_interprocedural_flows(
+                    project_id,
+                    (item for item in solution.flows if item.caller_summary_id in impacted_ids),
+                )
             self._write_summary_solution_rows_batched(
                 spool.rows(project_id, summary_ids=changed_payload_ids),
                 check_cancelled=check_cancelled,
