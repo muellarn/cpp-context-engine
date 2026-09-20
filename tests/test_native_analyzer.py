@@ -256,6 +256,71 @@ def test_native_analyzer_indexes_explicit_out_of_tree_generated_translation_unit
     assert any(analysis.graph_id == graphs[0].id for analysis in batch.data_flow_analyses)
 
 
+@pytest.fixture
+def relative_path_project(tmp_path: Path) -> tuple[Path, BuildConfiguration]:
+    project = tmp_path / "project"
+    generated = tmp_path / "generated"
+    project.mkdir()
+    generated.mkdir()
+    header = project / "real.hpp"
+    header.write_text(
+        "#pragma once\n#define APPLY(value) project_target(value)\n"
+        "inline int project_target(int value) { return value + 1; }\n",
+        encoding="utf-8",
+    )
+    external = tmp_path / "external.hpp"
+    external.write_text(
+        "#pragma once\ninline int external_target(int value) { return value - 1; }\n",
+        encoding="utf-8",
+    )
+    (generated / "generated.hpp").write_text(
+        "inline int generated_target(int value) { return value + value; }\n",
+        encoding="utf-8",
+    )
+    (project / "alias.hpp").symlink_to(header)
+    (project / "external-alias.hpp").symlink_to(external)
+    source = project / "probe.cpp"
+    source.write_text(
+        '#include "alias.hpp"\n#include "external-alias.hpp"\n'
+        '#include "../generated/generated.hpp"\n#line 1000 "not-the-source.cpp"\n'
+        "int run(int value) { return APPLY(value) + project_target(value) + "
+        "generated_target(value) + external_target(value) + external_target(value); }\n",
+        encoding="utf-8",
+    )
+    return project, BuildConfiguration(
+        id="relative-paths",
+        source_path=source,
+        directory=project,
+        arguments=("clang++", "-std=c++17", str(source)),
+        command_hash="relative-paths",
+        generated_source_roots=(generated, project),
+    )
+
+
+@pytest.mark.parametrize("profile", [IndexProfile.FULL, IndexProfile.NAVIGATION])
+def test_relative_path_classification_preserves_roots_macros_and_symlinks(
+    relative_path_project: tuple[Path, BuildConfiguration], profile: IndexProfile
+) -> None:
+    project, configuration = relative_path_project
+    facts = fresh_native_client(analyzer_binary(), timeout_seconds=5, profile=profile).analyze(
+        project, configuration
+    )
+    files = {fact["key"]: fact["path"] for fact in facts if fact["fact"] == "file"}
+    assert files == {
+        "file:real.hpp": str(project / "real.hpp"),
+        "file:probe.cpp": str(project / "probe.cpp"),
+        "file:@generated/0/generated.hpp": str(project.parent / "generated/generated.hpp"),
+    }
+    symbols = [fact for fact in facts if fact["fact"] == "symbol"]
+    names = {fact["qualified_name"] for fact in symbols}
+    assert {"run", "project_target", "generated_target", "APPLY"} <= names
+    assert "external_target" not in names
+    assert any(fact.get("kind") == "macro_expansion" for fact in facts)
+    assert next(fact for fact in symbols if fact["qualified_name"] == "run")["span"]["path"] == str(
+        project / "probe.cpp"
+    )
+
+
 @pytest.mark.parametrize("escape_kind", ["missing-allowlist", "traversal", "symlink"])
 def test_real_companion_rejects_generated_source_escape(tmp_path: Path, escape_kind: str) -> None:
     project = tmp_path / "project"

@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -281,15 +282,26 @@ public:
 
   std::optional<std::string> relativePath(const std::filesystem::path &candidate) const {
     const auto canonical = canonicalPath(candidate);
+    const auto key = canonical.native();
+    if (const auto found = relativePaths_.find(key); found != relativePaths_.end())
+      return found->second;
+
+    // Roots are fixed for this TU, so repeated AST filters can reuse even rejected paths.
+    std::optional<std::string> result;
     auto relative = canonical.lexically_relative(projectRoot_);
-    if (!relative.empty() && *relative.begin() != "..")
-      return relative.generic_string();
-    for (std::size_t index = 0; index < generatedSourceRoots_.size(); ++index) {
-      relative = canonical.lexically_relative(generatedSourceRoots_[index]);
-      if (!relative.empty() && *relative.begin() != "..")
-        return "@generated/" + std::to_string(index) + "/" + relative.generic_string();
+    if (!relative.empty() && *relative.begin() != "..") {
+      result = relative.generic_string();
+    } else {
+      for (std::size_t index = 0; index < generatedSourceRoots_.size(); ++index) {
+        relative = canonical.lexically_relative(generatedSourceRoots_[index]);
+        if (!relative.empty() && *relative.begin() != "..") {
+          result = "@generated/" + std::to_string(index) + "/" + relative.generic_string();
+          break;
+        }
+      }
     }
-    return std::nullopt;
+    relativePaths_.emplace(key, result);
+    return result;
   }
 
   std::optional<std::string> relative(clang::SourceLocation location,
@@ -501,6 +513,8 @@ private:
   cpp_context::CanonicalPathCache pathCache_;
   std::filesystem::path projectRoot_;
   std::vector<std::filesystem::path> generatedSourceRoots_;
+  mutable std::unordered_map<std::filesystem::path::string_type,
+                             std::optional<std::string>> relativePaths_;
 };
 
 class Collector;
