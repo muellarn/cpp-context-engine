@@ -386,6 +386,7 @@ def _solve_variant(
                     callee_location_id=callee_location,
                 )
                 flows[flow.id] = flow
+            writebacks = {}
             for effect_index, effect in enumerate(current_effects.get(callee.id, ())):
                 if check_cancelled is not None and effect_index % 256 == 0:
                     check_cancelled()
@@ -397,6 +398,13 @@ def _solve_variant(
                 binding = bindings_by_pair.get((caller.id, site.id, effect.parameter_index))
                 if binding is None or not binding.writeback_candidate:
                     continue
+                # Only eligible effects can win; keep the first key position and
+                # last certainty without rebuilding an overwritten flow hash/model.
+                writebacks[(effect.parameter_index, effect.location_id)] = (effect, binding)
+            for writeback_index, (effect, binding) in enumerate(writebacks.values()):
+                # Winner construction is a separate pass; retain bounded cancellation.
+                if check_cancelled is not None and writeback_index % 256 == 0:
+                    check_cancelled()
                 flow = _flow(
                     InterproceduralFlowKind.WRITEBACK,
                     caller,
