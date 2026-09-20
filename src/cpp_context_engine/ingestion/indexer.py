@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +71,7 @@ class ProjectIndexer:
         *,
         build_variant: BuildVariant | None = None,
         cancelled: threading.Event | None = None,
+        finalization_observer: Callable[[str, str], None] | None = None,
     ) -> IndexingResult:
         _check_cancelled(cancelled)
         project_root = project_root.resolve(strict=False)
@@ -141,6 +142,11 @@ class ProjectIndexer:
                 build_variant=variant,
                 index_profile=self._profile,
                 cancelled=cancelled,
+                **(
+                    {"finalization_observer": finalization_observer}
+                    if finalization_observer is not None
+                    else {}
+                ),
             )
         finally:
             close = getattr(batch_stream, "close", None)

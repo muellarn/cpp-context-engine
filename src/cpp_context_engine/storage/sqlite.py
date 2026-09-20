@@ -2547,6 +2547,7 @@ class SQLiteStore:
         build_variant: BuildVariant | None = None,
         index_profile: IndexProfile = IndexProfile.FULL,
         cancelled: threading.Event | None = None,
+        finalization_observer: Callable[[str, str], None] | None = None,
     ) -> int:
         """Atomically stage and retire TU-sized batches before global finalization."""
 
@@ -2629,7 +2630,11 @@ class SQLiteStore:
 
                 _check_index_cancelled(cancelled)
                 if fresh_generation:
+                    if finalization_observer is not None:
+                        finalization_observer("restore_deferred_indexes", "started")
                     self._restore_fresh_generation_indexes(deferred_indexes)
+                    if finalization_observer is not None:
+                        finalization_observer("restore_deferred_indexes", "completed")
                 self._refresh_indexed_override_candidates(project_id, selected_variant.name)
                 override_affected_functions = self._invalidate_changed_override_callers(
                     project_id,
@@ -2646,12 +2651,18 @@ class SQLiteStore:
                 affected_functions |= self._reverse_summary_callers(
                     project_id, selected_variant.name, affected_functions
                 )
+                if finalization_observer is not None:
+                    finalization_observer("refresh_summaries", "started")
                 invalidated_summaries = self._refresh_summary_solutions(
                     project_id,
                     selected_variant.name,
                     affected_functions,
                     cancelled=cancelled,
                 )
+                # A failing/cancelled call must not emit completion; callbacks stay
+                # inside the transaction so observer failures also roll back.
+                if finalization_observer is not None:
+                    finalization_observer("refresh_summaries", "completed")
                 self._refresh_tracked_symbols(project_id)
                 if fresh_generation:
                     self._execute_deferred_schema_step(
