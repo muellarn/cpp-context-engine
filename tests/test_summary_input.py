@@ -200,40 +200,44 @@ def test_copy_rejects_wal_without_lockable_sidecars(tmp_path, monkeypatch):
     assert not attempts  # Reject this unprovable lock state before hashing/copying.
 
 
-def test_guard_counts_anonymous_files_and_cleans_failed_worker(tmp_path, monkeypatch):
-    original_popen = subprocess.Popen
-    children = []
-
-    def launch(*_args, **kwargs):
-        child = original_popen(
-            [
-                sys.executable,
-                "-c",
-                "import tempfile,time; f=tempfile.TemporaryFile(); "
-                "f.write(b'x'*1048576); f.flush(); time.sleep(10)",
-            ],
-            **kwargs,
-        )
-        children.append(child)
-        return child
-
-    monkeypatch.setattr(summary_input.subprocess, "Popen", launch)
+def test_guard_counts_anonymous_files_and_cleans_failed_worker(tmp_path):
     output = tmp_path / "guarded"
-    with pytest.raises(RuntimeError, match="disk use exceeded"):
-        summary_input.run(
-            {},
-            output,
-            summary_input.CanaryLimits(
-                wall_seconds=5,
-                rss_bytes=256 * 1024**2,
-                disk_bytes=65536,
-            ),
-        )
+    # The supervisor owns its process tree, not pytest's retained suite state.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import subprocess, sys
+from pathlib import Path
+from cpp_context_engine import summary_input as s
+original_popen = subprocess.Popen
+children = []
+def launch(*args, **kwargs):
+    child = original_popen([sys.executable, '-c',
+        "import tempfile,time; f=tempfile.TemporaryFile(); "
+        "f.write(b'x'*1048576); f.flush(); time.sleep(10)"], **kwargs)
+    children.append(child)
+    return child
+s.subprocess.Popen = launch
+try:
+    s.run({}, Path(sys.argv[1]), s.CanaryLimits(
+        wall_seconds=5, rss_bytes=256*1024**2, disk_bytes=65536))
+except RuntimeError as error:
+    assert 'disk use exceeded' in str(error), str(error)
+else:
+    raise AssertionError('anonymous disk budget was not enforced')
+assert all(child.poll() is not None for child in children)
+""",
+            str(output),
+        ],
+        check=True,
+        timeout=10,
+    )
     report = json.loads((output / "guard.json").read_text())
     assert report["peak_bytes"]["anonymous"] >= 1048576
     assert report["processes_clean"] is True
     assert report["elapsed_seconds"] < 5
-    assert all(child.poll() is not None for child in children)
     assert not (output / "summary-input.json").exists()
 
 
@@ -373,16 +377,29 @@ def test_full_facts_produce_distinct_input_without_embeddings(full_facts, tmp_pa
     request, _spec, _subset, original = full_facts
     before = summary_input._sha256(original)
     output = tmp_path / "validated"
-    result = summary_input.run(
-        request,
-        output,
-        summary_input.CanaryLimits(
-            wall_seconds=15,
-            rss_bytes=256 * 1024**2,
-            database_bytes=8 * 1024**2,
-            disk_bytes=16 * 1024**2,
-        ),
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request))
+    # Use the real CLI: unrelated pytest RSS must not consume its real guard budget.
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cpp_context_engine.summary_input",
+            "--request",
+            str(request_path),
+            "--output-directory",
+            str(output),
+            "--seconds",
+            "15",
+            "--rss-limit-mib",
+            "256",
+            "--disk-limit-mib",
+            "8",
+        ],
+        check=True,
+        timeout=20,
     )
+    result = json.loads((output / "summary-input.json").read_text())
     assert result["schema"] == "cpp-context-validated-summary-input"
     assert result["whole_index_success"] is False
     assert result["embedding_completeness"] == "not_validated"
