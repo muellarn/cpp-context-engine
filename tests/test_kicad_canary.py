@@ -708,15 +708,17 @@ def test_canary_child_wires_exact_analyzer_protocol_observer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     event = _pipeline_event(1, 1.0, "scheduling_state")
+    observed: dict[str, object] = {}
 
     class Client:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
+        def __init__(self, *_args, **kwargs) -> None:
+            observed["client"] = kwargs
 
         def probe(self) -> object:
             return object()
 
-    def ingestor(*_args, observer=None, **_kwargs):
+    def ingestor(*_args, observer=None, **kwargs):
+        observed["ingestor"] = kwargs
         assert observer is not None
         observer(event)
         raise RuntimeError("stop after observer wiring")
@@ -734,6 +736,8 @@ def test_canary_child_wires_exact_analyzer_protocol_observer(
                 "translation_units": 1,
                 "workers": 1,
                 "analyzer_timeout_seconds": 1,
+                "analyzer_max_decoded_bytes": 536_870_912,
+                "analyzer_max_spool_bytes": 1_610_612_736,
                 "embedding_dimensions": 1,
                 "queries": [],
                 "profile": "navigation",
@@ -746,6 +750,8 @@ def test_canary_child_wires_exact_analyzer_protocol_observer(
     payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert payloads[0] == event.to_protocol_payload()
     assert payloads[1]["event"] == "error"
+    assert observed["client"]["max_decoded_bytes"] == 536_870_912
+    assert observed["ingestor"]["max_spool_bytes"] == 1_610_612_736
 
 
 def test_canary_monitor_detects_hidden_idle_slot_from_child_protocol() -> None:
@@ -1658,6 +1664,114 @@ def test_sample_worker_and_total_deadlines_remain_distinct(
     assert observed["disk_bytes"] == 1024**3
 
 
+@pytest.mark.parametrize(
+    ("flags", "decoded", "spool"),
+    [
+        ([], 268_435_456, 4_294_967_296),
+        (
+            ["--workers", "3", "--analyzer-max-decoded-bytes", "536870912"],
+            536_870_912,
+            1_610_612_736,
+        ),
+        (
+            [
+                "--workers",
+                "1",
+                "--analyzer-max-decoded-bytes",
+                "536870912",
+                "--analyzer-max-spool-bytes",
+                "1610612736",
+            ],
+            536_870_912,
+            1_610_612_736,
+        ),
+    ],
+)
+def test_cli_records_independent_analyzer_budgets_in_worker_spec(
+    flags: list[str],
+    decoded: int,
+    spool: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(cdb, [{"directory": str(project), "file": str(source), "arguments": ["c++"]}])
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
+    observed: dict[str, object] = {}
+
+    def supervised(spec_path, *_args):
+        observed.update(json.loads(spec_path.read_text(encoding="utf-8")))
+        raise RuntimeError("stop after spec creation, without native or database work")
+
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_DECODED_BYTES", "1")
+    monkeypatch.setenv("CPP_CONTEXT_ANALYZER_MAX_SPOOL_BYTES", "1")
+    monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    output = tmp_path / "output"
+    assert (
+        kicad_canary.main(
+            [
+                "--project-root",
+                str(project),
+                "--compile-commands",
+                str(cdb),
+                "--clang-analyzer",
+                str(analyzer),
+                "--output-directory",
+                str(output),
+                "--gates",
+                "1",
+                *flags,
+            ]
+        )
+        == 2
+    )
+    for values in (observed, observed["measurement_provenance"]):
+        assert values["analyzer_max_decoded_bytes"] == decoded
+        assert values["analyzer_max_spool_bytes"] == spool
+    persisted = json.loads((output / ".gate-1.failed" / "worker-spec.json").read_text())
+    assert persisted == observed
+    assert not list(output.rglob("*.db"))
+
+
+@pytest.mark.parametrize("flag", ["--analyzer-max-decoded-bytes", "--analyzer-max-spool-bytes"])
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
+def test_cli_rejects_invalid_analyzer_budgets_before_run(
+    flag: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        kicad_canary,
+        "run_canary",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("run must not start")),
+    )
+    args = [
+        "--project-root",
+        "/unused/project",
+        "--compile-commands",
+        "/unused/cdb.json",
+        "--clang-analyzer",
+        "/unused/analyzer",
+        "--output-directory",
+        "/unused/output",
+        flag,
+        value,
+    ]
+    if value == "not-an-integer":
+        with pytest.raises(SystemExit) as error:
+            kicad_canary.main(args)
+        assert error.value.code == 2
+    else:
+        assert kicad_canary.main(args) == 2
+
+
 def test_full_database_provenance_requires_clang_and_every_deep_coverage_flag(
     tmp_path: Path,
 ) -> None:
@@ -2404,6 +2518,10 @@ def test_cli_rejects_nonfinite_limits_before_run(
     [
         ("workers", 0),
         ("analyzer_timeout_seconds", float("nan")),
+        ("analyzer_max_decoded_bytes", 0),
+        ("analyzer_max_decoded_bytes", -1),
+        ("analyzer_max_spool_bytes", 0),
+        ("analyzer_max_spool_bytes", -1),
         ("embedding_dimensions", 0),
         ("rss_bytes", 0),
         ("database_bytes", 0),
