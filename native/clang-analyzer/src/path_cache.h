@@ -20,8 +20,8 @@ public:
 
   explicit CanonicalPathCache(Resolver resolver) : resolver_(std::move(resolver)) {}
 
-  Path canonical(const Path &path) const {
-    const auto key = path.native();
+  const Path &canonical(const Path &path) const {
+    const auto &key = path.native();
     if (const auto found = paths_.find(key); found != paths_.end())
       return found->second;
 
@@ -29,8 +29,9 @@ public:
     auto resolved = resolver_(path, error);
     if (error)
       resolved = path.lexically_normal();
-    paths_.emplace(key, resolved);
-    return resolved;
+    // Entries are immutable and never erased; even rehash preserves references.
+    // Return the owned entry so cache hits do not copy filesystem path storage.
+    return paths_.emplace(key, std::move(resolved)).first->second;
   }
 
   std::size_t size() const { return paths_.size(); }
