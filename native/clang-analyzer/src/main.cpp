@@ -261,7 +261,7 @@ public:
       generatedSourceRoots_.push_back(pathCache_.canonical(root));
   }
 
-  std::filesystem::path canonicalPath(const std::filesystem::path &path) const {
+  const std::filesystem::path &canonicalPath(const std::filesystem::path &path) const {
     return pathCache_.canonical(path);
   }
 
@@ -282,8 +282,8 @@ public:
   }
 
   std::optional<std::string> relativePath(const std::filesystem::path &candidate) const {
-    const auto canonical = canonicalPath(candidate);
-    const auto key = canonical.native();
+    const auto &canonical = canonicalPath(candidate);
+    const auto &key = canonical.native();
     if (const auto found = relativePaths_.find(key); found != relativePaths_.end())
       return found->second;
 
