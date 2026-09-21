@@ -1,10 +1,29 @@
 #include "path_cache.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+
+namespace {
+bool countAllocations = false;
+std::size_t allocations = 0;
+}
+
+void *operator new(std::size_t size) {
+  if (countAllocations)
+    ++allocations;
+  if (void *memory = std::malloc(size ? size : 1))
+    return memory;
+  throw std::bad_alloc();
+}
+
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
 
@@ -82,10 +101,58 @@ void testCacheLifetimeIsInstanceLocal() {
   require(calls == 3);
 }
 
+void testWarmCacheHitsDoNotAllocate() {
+  unsigned calls = 0;
+  cpp_context::CanonicalPathCache cache(
+      [&calls](const Path &path, std::error_code &error) {
+        ++calls;
+        error.clear();
+        return path;
+      });
+  // Avoid small-string optimization; only already-populated hits are measured.
+  const Path raw = Path("/canonical") / std::string(128, 'x') / "source.cpp";
+  const Path expected = cache.canonical(raw);
+  bool identical = true;
+  allocations = 0;
+  countAllocations = true;
+  for (unsigned index = 0; index < 16; ++index) {
+    const auto &cached = cache.canonical(raw);
+    identical = identical && cached == expected;
+  }
+  countAllocations = false;
+  std::printf("warm cache: hits=16 allocations=%zu resolver_calls=%u identical=%d\n",
+              allocations, calls, identical);
+  std::fflush(stdout);
+  require(identical && calls == 1);
+  require(allocations == 0);
+}
+
+void testReferencesOwnTemporaryInputsAndSurviveGrowth() {
+  unsigned calls = 0;
+  cpp_context::CanonicalPathCache cache(
+      [&calls](const Path &path, std::error_code &error) {
+        ++calls;
+        error.clear();
+        return path;
+      });
+  const Path expected = Path("/canonical") / std::string(128, 'y') / "first.cpp";
+  // The input temporary dies here; the result must belong to the cache.
+  const auto &first = cache.canonical(Path(expected));
+  const auto *address = &first;
+  require(first == expected && calls == 1);
+  for (unsigned index = 0; index < 512; ++index)
+    cache.canonical(Path("/growth") / std::to_string(index));
+  require(cache.size() == 513 && calls == 513);
+  const auto &again = cache.canonical(Path(expected));
+  require(&again == address && first == expected && calls == 513);
+}
+
 } // namespace
 
 int main() {
   testCachesSuccessAndFallbackByExactRawPath();
   testCanonicalizesRelativeAndSymlinkPaths();
   testCacheLifetimeIsInstanceLocal();
+  testWarmCacheHitsDoNotAllocate();
+  testReferencesOwnTemporaryInputsAndSurviveGrowth();
 }
