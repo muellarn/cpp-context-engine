@@ -44,6 +44,7 @@
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "function_signature.h"
 #include "path_cache.h"
 
 namespace {
@@ -2746,7 +2747,8 @@ private:
       }
       std::string signature;
       llvm::raw_string_ostream signatureStream(signature);
-      decl->print(signatureStream, context_.getPrintingPolicy());
+      if (!cpp_context::printFunctionSignature(decl, context_, signatureStream))
+        decl->print(signatureStream, context_.getPrintingPolicy());
       signatureStream.flush();
       std::string documentation;
       if (const auto *comment = context_.getRawCommentForDeclNoCache(decl))
