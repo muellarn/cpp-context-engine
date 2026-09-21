@@ -257,7 +257,14 @@ def load_runtime_calibration(
             r"[0-9a-f]{40}", report["project_commit"]
         ):
             raise ValueError("calibration requires an exact project revision")
-        for field in ("project_commit", "workers", "embedding_dimensions"):
+        # The same producer revision can now run under different decoded/spool caps.
+        for field in (
+            "project_commit",
+            "workers",
+            "embedding_dimensions",
+            "analyzer_max_decoded_bytes",
+            "analyzer_max_spool_bytes",
+        ):
             if report.get(field) != expected[field]:
                 raise ValueError(f"calibration {field} differs")
         if report.get("profile") != "navigation" or len(report["gates"]) != 1:
@@ -265,11 +272,19 @@ def load_runtime_calibration(
         gate = report["gates"][0]
         directory = report_path.parent / f"gate-{gate['gate']}"
         worker = json.loads((directory / "worker-spec.json").read_text(encoding="utf-8"))
-        for field in ("queries", "generated_source_roots", "workers", "embedding_dimensions"):
+        for field in (
+            "queries",
+            "generated_source_roots",
+            "workers",
+            "embedding_dimensions",
+            "analyzer_max_decoded_bytes",
+            "analyzer_max_spool_bytes",
+        ):
             if worker.get(field) != expected[field]:
                 raise ValueError(f"calibration worker {field} differs")
-        if worker["measurement_provenance"]["engine_commit"] != report["engine_commit"]:
-            raise ValueError("calibration worker producer differs")
+        for field in ("engine_commit", "analyzer_max_decoded_bytes", "analyzer_max_spool_bytes"):
+            if worker["measurement_provenance"].get(field) != report[field]:
+                raise ValueError(f"calibration worker provenance {field} differs")
         if not (directory / "SUCCESS").is_file() or gate.get("process_group_clean") is not True:
             raise ValueError("calibration gate was not successfully published")
         if gate.get("peak_swap_bytes") != 0 or gate.get("database_integrity") != "ok":

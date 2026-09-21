@@ -32,6 +32,7 @@ from cpp_context_engine.ingestion import (
     ProjectIndexer,
 )
 from cpp_context_engine.ingestion.compilation_database import CompilationDatabase
+from cpp_context_engine.ingestion.native import DEFAULT_MAX_DECODED_BYTES
 from cpp_context_engine.models import BuildScope, BuildVariant, GraphDirection, IndexProfile
 from cpp_context_engine.runtime import build_runtime
 from cpp_context_engine.runtime_calibration import load_runtime_calibration, projected_total_seconds
@@ -1780,12 +1781,14 @@ def _run_worker(spec_path: Path) -> int:
         client = NativeAnalyzerClient(
             analyzer,
             timeout_seconds=float(spec["analyzer_timeout_seconds"]),
+            max_decoded_bytes=int(spec["analyzer_max_decoded_bytes"]),
             profile=profile,
         )
         info = client.probe()
         ingestor = NativeClangIngestor(
             client,
             max_workers=int(spec["workers"]),
+            max_spool_bytes=int(spec["analyzer_max_spool_bytes"]),
             profile=profile,
             observer=_worker_analyzer_event,
         )
@@ -2072,11 +2075,18 @@ def run_canary(
     generated_source_roots: Sequence[Path] = (),
     total_gate_timeouts: Mapping[str, float] | None = None,
     runtime_calibration: Path | None = None,
+    analyzer_max_decoded_bytes: int = DEFAULT_MAX_DECODED_BYTES,
+    analyzer_max_spool_bytes: int | None = None,
 ) -> dict[str, Any]:
     total_timeouts = gate_timeouts if total_gate_timeouts is None else total_gate_timeouts
+    # The ingestor otherwise derives spool from decoded bytes, silently raising both caps.
+    if analyzer_max_spool_bytes is None:
+        analyzer_max_spool_bytes = workers * 2 * DEFAULT_MAX_DECODED_BYTES
     for name, value in (
         ("workers", workers),
         ("analyzer timeout", analyzer_timeout_seconds),
+        ("analyzer decoded limit", analyzer_max_decoded_bytes),
+        ("analyzer spool limit", analyzer_max_spool_bytes),
         ("embedding dimensions", embedding_dimensions),
         ("RSS limit", rss_bytes),
         ("database limit", database_bytes),
@@ -2115,6 +2125,8 @@ def run_canary(
         "project_commit": _git_revision(inspection.project_root),
         "profile": profile.value,
         "workers": workers,
+        "analyzer_max_decoded_bytes": analyzer_max_decoded_bytes,
+        "analyzer_max_spool_bytes": analyzer_max_spool_bytes,
         "embedding_dimensions": embedding_dimensions,
         "input": inspection.public_report(),
         "gates": gate_reports,
@@ -2190,6 +2202,8 @@ def run_canary(
                     "expected_fact_schema_version": SCHEMA_VERSION,
                     "profile": profile.value,
                     "workers": workers,
+                    "analyzer_max_decoded_bytes": analyzer_max_decoded_bytes,
+                    "analyzer_max_spool_bytes": analyzer_max_spool_bytes,
                     "embedding_dimensions": embedding_dimensions,
                     "generated_source_roots": [str(root) for root in gate_generated_roots],
                 },
@@ -2204,6 +2218,8 @@ def run_canary(
                 "translation_units": expected_translation_units,
                 "workers": workers,
                 "analyzer_timeout_seconds": analyzer_timeout_seconds,
+                "analyzer_max_decoded_bytes": analyzer_max_decoded_bytes,
+                "analyzer_max_spool_bytes": analyzer_max_spool_bytes,
                 "embedding_dimensions": embedding_dimensions,
                 "queries": list(queries),
                 "profile": profile.value,
@@ -2301,6 +2317,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--total-gate-timeouts", default="")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--analyzer-timeout-seconds", type=float, default=75.0)
+    parser.add_argument(
+        "--analyzer-max-decoded-bytes",
+        type=int,
+        default=DEFAULT_MAX_DECODED_BYTES,
+        help="maximum decoded response bytes per translation unit (default: 268435456)",
+    )
+    parser.add_argument(
+        "--analyzer-max-spool-bytes",
+        type=int,
+        help="aggregate native spool bytes (default: workers * 2 * 268435456)",
+    )
     parser.add_argument("--embedding-dimensions", type=int, default=32)
     parser.add_argument("--query", action="append", dest="queries")
     parser.add_argument("--rss-limit-mib", type=float, default=2.5 * 1024)
@@ -2349,6 +2376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name, value in (
             ("workers", args.workers),
             ("analyzer timeout", args.analyzer_timeout_seconds),
+            ("analyzer decoded limit", args.analyzer_max_decoded_bytes),
             ("embedding dimensions", args.embedding_dimensions),
             ("RSS limit", args.rss_limit_mib),
             ("database limit", database_limit_mib),
@@ -2356,6 +2384,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("no-progress timeout", args.no_progress_seconds),
         ):
             _require_finite_positive(name, value)
+        if args.analyzer_max_spool_bytes is not None:
+            _require_finite_positive("analyzer spool limit", args.analyzer_max_spool_bytes)
         timeouts = (
             _parse_timeouts(args.gate_timeouts)
             if args.gate_timeouts
@@ -2378,6 +2408,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             gate_timeouts=timeouts,
             workers=args.workers,
             analyzer_timeout_seconds=args.analyzer_timeout_seconds,
+            analyzer_max_decoded_bytes=args.analyzer_max_decoded_bytes,
+            analyzer_max_spool_bytes=args.analyzer_max_spool_bytes,
             embedding_dimensions=args.embedding_dimensions,
             queries=tuple(args.queries or DEFAULT_QUERIES),
             rss_bytes=int(args.rss_limit_mib * 1024**2),

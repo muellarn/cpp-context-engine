@@ -266,6 +266,8 @@ def evidence(tmp_path):
         "engine_commit": "1" * 40,
         "project_commit": "2" * 40,
         "workers": 2,
+        "analyzer_max_decoded_bytes": 268_435_456,
+        "analyzer_max_spool_bytes": 1_073_741_824,
         "embedding_dimensions": 32,
         "analyzer_sha256": "a" * 64,
         "schema_version": kicad_canary.SCHEMA_VERSION,
@@ -283,9 +285,23 @@ def evidence(tmp_path):
         (directory / "compile_commands.json").write_bytes(subset)
         worker = {
             field: expected[field]
-            for field in ("workers", "embedding_dimensions", "queries", "generated_source_roots")
+            for field in (
+                "workers",
+                "embedding_dimensions",
+                "queries",
+                "generated_source_roots",
+                "analyzer_max_decoded_bytes",
+                "analyzer_max_spool_bytes",
+            )
         }
-        worker["measurement_provenance"] = {"engine_commit": expected["engine_commit"]}
+        worker["measurement_provenance"] = {
+            field: expected[field]
+            for field in (
+                "engine_commit",
+                "analyzer_max_decoded_bytes",
+                "analyzer_max_spool_bytes",
+            )
+        }
         (directory / "worker-spec.json").write_text(json.dumps(worker))
         gate = _gate(len(indices))
         gate["subset_cdb_sha256"] = hashlib.sha256(subset).hexdigest()
@@ -294,7 +310,14 @@ def evidence(tmp_path):
             "schema_version": 1,
             **{
                 field: expected[field]
-                for field in ("engine_commit", "project_commit", "workers", "embedding_dimensions")
+                for field in (
+                    "engine_commit",
+                    "project_commit",
+                    "workers",
+                    "embedding_dimensions",
+                    "analyzer_max_decoded_bytes",
+                    "analyzer_max_spool_bytes",
+                )
             },
             "profile": "navigation",
             "gates": [gate],
@@ -340,6 +363,26 @@ def test_accept_pinned_nested_fit_and_disjoint_holdout(evidence):
     assert result["empirical"] is True
     assert len(result["evidence"]) == 3
     assert sum(result["phase_seconds"].values()) + result["overhead_seconds"] == 34
+
+
+@pytest.mark.parametrize("field", ["analyzer_max_decoded_bytes", "analyzer_max_spool_bytes"])
+@pytest.mark.parametrize("source", ["report", "worker", "measurement_provenance"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_reject_mismatched_or_missing_analyzer_budgets(evidence, field, source, missing):
+    # The holdout must use the same effective limits as both fits and the target run.
+    worker_path = evidence.root / "2" / "gate-all" / "worker-spec.json"
+    worker = json.loads(worker_path.read_text())
+    values = evidence.reports[2] if source == "report" else worker
+    if source == "measurement_provenance":
+        values = worker["measurement_provenance"]
+    if missing:
+        del values[field]
+    else:
+        values[field] *= 2
+    if source != "report":
+        worker_path.write_text(json.dumps(worker))
+    with pytest.raises(ValueError, match=field):
+        evidence.load()
 
 
 def test_navigation_calls_are_valid_and_part_of_finalization_work(evidence):
