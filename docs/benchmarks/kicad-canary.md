@@ -199,11 +199,12 @@ cpp-context-kicad-canary \
   --generated-source-root "$KICAD_GENERATED_ROOT" \
   --clang-analyzer "$CLANG_ANALYZER" \
   --output-directory "$CANARY_OUTPUT/navigation-full" \
+  --runtime-calibration "$CANARY_OUTPUT/runtime-calibration.json" \
   --gates all \
   --gate-timeouts all:5400 \
   --total-gate-timeouts all:5400 \
   --workers 8 \
-  --rss-limit-mib 2560 \
+  --rss-limit-mib 8192 \
   --database-limit-mib 49152 \
   --disk-limit-mib 65536 \
   --query compareVersionStrings
@@ -218,6 +219,55 @@ This means missing forecast evidence, not proven slowness. Until there is a
 calibrated tail estimate, a full run crossing the ten-minute checkpoint remains
 no-go. Do not invent multipliers or extrapolate the third-party-heavy prefix32
 as a reliable whole-project forecast.
+
+### Empirical whole-runtime calibration (#100)
+
+`--runtime-calibration` is supported only for one complete navigation `all` gate.
+It consumes two successful, increasing nested fit samples and one disjoint
+holdout, using their existing reports and retained CDB/worker-spec files, not
+their databases. No real post-#97 fit/holdout set has yet been accepted; the
+implementation and offline tests alone do not authorize a whole-KiCad run.
+
+The JSON input has `schema: "cpp-context-runtime-calibration-v1"`, the unchanged
+whole `source_cdb_sha256`, two descriptors in `fits`, and one in `holdout`.
+Each descriptor contains `report` (relative to the input file), its `sha256`,
+and ordered `raw_indices` into the original whole CDB. Copy those original
+objects unchanged into each sample's CDB and run the existing `all` gate with
+the same workers, queries, generated roots and embedding dimensions. Keep the
+sample report's local `selected_raw_indices` unchanged at `0..N-1`; only the
+bundle records the different whole-CDB provenance indices. No report rewriting
+or new gate-selection mode is needed. Keep the
+published `SUCCESS`, report, subset CDB and worker specification. Failed gates,
+partial phases, omitted configurations, deep facts or resource violations do not
+qualify. Engine/analyzer/schema/project and exact compile commands must match;
+only documentation-only Git differences are compatible with measured evidence.
+Changes to producer, canary or model code require a new compatible evidence set.
+
+Both fits must cover every top-level project source group and generated sources;
+the holdout must cover every group not already fully enumerated by the larger
+fit. For this CDB, a proposed 16/32 fit with a disjoint 15-TU holdout covers the
+16 groups (the two-entry tools group is a census). This is a sampling proposal,
+not a cost-representativeness claim or permission to start those measurements.
+The existing third-party-heavy prefix32 acceptance gates are not these cohorts.
+
+The fixed empirical estimate uses the largest measured phase cost per work unit:
+TU pipeline wall time per configuration; post-TU time per indexed symbol,
+occurrence, edge, callsite and call target; embedding time per processed record; separate
+producer/validator time per peak database byte. Overlapping TU intervals are
+never added. Whole work amounts use the largest measured amount per configuration
+times the whole configuration count. Positive time with zero work units retains
+a positive floor; the largest measured nonphase startup/gap/cleanup cost is also
+retained. The holdout must satisfy every amount, phase and total estimate.
+There is no guessed safety multiplier or mathematical completion guarantee.
+
+A valid estimate over 90 minutes rejects before starting. During the run, all
+unstarted tail phases retain their estimated costs; completed phases contribute
+their actual time. Exceeding a measured work/phase envelope invalidates the
+estimate, including at the final validator result. Zero TU progress still leaves
+the checkpoint unknown. The existing 10-/30-minute rejection policies, hard
+90-minute deadline, swap prohibition and resource/atomicity checks remain in
+force. `empirical_projected_total_seconds` is retained in the existing timing
+artifact; it is not a promise that an unobserved larger workload will finish.
 
 Bounded real-KiCad deep materialization, cache/restart, invalidation,
 cancellation, and multi-build checks are a separate gate dependent on Issue #45.
