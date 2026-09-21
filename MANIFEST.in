@@ -1,1 +1,1 @@
-recursive-include native/clang-analyzer CMakeLists.txt *.cpp
+recursive-include native/clang-analyzer CMakeLists.txt *.cpp *.h LICENSE-LLVM.txt

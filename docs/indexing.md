@@ -275,6 +275,24 @@ ID where Clang supplies a USR, an exact source range, source text/hash,
 documentation, signature, build configuration, and metadata. Occurrences retain
 declaration/reference/call/type/macro-expansion ranges.
 
+Native function and function-template `signature` values describe declarations,
+not their outer bodies or constructor initializer lists. Clang still prints
+parameter defaults, qualifiers, attributes, templates and constraints, including
+lambda bodies within those declaration expressions. `source_text`, physical
+spans, symbol identities and non-signature facts retain the complete indexed
+source. Other symbol kinds retain their existing printing behavior.
+
+This intentionally changes MCP-visible signatures, symbol-only search and the
+signature contribution to hybrid ranking. Body-only terms remain in lexical
+source search and full-code retrieval, but no longer count as function-signature
+matches. Embedding text includes the new signature and the unchanged source, so
+its content identity also changes. After upgrading the native binary, run normal
+incremental indexing for every enabled build variant: the existing binary-SHA256
+producer identity (including compiled header changes) forces affected TUs to be
+refreshed, and content-addressed embeddings use the refreshed text. No protocol,
+schema or output-budget change is involved. This correction does not by itself
+prove that a previously oversized KiCad TU now fits the decoded-output limit.
+
 The graph stores `CONTAINS`, `REFERENCES`, `CALLS`, `INHERITS`, `OVERRIDES`,
 `USES_TYPE`, and project-local `INCLUDES` relationships. Override edges use
 libclang's native override API. System declarations and system include graph
