@@ -35,6 +35,7 @@ from cpp_context_engine.ingestion.compilation_database import CompilationDatabas
 from cpp_context_engine.ingestion.native import DEFAULT_MAX_DECODED_BYTES
 from cpp_context_engine.models import BuildScope, BuildVariant, GraphDirection, IndexProfile
 from cpp_context_engine.runtime import build_runtime
+from cpp_context_engine.runtime_calibration import load_runtime_calibration, projected_total_seconds
 from cpp_context_engine.search import DeterministicLocalEmbeddingProvider, SQLiteVectorSearch
 from cpp_context_engine.storage import SQLiteStore
 from cpp_context_engine.storage.sqlite import SCHEMA_VERSION
@@ -1170,6 +1171,8 @@ def _run_supervised(
     started = float(spec.get("gate_started_monotonic", stage_started))
     total_wall_seconds = float(spec.get("total_wall_seconds", limits.wall_seconds))
     full_project = bool(spec.get("full_project", False))
+    calibration = spec.get("runtime_calibration")
+    projected: float | None = None
     phase = stage
     measurements = _PhaseMeasurements(stage, started, stage_started, total_tus)
     peak_rss = peak_swap = peak_database = peak_disk = 0
@@ -1197,6 +1200,7 @@ def _run_supervised(
                     "peak_database_bytes": peak_database,
                     "peak_disk_bytes": peak_disk,
                     "measurements": measurements.snapshot(),
+                    "empirical_projected_total_seconds": projected,
                     **(
                         {"ingestion_pipeline": analyzer_telemetry.partial_report(started)}
                         if analyzer_telemetry is not None
@@ -1371,15 +1375,42 @@ def _run_supervised(
                 and time.monotonic() - last_useful > limits.no_progress_seconds
             ):
                 violation = f"no observable progress for {limits.no_progress_seconds:g} seconds"
-            if violation is None and full_project and completed_tus and phase != "complete":
-                projected = total_elapsed * total_tus / completed_tus
-                if total_elapsed >= 1_800 and projected > 3_600:
+            if violation is None and full_project:
+                projected = None
+                if calibration is not None:
+                    # Check the final validator result too: its completed duration
+                    # must not bypass the envelope by changing phase to complete.
+                    snapshots = [measurements.snapshot()]
+                    if stage == "validation":
+                        snapshots.insert(0, spec["gate_report"]["phase_measurements"])
+                    try:
+                        projected = projected_total_seconds(
+                            calibration,
+                            snapshots,
+                            elapsed=total_elapsed,
+                            total_tus=total_tus,
+                            staged_tus=completed_tus,
+                            database_bytes=peak_database,
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        violation = f"runtime calibration rejected: {error}"
+                elif completed_tus and phase != "complete":
+                    # This lower bound remains useful for early rejection, but
+                    # cannot justify continuing with an unmeasured global tail.
+                    projected = total_elapsed * total_tus / completed_tus
+                if projected is not None and total_elapsed >= 1_800 and projected > 3_600:
                     violation = "30-minute projection exceeds the 60-minute target"
-                elif total_elapsed >= 600 and projected > 5_400:
+                elif projected is not None and total_elapsed >= 600 and projected > 5_400:
                     violation = "10-minute projection exceeds the 90-minute hard limit"
-            if violation is None and full_project and total_elapsed >= 600 and phase != "complete":
-                # TU throughput cannot estimate still-unmeasured embeddings/verification.
-                violation = f"total projection unknown at decision checkpoint (phase {phase})"
+                if (
+                    violation is None
+                    and phase != "complete"
+                    and total_elapsed >= 600
+                    and (calibration is None or projected is None)
+                ):
+                    # Only validated complete fit/holdout phases can replace the
+                    # old unconditional unknown-total stop, never TU rate alone.
+                    violation = f"total projection unknown at decision checkpoint (phase {phase})"
             if time.monotonic() - last_report >= 5 or kind == "stdout" and completed_tus:
                 rate = completed_tus / elapsed if elapsed > 0 else 0.0
                 eta = (
@@ -1388,10 +1419,15 @@ def _run_supervised(
                     else None
                 )
                 eta_text = f"{eta:.1f}s" if eta is not None else "unknown"
+                total_eta = (
+                    f"empirical {max(0.0, projected - total_elapsed):.1f}s"
+                    if calibration is not None and projected is not None
+                    else "unknown"
+                )
                 print(
                     f"canary: {completed_tus}/{total_tus} TUs, {total_elapsed:.1f}s, "
                     f"phase {phase}, "
-                    f"TU-only ETA {eta_text}, total ETA unknown, "
+                    f"TU-only ETA {eta_text}, total ETA {total_eta}, "
                     f"RSS {budget_tree.rss / 1024**2:.1f} MiB, "
                     f"DB {database_bytes / 1024**2:.1f} MiB",
                     file=sys.stderr,
@@ -2038,6 +2074,7 @@ def run_canary(
     baseline_report: Path | None = None,
     generated_source_roots: Sequence[Path] = (),
     total_gate_timeouts: Mapping[str, float] | None = None,
+    runtime_calibration: Path | None = None,
     analyzer_max_decoded_bytes: int = DEFAULT_MAX_DECODED_BYTES,
     analyzer_max_spool_bytes: int | None = None,
 ) -> dict[str, Any]:
@@ -2096,6 +2133,31 @@ def run_canary(
         "baseline_parity": baseline_report is not None,
     }
     analyzer_sha256 = _sha256(analyzer)
+    calibration = None
+    if runtime_calibration is not None:
+        if profile is not IndexProfile.NAVIGATION or list(gates) != ["all"]:
+            raise ValueError("runtime calibration requires one complete NAV gate")
+        if inspection.entry_count != inspection.normalized_configuration_count:
+            raise ValueError("runtime calibration requires unique compiler configurations")
+        try:
+            calibration = load_runtime_calibration(
+                runtime_calibration,
+                repository=Path(__file__).resolve().parents[2],
+                source_rows=_load_raw_cdb(inspection.compilation_database),
+                source_cdb_sha256=inspection.sha256,
+                project_root=inspection.project_root,
+                expected={
+                    **report,
+                    "analyzer_sha256": analyzer_sha256,
+                    "schema_version": SCHEMA_VERSION,
+                    "semantic_tables": _SEMANTIC_TABLES,
+                    "queries": list(queries),
+                    "generated_source_roots": [str(root) for root in canonical_generated_roots],
+                },
+            )
+        except (KeyError, TypeError, subprocess.CalledProcessError) as error:
+            raise ValueError(f"invalid runtime calibration evidence: {error}") from error
+        report["runtime_calibration"] = calibration
     baseline: Mapping[str, Any] | None = None
     baseline_gates: list[Mapping[str, Any]] = []
     if baseline_report is not None:
@@ -2148,6 +2210,7 @@ def run_canary(
                 "gate_started_monotonic": gate_started,
                 "total_wall_seconds": total_timeouts[name],
                 "full_project": gate == "all",
+                "runtime_calibration": calibration,
                 "project_root": str(inspection.project_root),
                 "compilation_database": str(subset),
                 "database": str(running / "index.db"),
@@ -2272,6 +2335,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--disk-limit-mib", type=float)
     parser.add_argument("--no-progress-seconds", type=float, default=10)
     parser.add_argument("--baseline-report", type=Path)
+    parser.add_argument("--runtime-calibration", type=Path)
     parser.add_argument(
         "--generated-source-root",
         action="append",
@@ -2356,6 +2420,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             baseline_report=args.baseline_report,
             generated_source_roots=args.generated_source_root,
             total_gate_timeouts=total_timeouts,
+            runtime_calibration=args.runtime_calibration,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

@@ -45,6 +45,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "function_signature.h"
+#include "macro_history.h"
 #include "path_cache.h"
 
 namespace {
@@ -391,28 +392,19 @@ public:
 
   llvm::json::Array
   expansionStack(clang::SourceLocation location,
-                 const std::vector<MacroExpansionRecord> &records) const {
+                 const std::vector<MacroExpansionRecord> &records,
+                 const cpp_context::MacroHistoryIndex &index) const {
     llvm::json::Array result;
     auto current = location;
     for (unsigned depth = 0; current.isMacroID() && depth < 64; ++depth) {
       auto immediate = sourceManager_.getImmediateExpansionRange(current).getAsRange();
-      const MacroExpansionRecord *matched = nullptr;
-      for (auto iterator = records.rbegin(); iterator != records.rend(); ++iterator) {
-        if (iterator->expansionRange.getBegin() == immediate.getBegin()) {
-          matched = &*iterator;
-          break;
-        }
-      }
+      auto position = index.exact(immediate.getBegin().getRawEncoding());
+      const MacroExpansionRecord *matched = position ? &records[*position] : nullptr;
       if (!matched) {
-        for (auto iterator = records.rbegin(); iterator != records.rend(); ++iterator) {
-          if (offset(iterator->expansionRange.getBegin(), false) ==
-                  offset(immediate.getBegin(), false) &&
-              path(iterator->expansionRange.getBegin(), false) ==
-                  path(immediate.getBegin(), false)) {
-            matched = &*iterator;
-            break;
-          }
-        }
+        position = index.fallback(offset(immediate.getBegin(), false),
+                                  path(immediate.getBegin(), false));
+        if (position)
+          matched = &records[*position];
       }
       if (matched) {
         auto spelling = span(matched->definitionRange, true);
@@ -718,6 +710,17 @@ public:
 
   SourceFacts &sourceFacts() { return source_; }
 
+  void indexMacroHistory() {
+    // The history is complete only at HandleTranslationUnit, not in our constructor.
+    // Index once instead of rescanning every expansion for every callsite/frame.
+    for (std::size_t position = 0; position < macroExpansions_.size(); ++position) {
+      const auto &record = macroExpansions_[position];
+      const auto begin = record.expansionRange.getBegin();
+      macroHistory_.add(begin.getRawEncoding(), source_.offset(begin, false),
+                        source_.path(begin, false), record.key, position);
+    }
+  }
+
   bool shouldVisitTemplateInstantiations() const { return true; }
   bool shouldVisitImplicitCode() const { return true; }
 
@@ -949,13 +952,19 @@ private:
                        std::to_string(source_.offset(range.getBegin(), true)) + ":" +
                        std::to_string(source_.offset(range.getBegin(), false)) + ":" +
                        std::to_string(source_.offset(range.getEnd(), false));
+    auto stack = source_.expansionStack(range.getBegin(), macroExpansions_, macroHistory_);
+    std::vector<std::string> macroKeys;
+    for (const auto &value : stack)
+      if (const auto *object = value.getAsObject())
+        if (const auto key = object->getString("macro_key"))
+          macroKeys.push_back(key->str());
+    const auto matchingMacros = macroHistory_.matchingRecords(macroKeys);
     llvm::json::Object site{{"fact", "callsite_v1"},
                             {"key", callsiteKey},
                             {"owner_key", *ownerKey},
                             {"dispatch_kind", dispatchKind.str()},
                             {"expansion_span", std::move(*expansion)},
-                            {"expansion_stack",
-                             source_.expansionStack(range.getBegin(), macroExpansions_)},
+                            {"expansion_stack", std::move(stack)},
                             {"target_set_complete", complete},
                             {"unresolved_reason", unresolvedReason.str()},
                             {"callee_text", source_.source(range)}};
@@ -976,23 +985,15 @@ private:
                  {"derivation", derivation.str()},
                  {"evidence_span", std::move(*source_.span(range, false))}});
     }
-    // The stack depends on the callsite, not on each macro record we match against it.
-    auto stack = source_.expansionStack(range.getBegin(), macroExpansions_);
-    for (const auto &frame : macroExpansions_) {
-      for (const auto &value : stack) {
-        const auto *object = value.getAsObject();
-        auto macroKey = object ? object->getString("macro_key") : std::nullopt;
-        if (!macroKey || *macroKey != frame.key)
-          continue;
-        sink_.add("edge:generated_by_macro:" + *ownerKey + ":" + frame.key + ":" +
-                      std::to_string(source_.offset(range.getBegin(), false)),
-                  {{"fact", "edge"},
-                   {"source_key", *ownerKey},
-                   {"target_key", frame.key},
-                   {"relation", "generated_by_macro"},
-                   {"span", std::move(*source_.span(range, false))}});
-        break;
-      }
+    for (const auto position : matchingMacros) {
+      const auto &frame = macroExpansions_[position];
+      sink_.add("edge:generated_by_macro:" + *ownerKey + ":" + frame.key + ":" +
+                    std::to_string(source_.offset(range.getBegin(), false)),
+                {{"fact", "edge"},
+                 {"source_key", *ownerKey},
+                 {"target_key", frame.key},
+                 {"relation", "generated_by_macro"},
+                 {"span", std::move(*source_.span(range, false))}});
     }
   }
 
@@ -2881,6 +2882,7 @@ private:
   FactSink &sink_;
   SourceFacts &source_;
   const std::vector<MacroExpansionRecord> &macroExpansions_;
+  cpp_context::MacroHistoryIndex macroHistory_;
   bool navigationOnly_;
   const clang::FunctionDecl *currentCallable_ = nullptr;
   std::unordered_set<std::string> emittedSymbolFacts_;
@@ -2892,6 +2894,7 @@ public:
            const std::vector<MacroExpansionRecord> &macroExpansions, bool navigationOnly)
       : collector_(context, sink, source, macroExpansions, navigationOnly) {}
   void HandleTranslationUnit(clang::ASTContext &context) override {
+    collector_.indexMacroHistory();
     collector_.TraverseDecl(context.getTranslationUnitDecl());
   }
 
