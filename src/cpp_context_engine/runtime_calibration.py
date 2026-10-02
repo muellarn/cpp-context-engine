@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 import subprocess
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,38 @@ WORK = {
     "producer_checks": "database_bytes",
     "validation": "database_bytes",
 }
+RISK_INDICES = (
+    9,
+    16,
+    110,
+    168,
+    862,
+    864,
+    1266,
+    1366,
+    1771,
+    1998,
+    2026,
+    2034,
+    2093,
+    2133,
+    2155,
+    2240,
+)
+
+
+def calibration_cohorts(total_tus: int, source_cdb_sha256: str) -> dict[str, Any]:
+    """Freeze the existing risk census and uniform remainder samples before measurement."""
+    if total_tus != 2252 or not re.fullmatch(r"[0-9a-f]{64}", source_cdb_sha256):
+        raise ValueError("calibration cohorts require the pinned 2252-configuration CDB")
+    rest = [index for index in range(total_tus) if index not in RISK_INDICES]
+    # One reproducible draw, without replacement or coverage-driven reselection.
+    drawn = random.Random(int(source_cdb_sha256, 16)).sample(rest, 47)
+    return {
+        "risk": list(RISK_INDICES),
+        "fits": [sorted(drawn[:16]), sorted(drawn[:32])],
+        "holdout": sorted(drawn[32:]),
+    }
 
 
 def _number(value: Any, name: str, *, positive: bool = False) -> float:
@@ -86,16 +118,22 @@ def _sample(gate: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def fit_phase_estimate(
-    fits: Sequence[Mapping[str, Any]], holdout: Mapping[str, Any], total_tus: int
+    fits: Sequence[Mapping[str, Any]],
+    holdout: Mapping[str, Any],
+    total_tus: int,
+    *,
+    risk: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Use measured upper rates, never a guessed safety factor or a TU-linear tail."""
     if len(fits) != 2:
         raise ValueError("calibration requires two fit sizes")
     samples = [_sample(gate) for gate in fits]
+    known = _sample(risk)
     check = _sample(holdout)
     if not samples[0]["work"]["tus"] < samples[1]["work"]["tus"]:
         raise ValueError("calibration fit sizes must increase")
     _number(total_tus, "whole TU count", positive=True)
+    remaining_tus = _number(total_tus - known["work"]["tus"], "remainder TU count", positive=True)
     amounts_per_tu = {
         name: max(sample["work"][name] / sample["work"]["tus"] for sample in samples)
         for name in ("facts", "embeddings", "database_bytes")
@@ -136,7 +174,21 @@ def fit_phase_estimate(
         raise ValueError("calibration holdout phase exceeds prediction")
     if check["total"] > sum(predicted["phase_seconds"].values()) + overhead + 1e-6:
         raise ValueError("calibration holdout total exceeds prediction")
-    return estimate(total_tus)
+    result = estimate(remaining_tus)
+    # H is a fixed census, not a representative sample to multiply by Whole's size.
+    result["phase_seconds"]["tu_processing"] += known["times"]["tu_processing"]
+    for name in result["work_limits"]:
+        result["work_limits"][name] += known["work"][name]
+    for phase in PHASES[1:]:
+        amount = known["work"][WORK[phase]]
+        rate = max(rates[phase], known["times"][phase] / max(1.0, amount))
+        result["phase_seconds"][phase] = max(
+            floors[phase],
+            known["times"][phase] if amount == 0 else 0,
+            rate * result["work_limits"][WORK[phase]],
+        )
+    result["overhead_seconds"] += known["overhead"]
+    return result
 
 
 def projected_total_seconds(
@@ -213,34 +265,23 @@ def load_runtime_calibration(
     repository: Path,
     source_rows: Sequence[Mapping[str, Any]],
     source_cdb_sha256: str,
-    project_root: Path,
     expected: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Accept three successful pinned original-CDB samples, without opening their DBs."""
+    """Accept H and three successful pinned R samples, without opening their DBs."""
     bundle = json.loads(path.read_text(encoding="utf-8"))
-    if bundle.get("schema") != "cpp-context-runtime-calibration-v1":
+    if bundle.get("schema") != "cpp-context-runtime-calibration-v2":
         raise ValueError("unknown runtime calibration schema")
     if bundle.get("source_cdb_sha256") != source_cdb_sha256:
         raise ValueError("calibration source CDB differs")
-    descriptors = [*bundle["fits"], bundle["holdout"]]
+    descriptors = [bundle["risk"], *bundle["fits"], bundle["holdout"]]
     if len(bundle["fits"]) != 2:
         raise ValueError("calibration requires two fit reports")
 
-    def cohort(row: Mapping[str, Any]) -> str:
-        source = Path(row["file"])
-        if not source.is_absolute():
-            source = Path(row["directory"]) / source
-        try:
-            return source.resolve().relative_to(project_root).parts[0]
-        except ValueError:
-            return "generated"
-
-    groups = [cohort(row) for row in source_rows]
-    population = Counter(groups)
-    indices: list[set[int]] = []
+    cohorts = calibration_cohorts(len(source_rows), source_cdb_sha256)
+    selected_cohorts = [cohorts["risk"], *cohorts["fits"], cohorts["holdout"]]
     gates = []
     evidence = []
-    for descriptor in descriptors:
+    for descriptor, required_indices in zip(descriptors, selected_cohorts, strict=True):
         report_path = (path.parent / descriptor["report"]).resolve()
         report_bytes = report_path.read_bytes()
         if hashlib.sha256(report_bytes).hexdigest() != descriptor["sha256"]:
@@ -356,23 +397,25 @@ def load_runtime_calibration(
             or gate["indexing"]["indexed_translation_units"] != len(selected)
         ):
             raise ValueError("calibration did not finish every selected configuration")
-        indices.append(set(selected))
+        if selected != required_indices:
+            raise ValueError("calibration must use the fixed risk and uniform disjoint cohorts")
+        _sample(gate)  # Reject incomplete H/R16 before using even their TU lower bound.
         gates.append(gate)
         evidence.append(
             {"report_sha256": descriptor["sha256"], "engine_commit": report["engine_commit"]}
         )
-    if not indices[0] < indices[1] or indices[1] & indices[2]:
-        raise ValueError("calibration needs nested fit sizes and disjoint holdout")
-    for selected in indices[:2]:
-        if {groups[index] for index in selected} != population.keys():
-            raise ValueError("calibration fit misses a source cohort")
-    holdout_groups = {groups[index] for index in indices[2]}
-    fitted = Counter(groups[index] for index in indices[1])
-    if any(
-        group not in holdout_groups and fitted[group] != size for group, size in population.items()
-    ):
-        raise ValueError("calibration holdout misses an unsampled source cohort")
-    estimate = fit_phase_estimate(gates[:2], gates[2], len(source_rows))
+        if len(gates) == 2:
+            risk = _sample(gates[0])
+            first = _sample(gates[1])
+            lower_bound = (
+                risk["times"]["tu_processing"]
+                + first["times"]["tu_processing"]
+                * (len(source_rows) - risk["work"]["tus"])
+                / first["work"]["tus"]
+            )
+            if lower_bound > 5_400:
+                raise ValueError("calibration R16 prestart TU projection exceeds 90 minutes")
+    estimate = fit_phase_estimate(gates[1:3], gates[3], len(source_rows), risk=gates[0])
     if sum(estimate["phase_seconds"].values()) + estimate["overhead_seconds"] > 5_400:
         raise ValueError("calibration prestart projection exceeds the 90-minute hard limit")
     return {

@@ -5,6 +5,7 @@ import io
 import json
 import subprocess
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,9 @@ from cpp_context_engine import kicad_canary
 from cpp_context_engine.ingestion.indexer import IndexingResult
 from cpp_context_engine.runtime_calibration import (
     PHASES,
+    RISK_INDICES,
     _compatible_revision,
+    calibration_cohorts,
     fit_phase_estimate,
     load_runtime_calibration,
     projected_total_seconds,
@@ -158,7 +161,7 @@ def _gate(tus):
         "database_integrity": "ok",
         "process_group_clean": True,
         "limits": {"rss_bytes": 1000, "database_bytes": 10000, "disk_bytes": 10000},
-        "total_wall_seconds": 100,
+        "total_wall_seconds": 600,
         "analyzer": {"sha256": "a" * 64},
         "semantic_snapshot": {
             "schema_version": kicad_canary.SCHEMA_VERSION,
@@ -169,19 +172,86 @@ def _gate(tus):
 
 def test_fixed_phase_rates_retain_tail_and_nonphase_overhead():
     fits = [_gate(2), _gate(4)]
-    model = fit_phase_estimate(fits, _gate(2), 8)
+    model = fit_phase_estimate(fits, _gate(2), 8, risk=_gate(2))
     assert model == {
         "phase_seconds": dict(zip(PHASES, (16, 8, 4, 2, 2), strict=True)),
-        "overhead_seconds": 2,
+        "overhead_seconds": 4,
         "work_limits": {"facts": 80, "embeddings": 32, "database_bytes": 800},
     }
-    assert fit_phase_estimate(fits, _gate(2), 8) == model
+    assert fit_phase_estimate(fits, _gate(2), 8, risk=_gate(2)) == model
     # A measured zero-unit phase is still positive work, not a zero-cost tail.
     for gate in [*fits]:
         gate["indexing"].update(indexed_symbols=0, indexed_occurrences=0, indexed_edges=0)
     holdout = _gate(2)
     holdout["indexing"].update(indexed_symbols=0, indexed_occurrences=0, indexed_edges=0)
-    assert fit_phase_estimate(fits, holdout, 8)["phase_seconds"]["post_tu_finalization"] == 4
+    assert (
+        fit_phase_estimate(fits, holdout, 8, risk=_gate(2))["phase_seconds"]["post_tu_finalization"]
+        == 80
+    )
+
+
+def test_risk_pipeline_is_paid_once_not_extrapolated_over_the_population():
+    risk = _gate(16)
+    # A fixed heavy cohort is a census of H, not a representative sample of R.
+    for snapshot in ("phase_measurements", "validation_phase_measurements"):
+        for interval in risk[snapshot]["phases"]:
+            for field in ("start_seconds", "end_seconds", "duration_seconds"):
+                interval[field] *= 10
+    risk["total_elapsed_seconds"] *= 10
+    remainder = [_gate(16), _gate(32)]
+    model = fit_phase_estimate(remainder, _gate(15), 2252, risk=risk)
+    assert model == {
+        "phase_seconds": dict(zip(PHASES, (4792, 22520, 11260, 5630, 5630), strict=True)),
+        "overhead_seconds": 22,
+        "work_limits": {"facts": 22520, "embeddings": 9008, "database_bytes": 225200},
+    }
+
+
+def test_remainder_cohorts_are_fixed_nested_uniform_draws_without_replacement():
+    cohorts = calibration_cohorts(2252, "a" * 64)
+    assert cohorts == calibration_cohorts(2252, "a" * 64)
+    assert cohorts["risk"] == list(RISK_INDICES)
+    risk, small, large, check = map(set, (cohorts["risk"], *cohorts["fits"], cohorts["holdout"]))
+    assert (len(risk), len(small), len(large), len(check)) == (16, 16, 32, 15)
+    assert small < large
+    assert not risk & (large | check)
+    assert not large & check
+    assert all(indices == sorted(indices) for indices in (*cohorts["fits"], cohorts["holdout"]))
+    assert calibration_cohorts(2252, "b" * 64)["fits"] != cohorts["fits"]
+    with pytest.raises(ValueError, match="pinned"):
+        calibration_cohorts(2251, "a" * 64)
+
+
+def test_expensive_risk_tail_does_not_rescue_a_failing_remainder_holdout():
+    risk, holdout = _gate(16), _gate(15)
+    for gate, extra in ((risk, 100), (holdout, 1)):
+        interval = gate["validation_phase_measurements"]["phases"][0]
+        interval["duration_seconds"] += extra
+        interval["end_seconds"] += extra
+        gate["total_elapsed_seconds"] += extra
+    with pytest.raises(ValueError, match="holdout phase"):
+        fit_phase_estimate([_gate(16), _gate(32)], holdout, 2252, risk=risk)
+
+
+def test_live_mixed_whole_rate_remains_conservative_without_subtracting_risk_time():
+    model = fit_phase_estimate([_gate(2), _gate(4)], _gate(2), 8, risk=_gate(2))
+    snapshot = {
+        "phases": [{"name": "tu_processing", "status": "incomplete", "start_seconds": 1}],
+        "counts": {},
+    }
+    # A heavy early prefix still dominates the unchanged mixed-Whole safeguard.
+    assert (
+        projected_total_seconds(
+            model, [snapshot], elapsed=11, total_tus=8, staged_tus=1, database_bytes=0
+        )
+        == 100
+    )
+    assert (
+        projected_total_seconds(
+            model, [snapshot], elapsed=11, total_tus=8, staged_tus=0, database_bytes=0
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -214,11 +284,11 @@ def test_holdout_rejects_underprediction_and_incomplete_intervals(fault, reason)
     else:
         holdout["phase_measurements"]["phases"][0]["status"] = "incomplete"
     with pytest.raises(ValueError, match=reason):
-        fit_phase_estimate([_gate(2), _gate(4)], holdout, 8)
+        fit_phase_estimate([_gate(2), _gate(4)], holdout, 8, risk=_gate(2))
 
 
 def test_live_validation_keeps_only_unfinished_cost_and_rejects_excess_work():
-    model = fit_phase_estimate([_gate(2), _gate(4)], _gate(2), 8)
+    model = fit_phase_estimate([_gate(2), _gate(4)], _gate(2), 8, risk=_gate(2))
     whole = _gate(8)
     producer = whole["phase_measurements"]
     validation = whole["validation_phase_measurements"]
@@ -227,7 +297,7 @@ def test_live_validation_keeps_only_unfinished_cost_and_rejects_excess_work():
         projected_total_seconds(
             model, [producer, validation], elapsed=32, total_tus=8, staged_tus=8, database_bytes=800
         )
-        == 34
+        == 36
     )
     with pytest.raises(ValueError, match="validation time exceeded"):
         projected_total_seconds(
@@ -256,11 +326,10 @@ def evidence(tmp_path):
     rows = [
         {
             "directory": str(root),
-            "file": f"{group}/{index}.cc",
-            "arguments": ["clang++", "-c", f"{group}/{index}.cc"],
+            "file": f"common/{index}.cc",
+            "arguments": ["clang++", "-c", f"common/{index}.cc"],
         }
-        for group in ("common", "pcbnew")
-        for index in range(4)
+        for index in range(2252)
     ]
     expected = {
         "engine_commit": "1" * 40,
@@ -274,10 +343,11 @@ def evidence(tmp_path):
         "semantic_tables": kicad_canary._SEMANTIC_TABLES,
         "queries": ["main"],
         "generated_source_roots": [],
-        "source_cdb_sha256": "b" * 64,
+        "source_cdb_sha256": hashlib.sha256(json.dumps(rows).encode()).hexdigest(),
     }
+    cohorts = calibration_cohorts(len(rows), expected["source_cdb_sha256"])
     reports, descriptors = [], []
-    for number, indices in enumerate(([0, 4], [0, 1, 4, 5], [2, 6])):
+    for number, indices in enumerate((*cohorts["fits"], cohorts["holdout"], cohorts["risk"])):
         directory = tmp_path / str(number) / "gate-all"
         directory.mkdir(parents=True)
         (directory / "SUCCESS").write_text("success\n")
@@ -304,6 +374,11 @@ def evidence(tmp_path):
         }
         (directory / "worker-spec.json").write_text(json.dumps(worker))
         gate = _gate(len(indices))
+        for snapshot in ("phase_measurements", "validation_phase_measurements"):
+            for interval in gate[snapshot]["phases"]:
+                for field in ("start_seconds", "end_seconds", "duration_seconds"):
+                    interval[field] /= 10
+        gate["total_elapsed_seconds"] /= 10
         gate["subset_cdb_sha256"] = hashlib.sha256(subset).hexdigest()
         report = {
             "schema": "cpp-context-kicad-canary-report",
@@ -325,8 +400,9 @@ def evidence(tmp_path):
         reports.append(report)
         descriptors.append({"report": f"{number}/report.json", "raw_indices": indices})
     bundle = {
-        "schema": "cpp-context-runtime-calibration-v1",
-        "source_cdb_sha256": "b" * 64,
+        "schema": "cpp-context-runtime-calibration-v2",
+        "source_cdb_sha256": expected["source_cdb_sha256"],
+        "risk": descriptors[3],
         "fits": descriptors[:2],
         "holdout": descriptors[2],
     }
@@ -343,7 +419,6 @@ def evidence(tmp_path):
             repository=tmp_path,
             source_rows=rows,
             source_cdb_sha256=expected["source_cdb_sha256"],
-            project_root=root,
             expected=expected,
         )
 
@@ -361,8 +436,57 @@ def evidence(tmp_path):
 def test_accept_pinned_nested_fit_and_disjoint_holdout(evidence):
     result = evidence.load()
     assert result["empirical"] is True
-    assert len(result["evidence"]) == 3
-    assert sum(result["phase_seconds"].values()) + result["overhead_seconds"] == 34
+    assert len(result["evidence"]) == 4
+    assert sum(result["phase_seconds"].values()) + result["overhead_seconds"] == pytest.approx(
+        901.2
+    )
+
+
+@pytest.mark.parametrize(
+    "fault", ["failed", "incomplete", "old_contract", "risk_selection", "remainder_selection"]
+)
+def test_risk_and_predetermined_remainder_cannot_be_replaced_with_convenient_evidence(
+    evidence, fault
+):
+    if fault == "failed":
+        (evidence.root / "3" / "gate-all" / "SUCCESS").unlink()
+        reason = "successfully"
+    elif fault == "incomplete":
+        evidence.reports[3]["gates"][0]["phase_measurements"]["phases"][1]["status"] = "incomplete"
+        reason = "incomplete"
+    elif fault == "old_contract":
+        evidence.bundle["schema"] = "cpp-context-runtime-calibration-v1"
+        reason = "schema"
+    else:
+        number = 3 if fault == "risk_selection" else 0
+        descriptor = evidence.bundle["risk"] if number == 3 else evidence.bundle["fits"][0]
+        selected = descriptor["raw_indices"]
+        replacement = next(index for index in range(2252) if index not in selected)
+        descriptor["raw_indices"] = sorted([replacement, *selected[1:]])
+        data = json.dumps([evidence.rows[index] for index in descriptor["raw_indices"]]).encode()
+        (evidence.root / str(number) / "gate-all" / "compile_commands.json").write_bytes(data)
+        evidence.reports[number]["gates"][0]["subset_cdb_sha256"] = hashlib.sha256(data).hexdigest()
+        reason = "fixed risk and uniform"
+    with pytest.raises(ValueError, match=reason):
+        evidence.load()
+
+
+def test_r16_mathematical_nogo_precedes_reading_later_reports(evidence, monkeypatch):
+    gate = evidence.reports[0]["gates"][0]
+    for snapshot in ("phase_measurements", "validation_phase_measurements"):
+        for interval in gate[snapshot]["phases"]:
+            for field in ("start_seconds", "end_seconds", "duration_seconds"):
+                interval[field] *= 20
+    gate["total_elapsed_seconds"] *= 20
+    original_read = Path.read_bytes
+
+    def read(path):
+        assert path != evidence.root / "1" / "report.json", "R32 must not be needed after R16 no-go"
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    with pytest.raises(ValueError, match="R16 prestart TU"):
+        evidence.load()
 
 
 @pytest.mark.parametrize("field", ["analyzer_max_decoded_bytes", "analyzer_max_spool_bytes"])
@@ -392,8 +516,8 @@ def test_navigation_calls_are_valid_and_part_of_finalization_work(evidence):
         gate["indexing"].update(indexed_callsites=2 * tus, indexed_call_targets=3 * tus)
         gate["semantic_snapshot"]["counts"].update(callsites=2 * tus, call_targets=3 * tus)
     result = evidence.load()
-    assert result["work_limits"]["facts"] == 15 * 8
-    assert result["phase_seconds"]["post_tu_finalization"] == 8
+    assert result["work_limits"]["facts"] == 15 * 2252
+    assert result["phase_seconds"]["post_tu_finalization"] == pytest.approx(225.2)
 
 
 @pytest.mark.parametrize(
@@ -440,9 +564,11 @@ def test_reject_invalid_calibration_evidence(evidence, fault, reason):
     elif fault == "commands":
         evidence.bundle["fits"][0]["raw_indices"] = [0, 5]
     elif fault == "holdout":
-        evidence.bundle["holdout"]["raw_indices"] = [0, 4]
+        evidence.bundle["holdout"]["raw_indices"] = evidence.bundle["fits"][0]["raw_indices"][:-1]
         directory = evidence.root / "2" / "gate-all"
-        data = (evidence.root / "0" / "gate-all" / "compile_commands.json").read_bytes()
+        data = json.dumps(
+            [evidence.rows[index] for index in evidence.bundle["holdout"]["raw_indices"]]
+        ).encode()
         (directory / "compile_commands.json").write_bytes(data)
         evidence.reports[2]["gates"][0]["subset_cdb_sha256"] = hashlib.sha256(data).hexdigest()
     elif fault == "deep":
@@ -527,9 +653,9 @@ def test_cli_loads_real_evidence_before_starting_supervisor(evidence, monkeypatc
     def supervise(spec_path, _directory, _limits, total):
         spec = json.loads(spec_path.read_text())
         observed.append(spec)
-        assert total == 8
+        assert total == 2252
         assert spec["runtime_calibration"]["empirical"] is True
-        assert len(spec["runtime_calibration"]["evidence"]) == 3
+        assert len(spec["runtime_calibration"]["evidence"]) == 4
         assert (
             spec["runtime_calibration"]["source_cdb_sha256"] == evidence.bundle["source_cdb_sha256"]
         )

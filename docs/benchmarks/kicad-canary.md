@@ -223,13 +223,17 @@ as a reliable whole-project forecast.
 ### Empirical whole-runtime calibration (#100)
 
 `--runtime-calibration` is supported only for one complete navigation `all` gate.
-It consumes two successful, increasing nested fit samples and one disjoint
-holdout, using their existing reports and retained CDB/worker-spec files, not
-their databases. No real post-#97 fit/holdout set has yet been accepted; the
+It consumes one successful fixed risk census H, two increasing nested fit samples
+from the remainder R, and one disjoint R holdout. It uses their existing reports
+and retained CDB/worker-spec files, not their databases. No complete real H/R
+calibration has yet been accepted; a failed H with successful TU staging is still
+ineligible because its remaining phases and validation did not complete. The
 implementation and offline tests alone do not authorize a whole-KiCad run.
 
-The JSON input has `schema: "cpp-context-runtime-calibration-v1"`, the unchanged
-whole `source_cdb_sha256`, two descriptors in `fits`, and one in `holdout`.
+The JSON input has `schema: "cpp-context-runtime-calibration-v2"`, the unchanged
+whole `source_cdb_sha256`, one descriptor in `risk`, two descriptors in `fits`,
+and one in `holdout`. The old unpublished v1 contract is rejected, not silently
+reinterpreted as unbiased evidence.
 Each descriptor contains `report` (relative to the input file), its `sha256`,
 and ordered `raw_indices` into the original whole CDB. Copy those original
 objects unchanged into each sample's CDB and run the existing `all` gate with
@@ -243,28 +247,56 @@ qualify. Engine/analyzer/schema/project and exact compile commands must match;
 only documentation-only Git differences are compatible with measured evidence.
 Changes to producer, canary or model code require a new compatible evidence set.
 
-Both fits must cover every top-level project source group and generated sources;
-the holdout must cover every group not already fully enumerated by the larger
-fit. For this CDB, a proposed 16/32 fit with a disjoint 15-TU holdout covers the
-16 groups (the two-entry tools group is a census). This is a sampling proposal,
-not a cost-representativeness claim or permission to start those measurements.
-The existing third-party-heavy prefix32 acceptance gates are not these cohorts.
+The existing 16-configuration risk set H is fixed at original indices
+`9,16,110,168,862,864,1266,1366,1771,1998,2026,2034,2093,2133,2155,2240`.
+It covers known difficult regions; it is deliberately not a representative fit
+sample. This contract is limited to the pinned 2252-configuration workload.
+`calibration_cohorts(2252, source_cdb_sha256)` returns H and the predetermined R
+indices: one uniform pseudorandom draw of 47 configurations without replacement
+from the remaining 2236, using the CDB digest as the fixed seed. Its first 16 and
+first 32 entries define nested fits; its final 15 define the disjoint holdout.
+Each cohort is sorted into original CDB order before writing the unchanged
+objects. No coverage forcing, reseeding, favorable rerolls, or overlap with H is
+allowed; the loader independently regenerates and checks the exact selections.
+Source-group risk coverage stays in H. A uniform small sample is still empirical,
+not proof of cost representativeness. Prefix NAV32 is not an R sample.
 
-The fixed empirical estimate uses the largest measured phase cost per work unit:
+For R, the fixed empirical estimate uses the largest measured phase cost per work unit:
 TU pipeline wall time per configuration; post-TU time per indexed symbol,
 occurrence, edge, callsite and call target; embedding time per processed record; separate
 producer/validator time per peak database byte. Overlapping TU intervals are
-never added. Whole work amounts use the largest measured amount per configuration
-times the whole configuration count. Positive time with zero work units retains
-a positive floor; the largest measured nonphase startup/gap/cleanup cost is also
-retained. The holdout must satisfy every amount, phase and total estimate.
+never added. R work amounts use the largest measured amount per R configuration
+times 2236. Add H's measured TU wall time, work amounts and nonphase overhead exactly
+once; never multiply its forced heavy TU sample by the whole-project population.
+For each tail phase, apply the highest observed H/R seconds-per-work-unit rate
+to the combined H-plus-projected-R workload. This retains H's expensive tail
+behavior rather than assuming separate finalization times simply add.
+Positive time with zero work units retains a positive floor; the largest measured
+R nonphase startup/gap/cleanup cost is also retained. The independent R holdout
+must satisfy every R amount, phase and total estimate without borrowing H's budget.
 There is no guessed safety multiplier or mathematical completion guarantee.
+This is an empirical composition, not proof that nonlinear finalization
+on their union is bounded by the measured rates. Existing live work/phase envelopes must
+reject deviations. The earlier real failures remain attached to their original
+code/data pins and cannot supply any of these four successful reports.
 
-A valid estimate over 90 minutes rejects before starting. During the run, all
+A valid estimate over 90 minutes rejects before starting. After validating H and
+R16, the loader already rejects if `H_TU + (R16_TU / 16) * 2236 > 5400`; adding the
+second max-rate fit or nonnegative tail costs cannot rescue that model. This is
+an early mathematical no-go for the proposed model, not a claimed lower bound on
+actual runtime. R32/holdout reports are not read after that rejection. Missing
+later evidence never authorizes a Whole run.
+
+During the run, all
 unstarted tail phases retain their estimated costs; completed phases contribute
 their actual time. Exceeding a measured work/phase envelope invalidates the
 estimate, including at the final validator result. Zero TU progress still leaves
-the checkpoint unknown. The existing 10-/30-minute rejection policies, hard
+the checkpoint unknown. The additional observed `spent * remaining / staged`
+Whole-pipeline rest estimate remains unchanged and is maximized with the
+calibrated rest. It is a mixed H/R throughput check, not an R-only rate. A heavy
+early prefix can still conservatively cause NO-GO; no guessed H time or sum of
+overlapping Native/Conversion intervals is subtracted to hide that limitation.
+The existing 10-/30-minute rejection policies, hard
 90-minute deadline, swap prohibition and resource/atomicity checks remain in
 force. `empirical_projected_total_seconds` is retained in the existing timing
 artifact; it is not a promise that an unobserved larger workload will finish.

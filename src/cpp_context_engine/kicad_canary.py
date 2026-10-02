@@ -2145,7 +2145,6 @@ def run_canary(
                 repository=Path(__file__).resolve().parents[2],
                 source_rows=_load_raw_cdb(inspection.compilation_database),
                 source_cdb_sha256=inspection.sha256,
-                project_root=inspection.project_root,
                 expected={
                     **report,
                     "analyzer_sha256": analyzer_sha256,
