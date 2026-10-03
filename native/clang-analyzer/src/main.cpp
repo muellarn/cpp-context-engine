@@ -1963,8 +1963,12 @@ private:
       for (const auto &access : records) {
         if (!isDefinition(access.kind))
           continue;
-        state.definitions[access.locationKey] = {access.key};
-        state.definitionsComplete[access.locationKey] = true;
+        // Navigation consumes points-to values, not reaching-definition evidence.
+        // Keep its collection and points-to evaluations (including side effects).
+        if (!navigationOnly_) {
+          state.definitions[access.locationKey] = {access.key};
+          state.definitionsComplete[access.locationKey] = true;
+        }
         const auto location = locations.find(access.locationKey);
         if (location != locations.end() && location->second.tracksPointsTo) {
           const bool referenceHandle =
@@ -1993,12 +1997,14 @@ private:
       std::set<std::string> pointLocations;
       std::set<std::string> definitionLocations;
       for (const auto *state : states) {
-        for (const auto &[location, definitions] : state->definitions) {
-          joined.definitions[location].insert(definitions.begin(), definitions.end());
-          definitionLocations.insert(location);
+        if (!navigationOnly_) {
+          for (const auto &[location, definitions] : state->definitions) {
+            joined.definitions[location].insert(definitions.begin(), definitions.end());
+            definitionLocations.insert(location);
+          }
+          for (const auto &[location, _] : state->definitionsComplete)
+            definitionLocations.insert(location);
         }
-        for (const auto &[location, _] : state->definitionsComplete)
-          definitionLocations.insert(location);
         for (const auto &[location, _] : state->pointsTo)
           pointLocations.insert(location);
       }
@@ -2125,27 +2131,29 @@ private:
               evaluatePointsTo(calls[nextCall].calleeExpression, state);
           ++nextCall;
         }
-        auto definitions = state.definitions[access.locationKey];
-        if (!isDefinition(access.kind)) {
-          const bool complete = state.definitionsComplete[access.locationKey];
-          if (!complete)
-            incompleteReasons.insert("reaching_definition_incomplete");
-          const auto certainty = complete && definitions.size() == 1 ? "certain" : "possible";
-          for (const auto &definition : definitions)
-            emitAccessEvidence("reaching_definition", certainty,
-                               complete && definitions.size() == 1
-                                   ? "one definition reaches this use on every modeled path"
-                                   : "this definition reaches the use on at least one CFG path",
-                               definition, access.key, access.statement);
-        } else {
-          const bool complete = state.definitionsComplete[access.locationKey];
-          const auto certainty = complete && definitions.size() == 1 ? "certain" : "possible";
-          for (const auto &definition : definitions)
-            emitAccessEvidence("overwrites", certainty,
-                               complete && definitions.size() == 1
-                                   ? "this definition is the unique reaching prior value"
-                                   : "this definition is one of multiple reaching prior values",
-                               definition, access.key, access.statement);
+        if (!navigationOnly_) {
+          auto definitions = state.definitions[access.locationKey];
+          if (!isDefinition(access.kind)) {
+            const bool complete = state.definitionsComplete[access.locationKey];
+            if (!complete)
+              incompleteReasons.insert("reaching_definition_incomplete");
+            const auto certainty = complete && definitions.size() == 1 ? "certain" : "possible";
+            for (const auto &definition : definitions)
+              emitAccessEvidence("reaching_definition", certainty,
+                                 complete && definitions.size() == 1
+                                     ? "one definition reaches this use on every modeled path"
+                                     : "this definition reaches the use on at least one CFG path",
+                                 definition, access.key, access.statement);
+          } else {
+            const bool complete = state.definitionsComplete[access.locationKey];
+            const auto certainty = complete && definitions.size() == 1 ? "certain" : "possible";
+            for (const auto &definition : definitions)
+              emitAccessEvidence("overwrites", certainty,
+                                 complete && definitions.size() == 1
+                                     ? "this definition is the unique reaching prior value"
+                                     : "this definition is one of multiple reaching prior values",
+                                 definition, access.key, access.statement);
+          }
         }
 
         const auto location = locations.find(access.locationKey);
@@ -2166,8 +2174,10 @@ private:
         }
 
         if (isDefinition(access.kind)) {
-          state.definitions[access.locationKey] = {access.key};
-          state.definitionsComplete[access.locationKey] = true;
+          if (!navigationOnly_) {
+            state.definitions[access.locationKey] = {access.key};
+            state.definitionsComplete[access.locationKey] = true;
+          }
           if (location != locations.end() && location->second.tracksPointsTo) {
             const bool referenceHandle =
                 (location->second.kind == "local" || location->second.kind == "parameter") &&
