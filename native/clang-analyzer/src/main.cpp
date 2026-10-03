@@ -672,6 +672,10 @@ public:
       if (source_.isProjectPath(target)) {
         fact["target_key"] = source_.fileKey(target);
         fact["resolved_path"] = target.string();
+        // An include-only file has no declaration that could emit its file fact.
+        sink_.add("file:" + from->string(),
+                  {{"fact", "file"}, {"key", source_.fileKey(*from)},
+                   {"path", from->string()}});
         sink_.add("include:" + from->string() + ":" + target.string() + ":" +
                       std::to_string(source_.offset(hashLoc, false)),
                   std::move(fact));

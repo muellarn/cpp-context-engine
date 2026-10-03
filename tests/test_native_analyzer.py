@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import shutil
@@ -279,6 +280,52 @@ def completed_symbol_project(tmp_path: Path) -> tuple[Path, BuildConfiguration]:
         arguments=("clang++", "-std=c++17", str(source)),
         command_hash="completed-symbols",
     )
+
+
+@pytest.mark.parametrize("profile", [IndexProfile.FULL, IndexProfile.NAVIGATION])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_include_only_translation_unit_preserves_file_endpoints(
+    tmp_path: Path, profile: IndexProfile, compressed: bool
+) -> None:
+    source = tmp_path / "probe.cpp"
+    bridge = tmp_path / "bridge.hpp"
+    header = tmp_path / "api.hpp"
+    source.write_text('#include "bridge.hpp"\n#if 0\nint disabled();\n#endif\n', encoding="utf-8")
+    bridge.write_text('#include "api.hpp"\n', encoding="utf-8")
+    header.write_text("int declared();\n", encoding="utf-8")
+    configuration = BuildConfiguration(
+        id="include-only",
+        source_path=source,
+        directory=tmp_path,
+        arguments=("clang++", "-std=c++17", str(source)),
+        command_hash="include-only",
+    )
+    facts = fresh_native_client(
+        analyzer_binary(), timeout_seconds=5, profile=profile, prefer_compression=compressed
+    ).analyze(tmp_path, configuration)
+
+    batch = _FactBatchBuilder(tmp_path, configuration, profile=profile).build(facts)
+
+    files = {symbol.span.path: symbol for symbol in batch.symbols if symbol.kind is SymbolKind.FILE}
+    assert set(files) == {source, bridge, header}
+    for path, symbol in files.items():
+        assert symbol.source_hash == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert {fact["key"] for fact in facts if fact["fact"] == "file"} == {
+        "file:probe.cpp",
+        "file:bridge.hpp",
+        "file:api.hpp",
+    }
+    includes = [edge for edge in batch.edges if edge.relation is GraphRelation.INCLUDES]
+    assert {(edge.source_id, edge.target_id) for edge in includes} == {
+        (files[source].id, files[bridge].id),
+        (files[bridge].id, files[header].id),
+    }
+    assert len(includes) == 2
+    assert all(edge.build_configuration_id == configuration.id for edge in includes)
+    names = {
+        symbol.qualified_name for symbol in batch.symbols if symbol.kind is not SymbolKind.FILE
+    }
+    assert names == {"declared"}
 
 
 @pytest.mark.parametrize("profile", [IndexProfile.FULL, IndexProfile.NAVIGATION])
