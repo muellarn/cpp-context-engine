@@ -2720,6 +2720,12 @@ private:
   }
 
   std::optional<std::string> emitSymbol(const clang::NamedDecl *decl, llvm::StringRef kind) {
+    if (const auto completedKind = completedSymbolKeys_.find(kind.str());
+        completedKind != completedSymbolKeys_.end()) {
+      if (const auto completed = completedKind->second.find(decl);
+          completed != completedKind->second.end())
+        return completed->second;
+    }
     auto span = source_.span(decl->getSourceRange());
     if (!span)
       span = source_.span(decl->getSourceRange(), false);
@@ -2795,6 +2801,10 @@ private:
                  {"source_key", *containerKey},
                  {"target_key", key},
                  {"relation", "contains"}});
+    // Only completed emissions are reusable: the symbol-fact set alone does not
+    // cover occurrences and enclosing owners. Keep exact declarations and owned
+    // kind values distinct, including redeclarations that share the same USR.
+    completedSymbolKeys_[kind.str()].emplace(decl, key);
     return key;
   }
 
@@ -2886,6 +2896,9 @@ private:
   bool navigationOnly_;
   const clang::FunctionDecl *currentCallable_ = nullptr;
   std::unordered_set<std::string> emittedSymbolFacts_;
+  std::unordered_map<std::string,
+                     std::unordered_map<const clang::NamedDecl *, std::string>>
+      completedSymbolKeys_;
 };
 
 class Consumer final : public clang::ASTConsumer {
