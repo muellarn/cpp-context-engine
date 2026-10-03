@@ -8,6 +8,7 @@ import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from json import JSONDecodeError
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -49,13 +50,31 @@ class DeterministicLocalEmbeddingProvider:
         if not tokens:
             tokens = ("<empty>",)
         for token in tokens:
-            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest()
-            weight = 1.0 / math.sqrt(max(1, len(token)))
-            for offset in (0, 4, 8, 12):
-                bucket = int.from_bytes(digest[offset : offset + 4], "little") % self.dimensions
-                sign = 1.0 if digest[offset] & 1 else -1.0
-                values[bucket] += sign * weight
+            contributions = (
+                _cached_token_contributions(token, self.dimensions)
+                if len(token) <= 64
+                else _token_contributions(token, self.dimensions)
+            )
+            for bucket, weight in contributions:
+                values[bucket] += weight
         return tuple(values)
+
+
+def _token_contributions(token: str, dimensions: int) -> tuple[tuple[int, float], ...]:
+    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest()
+    weight = 1.0 / math.sqrt(max(1, len(token)))
+    return tuple(
+        (
+            int.from_bytes(digest[offset : offset + 4], "little") % dimensions,
+            (1.0 if digest[offset] & 1 else -1.0) * weight,
+        )
+        for offset in (0, 4, 8, 12)
+    )
+
+
+# Bound both entry count and retained token length; repeat the original additions
+# instead of aggregating occurrences, which would change floating-point results.
+_cached_token_contributions = lru_cache(maxsize=4096)(_token_contributions)
 
 
 @dataclass(frozen=True, slots=True)

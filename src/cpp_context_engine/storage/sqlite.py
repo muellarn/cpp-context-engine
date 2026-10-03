@@ -7782,16 +7782,33 @@ class SQLiteStore:
     def _embedding_configuration_dimensions(
         self, project_id: int, model: str, configuration_id: str
     ) -> set[int]:
-        return {
-            int(row[0])
-            for row in self._connection.execute(
-                """
-                SELECT DISTINCT dimensions FROM embedding_vectors
-                WHERE project_id = ? AND model = ? AND configuration_id = ?
-                """,
-                (project_id, model, configuration_id),
-            )
-        }
+        """Return zero, one, or two witnesses for empty, uniform, or mixed dimensions."""
+
+        # Both callers reject a mixed pool; enumerating every dimension with
+        # DISTINCT rescans all equal vectors on every embedding batch. Seek in
+        # the existing composite primary key instead, without caching pool state.
+        scope = (project_id, model, configuration_id)
+        first = self._connection.execute(
+            """
+            SELECT dimensions FROM embedding_vectors
+            WHERE project_id = ? AND model = ? AND configuration_id = ?
+            ORDER BY dimensions LIMIT 1
+            """,
+            scope,
+        ).fetchone()
+        if first is None:
+            return set()
+        dimension = int(first[0])
+        other = self._connection.execute(
+            """
+            SELECT dimensions FROM embedding_vectors
+            WHERE project_id = ? AND model = ? AND configuration_id = ?
+              AND dimensions > ?
+            ORDER BY dimensions LIMIT 1
+            """,
+            (*scope, dimension),
+        ).fetchone()
+        return {dimension} if other is None else {dimension, int(other[0])}
 
     def _validate_embedding_variants(
         self,
