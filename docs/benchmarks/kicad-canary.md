@@ -223,16 +223,16 @@ as a reliable whole-project forecast.
 ### Empirical whole-runtime calibration (#100)
 
 `--runtime-calibration` is supported only for one complete navigation `all` gate.
-It consumes one successful fixed risk census H, two increasing nested fit samples
+It consumes four successful fixed risk blocks H0–H3, two increasing nested fit samples
 from the remainder R, and one disjoint R holdout. It uses their existing reports
 and retained CDB/worker-spec files, not their databases. No complete real H/R
 calibration has yet been accepted; a failed H with successful TU staging is still
 ineligible because its remaining phases and validation did not complete. The
 implementation and offline tests alone do not authorize a whole-KiCad run.
 
-The JSON input has `schema: "cpp-context-runtime-calibration-v2"`, the unchanged
-whole `source_cdb_sha256`, one descriptor in `risk`, two descriptors in `fits`,
-and one in `holdout`. The old unpublished v1 contract is rejected, not silently
+The JSON input has `schema: "cpp-context-runtime-calibration-v3"`, the unchanged
+whole `source_cdb_sha256`, an ordered list of four descriptors in `risk`, two in `fits`,
+and one in `holdout`. The old unpublished v1/v2 contracts are rejected, not silently
 reinterpreted as unbiased evidence.
 Each descriptor contains `report` (relative to the input file), its `sha256`,
 and ordered `raw_indices` into the original whole CDB. Copy those original
@@ -251,8 +251,15 @@ The existing 16-configuration risk set H is fixed at original indices
 `9,16,110,168,862,864,1266,1366,1771,1998,2026,2034,2093,2133,2155,2240`.
 It covers known difficult regions; it is deliberately not a representative fit
 sample. This contract is limited to the pinned 2252-configuration workload.
-`calibration_cohorts(2252, source_cdb_sha256)` returns H and the predetermined R
-indices: one uniform pseudorandom draw of 47 configurations without replacement
+`calibration_cohorts(2252, source_cdb_sha256)` partitions H by `RISK_INDICES[offset::4]`
+before measurement, without reselection: H0=`[9,862,1771,2093]`,
+H1=`[16,864,1998,2133]`, H2=`[110,1266,2026,2155]`,
+H3=`[168,1366,2034,2240]`. Their disjoint union is exactly the original H16;
+each block must independently finish its existing `all` gate, producer checks,
+validator and all resource/provenance requirements. A successful native or TU
+phase in a failed H16 report cannot substitute for any block.
+The helper also returns the unchanged predetermined R indices:
+one uniform pseudorandom draw of 47 configurations without replacement
 from the remaining 2236, using the CDB digest as the fixed seed. Its first 16 and
 first 32 entries define nested fits; its final 15 define the disjoint holdout.
 Each cohort is sorted into original CDB order before writing the unchanged
@@ -266,22 +273,25 @@ TU pipeline wall time per configuration; post-TU time per indexed symbol,
 occurrence, edge, callsite and call target; embedding time per processed record; separate
 producer/validator time per peak database byte. Overlapping TU intervals are
 never added. R work amounts use the largest measured amount per R configuration
-times 2236. Add H's measured TU wall time, work amounts and nonphase overhead exactly
-once; never multiply its forced heavy TU sample by the whole-project population.
-For each tail phase, apply the highest observed H/R seconds-per-work-unit rate
+times 2236. Sum the four H blocks' measured TU pipeline wall times, work amounts
+and nonphase overhead exactly once; never multiply the forced heavy TU sample by
+the whole-project population. Do not sum overlapping per-TU native/conversion times.
+For each tail phase, apply the highest observed individual H4 or R seconds-per-work-unit rate
 to the combined H-plus-projected-R workload. This retains H's expensive tail
-behavior rather than assuming separate finalization times simply add.
+behavior rather than averaging the four H rates or adding fixed H tail time again.
 Positive time with zero work units retains a positive floor; the largest measured
 R nonphase startup/gap/cleanup cost is also retained. The independent R holdout
 must satisfy every R amount, phase and total estimate without borrowing H's budget.
 There is no guessed safety multiplier or mathematical completion guarantee.
-This is an empirical composition, not proof that nonlinear finalization
-on their union is bounded by the measured rates. Existing live work/phase envelopes must
+The summed H work is an empirical proxy, not the measured work of one united H16
+database: cross-TU finalization, FTS and deduplication can change nonlinearly on
+the union. Neither the proxy nor the maximum individual rates prove an upper bound.
+Existing live work/phase envelopes must
 reject deviations. The earlier real failures remain attached to their original
-code/data pins and cannot supply any of these four successful reports.
+code/data pins and cannot supply any of these seven successful reports.
 
-A valid estimate over 90 minutes rejects before starting. After validating H and
-R16, the loader already rejects if `H_TU + (R16_TU / 16) * 2236 > 5400`; adding the
+A valid estimate over 90 minutes rejects before starting. After validating all four H blocks and
+R16, the loader already rejects if `sum(H0_TU..H3_TU) + (R16_TU / 16) * 2236 > 5400`; adding the
 second max-rate fit or nonnegative tail costs cannot rescue that model. This is
 an early mathematical no-go for the proposed model, not a claimed lower bound on
 actual runtime. R32/holdout reports are not read after that rejection. Missing

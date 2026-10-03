@@ -54,7 +54,7 @@ def calibration_cohorts(total_tus: int, source_cdb_sha256: str) -> dict[str, Any
     # One reproducible draw, without replacement or coverage-driven reselection.
     drawn = random.Random(int(source_cdb_sha256, 16)).sample(rest, 47)
     return {
-        "risk": list(RISK_INDICES),
+        "risk": [list(RISK_INDICES[offset::4]) for offset in range(4)],
         "fits": [sorted(drawn[:16]), sorted(drawn[:32])],
         "holdout": sorted(drawn[32:]),
     }
@@ -122,18 +122,24 @@ def fit_phase_estimate(
     holdout: Mapping[str, Any],
     total_tus: int,
     *,
-    risk: Mapping[str, Any],
+    risk: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Use measured upper rates, never a guessed safety factor or a TU-linear tail."""
     if len(fits) != 2:
         raise ValueError("calibration requires two fit sizes")
+    if len(risk) != 4:
+        raise ValueError("calibration requires four risk reports")
     samples = [_sample(gate) for gate in fits]
-    known = _sample(risk)
+    known = [_sample(gate) for gate in risk]
     check = _sample(holdout)
     if not samples[0]["work"]["tus"] < samples[1]["work"]["tus"]:
         raise ValueError("calibration fit sizes must increase")
     _number(total_tus, "whole TU count", positive=True)
-    remaining_tus = _number(total_tus - known["work"]["tus"], "remainder TU count", positive=True)
+    remaining_tus = _number(
+        total_tus - sum(sample["work"]["tus"] for sample in known),
+        "remainder TU count",
+        positive=True,
+    )
     amounts_per_tu = {
         name: max(sample["work"][name] / sample["work"]["tus"] for sample in samples)
         for name in ("facts", "embeddings", "database_bytes")
@@ -175,19 +181,26 @@ def fit_phase_estimate(
     if check["total"] > sum(predicted["phase_seconds"].values()) + overhead + 1e-6:
         raise ValueError("calibration holdout total exceeds prediction")
     result = estimate(remaining_tus)
-    # H is a fixed census, not a representative sample to multiply by Whole's size.
-    result["phase_seconds"]["tu_processing"] += known["times"]["tu_processing"]
+    # Count every fixed H block once; never dilute its tail rate by averaging H.
+    result["phase_seconds"]["tu_processing"] += sum(
+        sample["times"]["tu_processing"] for sample in known
+    )
     for name in result["work_limits"]:
-        result["work_limits"][name] += known["work"][name]
+        result["work_limits"][name] += sum(sample["work"][name] for sample in known)
     for phase in PHASES[1:]:
-        amount = known["work"][WORK[phase]]
-        rate = max(rates[phase], known["times"][phase] / max(1.0, amount))
+        rate = max(
+            rates[phase],
+            *(sample["times"][phase] / max(1.0, sample["work"][WORK[phase]]) for sample in known),
+        )
         result["phase_seconds"][phase] = max(
             floors[phase],
-            known["times"][phase] if amount == 0 else 0,
+            *(
+                sample["times"][phase] if sample["work"][WORK[phase]] == 0 else 0
+                for sample in known
+            ),
             rate * result["work_limits"][WORK[phase]],
         )
-    result["overhead_seconds"] += known["overhead"]
+    result["overhead_seconds"] += sum(sample["overhead"] for sample in known)
     return result
 
 
@@ -267,18 +280,20 @@ def load_runtime_calibration(
     source_cdb_sha256: str,
     expected: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Accept H and three successful pinned R samples, without opening their DBs."""
+    """Accept four H blocks and three pinned R samples, without opening their DBs."""
     bundle = json.loads(path.read_text(encoding="utf-8"))
-    if bundle.get("schema") != "cpp-context-runtime-calibration-v2":
+    if bundle.get("schema") != "cpp-context-runtime-calibration-v3":
         raise ValueError("unknown runtime calibration schema")
     if bundle.get("source_cdb_sha256") != source_cdb_sha256:
         raise ValueError("calibration source CDB differs")
-    descriptors = [bundle["risk"], *bundle["fits"], bundle["holdout"]]
+    if not isinstance(bundle.get("risk"), list) or len(bundle["risk"]) != 4:
+        raise ValueError("calibration requires four risk reports")
+    descriptors = [*bundle["risk"], *bundle["fits"], bundle["holdout"]]
     if len(bundle["fits"]) != 2:
         raise ValueError("calibration requires two fit reports")
 
     cohorts = calibration_cohorts(len(source_rows), source_cdb_sha256)
-    selected_cohorts = [cohorts["risk"], *cohorts["fits"], cohorts["holdout"]]
+    selected_cohorts = [*cohorts["risk"], *cohorts["fits"], cohorts["holdout"]]
     gates = []
     evidence = []
     for descriptor, required_indices in zip(descriptors, selected_cohorts, strict=True):
@@ -404,18 +419,18 @@ def load_runtime_calibration(
         evidence.append(
             {"report_sha256": descriptor["sha256"], "engine_commit": report["engine_commit"]}
         )
-        if len(gates) == 2:
-            risk = _sample(gates[0])
-            first = _sample(gates[1])
+        if len(gates) == 5:
+            risk = [_sample(gate) for gate in gates[:4]]
+            first = _sample(gates[4])
             lower_bound = (
-                risk["times"]["tu_processing"]
+                sum(sample["times"]["tu_processing"] for sample in risk)
                 + first["times"]["tu_processing"]
-                * (len(source_rows) - risk["work"]["tus"])
+                * (len(source_rows) - sum(sample["work"]["tus"] for sample in risk))
                 / first["work"]["tus"]
             )
             if lower_bound > 5_400:
                 raise ValueError("calibration R16 prestart TU projection exceeds 90 minutes")
-    estimate = fit_phase_estimate(gates[1:3], gates[3], len(source_rows), risk=gates[0])
+    estimate = fit_phase_estimate(gates[4:6], gates[6], len(source_rows), risk=gates[:4])
     if sum(estimate["phase_seconds"].values()) + estimate["overhead_seconds"] > 5_400:
         raise ValueError("calibration prestart projection exceeds the 90-minute hard limit")
     return {
