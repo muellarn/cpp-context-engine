@@ -66,7 +66,10 @@ const std::vector<std::string> kCapabilities = {
     "macro_expansion_stack", "template_relationships_v1",
     "intraprocedural_dataflow_v1", "points_to_v1", "function_summaries_v1",
     "interprocedural_bindings_v1", "gzip_jsonl_v1", "analysis_profiles_v1",
-    "generated_source_roots_v1", "compact_structural_keys_v1"};
+    "generated_source_roots_v1", "compact_structural_keys_v1", "symbol_text_chunks_v1"};
+
+constexpr std::size_t kSymbolTextChunkBytes = 64 * 1024;
+bool symbolTextChunks = false;
 
 class OutputWriter {
 public:
@@ -155,6 +158,45 @@ void emit(std::initializer_list<llvm::json::Object::KV> properties) {
   emit(llvm::json::Object(properties));
 }
 
+void emitSymbolText(llvm::json::Object fact) {
+  llvm::json::Object descriptions;
+  std::vector<std::pair<std::string, std::string>> texts;
+  for (const auto *field : {"signature", "documentation", "source_text"}) {
+    const auto text = fact.getString(field);
+    if (!text || text->size() <= kSymbolTextChunkBytes)
+      continue;
+    llvm::SHA256 digest;
+    digest.update(*text);
+    descriptions[field] = llvm::json::Object{
+        {"bytes", static_cast<std::int64_t>(text->size())},
+        {"sha256", llvm::toHex(digest.final(), true)}};
+    texts.emplace_back(field, text->str());
+    fact.erase(field);
+  }
+  if (texts.empty()) {
+    emit(std::move(fact));
+    return;
+  }
+  const auto key = fact.getString("key")->str();
+  fact["text_chunks"] = std::move(descriptions);
+  emit(std::move(fact));
+  // Split only after FactSink's logical dedupe. UTF-8 pieces stay well below
+  // the existing record bound even when JSON escapes every input byte.
+  for (const auto &[field, text] : texts) {
+    std::int64_t index = 0;
+    for (std::size_t offset = 0; offset < text.size();) {
+      auto end = std::min(offset + kSymbolTextChunkBytes, text.size());
+      while (end < text.size() &&
+             (static_cast<unsigned char>(text[end]) & 0xc0) == 0x80)
+        --end;
+      emit({{"type", "fact"}, {"fact", "symbol_text_chunk_v1"},
+            {"key", key}, {"field", field}, {"index", index++},
+            {"text", text.substr(offset, end - offset)}});
+      offset = end;
+    }
+  }
+}
+
 void emitError(llvm::StringRef code, llvm::StringRef message) {
   emit({{"type", "error"}, {"code", code}, {"message", message}});
 }
@@ -227,7 +269,10 @@ public:
     // Projection must not affect native ordered sets, cap selection or dedupe.
     projectWireKeys(fact);
     fact["type"] = "fact";
-    emit(std::move(fact));
+    if (symbolTextChunks && fact.getString("fact").value_or("") == "symbol")
+      emitSymbolText(std::move(fact));
+    else
+      emit(std::move(fact));
   }
 
   void add(std::string sortKey,
@@ -2998,6 +3043,12 @@ bool handleHello(const llvm::json::Object &request) {
     emitError("capability_mismatch", "client must confirm compact_structural_keys_v1");
     return false;
   }
+  // Advertising a capability is not consent from an older v5 consumer.
+  symbolTextChunks = std::any_of(
+      requiredCapabilities->begin(), requiredCapabilities->end(), [](const auto &value) {
+        const auto capability = value.getAsString();
+        return capability && *capability == "symbol_text_chunks_v1";
+      });
   llvm::json::Array capabilities;
   for (const auto &capability : kCapabilities)
     capabilities.push_back(capability);

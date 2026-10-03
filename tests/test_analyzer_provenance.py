@@ -32,7 +32,7 @@ def test_native_binary_upgrade_reindexes_unchanged_tus(
     binary.write_bytes(b"analyzer A")
     client = NativeAnalyzerClient(binary, profile=profile)
     monkeypatch.setattr(client, "probe", lambda: object())
-    monkeypatch.setattr(client, "analyze_stream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(client, "_analyze_registry", lambda *_args, **_kwargs: None)
     old_identity = _file_digest(binary)
     ingestor = NativeClangIngestor(client, profile=profile)
     with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
@@ -131,14 +131,14 @@ def test_binary_change_during_generation_rolls_back(tmp_path: Path, monkeypatch)
     binary.write_bytes(b"A")
     client = NativeAnalyzerClient(binary)
     monkeypatch.setattr(client, "probe", lambda: object())
-    monkeypatch.setattr(client, "analyze_stream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(client, "_analyze_registry", lambda *_args, **_kwargs: None)
     with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
         indexer = ProjectIndexer(NativeClangIngestor(client), store)
         indexer.index(root, cdb)
         before = _semantic_dump(store)
         binary.write_bytes(b"B")
         monkeypatch.setattr(
-            client, "analyze_stream", lambda *_args, **_kwargs: binary.write_bytes(b"C")
+            client, "_analyze_registry", lambda *_args, **_kwargs: binary.write_bytes(b"C")
         )
         with pytest.raises(RuntimeError, match="analyzer changed during indexing"):
             indexer.index(root, cdb)
