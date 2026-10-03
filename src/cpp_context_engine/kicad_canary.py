@@ -1761,7 +1761,7 @@ def _run_worker(spec_path: Path) -> int:
             max_spool_bytes=int(spec["analyzer_max_spool_bytes"]),
             profile=profile,
             observer=_worker_analyzer_event,
-            max_analyzer_idle_seconds=float(spec["limits"]["no_progress_seconds"]),
+            max_analyzer_idle_seconds=float(spec["no_progress_seconds"]),
         )
         generated_source_roots = tuple(
             Path(path) for path in spec.get("generated_source_roots", ())
@@ -2162,6 +2162,7 @@ def run_canary(
                 "translation_units": expected_translation_units,
                 "workers": workers,
                 "analyzer_timeout_seconds": analyzer_timeout_seconds,
+                "no_progress_seconds": no_progress_seconds,
                 "analyzer_max_decoded_bytes": analyzer_max_decoded_bytes,
                 "analyzer_max_spool_bytes": analyzer_max_spool_bytes,
                 "embedding_dimensions": embedding_dimensions,
