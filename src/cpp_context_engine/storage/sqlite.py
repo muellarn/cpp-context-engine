@@ -86,6 +86,8 @@ MAX_SUMMARY_PAYLOAD_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_SUMMARY_PAYLOAD_RECORDS = 65_536
 SUMMARY_PAYLOAD_WRITE_BATCH_SIZE = 64
 SUMMARY_PAYLOAD_WRITE_BATCH_BYTES = 16 * 1024 * 1024
+_INSERT_BATCH_ROWS = 64
+_INSERT_BATCH_BYTES = 1024 * 1024
 _TRANSLATION_UNIT_DELETE_ORDER = (
     "deep_materialization_units",
     "deep_tu_cache",
@@ -3281,11 +3283,11 @@ class SQLiteStore:
             )
 
         symbols = tuple(batch.symbols)
-        self._connection.executemany(
+        self._insert_rows(
             """
             INSERT OR IGNORE INTO translation_unit_symbols(
                 project_id, translation_unit_id, symbol_id, is_definition
-            ) VALUES (?, ?, ?, ?)
+            ) VALUES {values}
             """,
             (
                 (
@@ -3296,14 +3298,17 @@ class SQLiteStore:
                 )
                 for symbol in symbols
             ),
+            columns=4,
         )
-        self._connection.executemany(
-            "INSERT OR IGNORE INTO temp._ingestion_affected_symbols(id) VALUES (?)",
+        self._insert_rows(
+            "INSERT OR IGNORE INTO temp._ingestion_affected_symbols(id) VALUES {values}",
             ((symbol.id,) for symbol in symbols),
+            columns=1,
         )
-        self._connection.executemany(
-            "INSERT OR IGNORE INTO temp._ingestion_affected_functions(id) VALUES (?)",
+        self._insert_rows(
+            "INSERT OR IGNORE INTO temp._ingestion_affected_functions(id) VALUES {values}",
             ((summary.function_symbol_id,) for summary in batch.function_summaries),
+            columns=1,
         )
         self._put_symbol_variants(project_id, symbols)
         self._put_occurrences(project_id, batch.occurrences)
@@ -3907,12 +3912,12 @@ class SQLiteStore:
                 """,
                 (project_id, *chunk),
             )
-        self._connection.executemany(
+        self._insert_rows(
             """
             INSERT INTO symbol_variants(
                 project_id, id, symbol_id, build_variant, build_configuration_id,
                 translation_unit_id, is_definition, snapshot_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES {values}
             ON CONFLICT(project_id, id) DO UPDATE SET
                 symbol_id = excluded.symbol_id,
                 build_variant = excluded.build_variant,
@@ -3934,6 +3939,7 @@ class SQLiteStore:
                 )
                 for symbol, variant_id, snapshot in records
             ),
+            columns=8,
         )
         if not self._defer_variant_fts:
             self._connection.executemany(
@@ -3976,14 +3982,61 @@ class SQLiteStore:
                     preferred[row["symbol_id"]] = self._snapshot_symbol(row["snapshot_json"])
         self._put_canonical_symbols(project_id, preferred.values(), prefer_definition=False)
 
+    def _insert_rows(self, sql: str, rows: Iterable[tuple[object, ...]], *, columns: int) -> None:
+        """Insert bounded ordered rows inside the caller's rollback-on-error transaction.
+
+        Only the fixed ingestion INSERTs below use this: no RETURNING, per-row
+        recovery, or independently owned transactions. Unlike executemany, each
+        chunk steps SQLite once instead of handing the GIL back per input row.
+        """
+        row_limit = max(
+            1,
+            min(
+                _INSERT_BATCH_ROWS,
+                self._connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // columns,
+            ),
+        )
+        placeholders = "(" + ",".join("?" for _ in range(columns)) + ")"
+        pending: list[tuple[object, ...]] = []
+        payload_bytes = 0
+
+        def flush() -> None:
+            self._connection.execute(
+                sql.format(values=",".join([placeholders] * len(pending))),
+                tuple(value for row in pending for value in row),
+            )
+            pending.clear()
+
+        for row in rows:
+            # Four bytes/codepoint bounds UTF-8 without encoding/copying source
+            # payloads to measure them. One oversize row still executes alone.
+            row_bytes = sum(
+                len(value) * 4
+                if isinstance(value, str)
+                else len(value)
+                if isinstance(value, bytes)
+                else 8
+                for value in row
+            )
+            if pending and payload_bytes + row_bytes > _INSERT_BATCH_BYTES:
+                flush()
+                payload_bytes = 0
+            pending.append(row)
+            payload_bytes += row_bytes
+            if len(pending) >= row_limit or payload_bytes >= _INSERT_BATCH_BYTES:
+                flush()
+                payload_bytes = 0
+        if pending:
+            flush()
+
     def _put_occurrences(self, project_id: int, occurrences: Iterable[SymbolOccurrence]) -> None:
-        self._connection.executemany(
+        self._insert_rows(
             """
             INSERT OR REPLACE INTO occurrences(
                 project_id, translation_unit_id, id, symbol_id, enclosing_symbol_id,
                 kind, path, start_line, end_line, start_column, end_column,
                 build_configuration_id, build_variant, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES {values}
             """,
             (
                 (
@@ -4004,15 +4057,16 @@ class SQLiteStore:
                 )
                 for occurrence in occurrences
             ),
+            columns=14,
         )
 
     def _put_edges(self, project_id: int, edges: Iterable[GraphEdge]) -> None:
-        self._connection.executemany(
+        self._insert_rows(
             """
             INSERT OR IGNORE INTO edges(
                 project_id, id, translation_unit_id, build_configuration_id,
                 build_variant, source_id, target_id, relation
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES {values}
             """,
             (
                 (
@@ -4035,6 +4089,7 @@ class SQLiteStore:
                 )
                 for edge in edges
             ),
+            columns=8,
         )
 
     def _put_cfg_facts(
@@ -4163,14 +4218,14 @@ class SQLiteStore:
         callsites: Iterable[CallSite],
         targets: Iterable[CallTarget],
     ) -> None:
-        self._connection.executemany(
+        self._insert_rows(
             """
             INSERT INTO callsites(
                 project_id, id, owner_symbol_id, dispatch_kind,
                 spelling_span_json, expansion_span_json, expansion_stack_json,
                 static_target_symbol_id, target_set_complete, unresolved_reason,
                 callee_text, translation_unit_id, build_configuration_id, build_variant
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES {values}
             """,
             (
                 (
@@ -4204,14 +4259,15 @@ class SQLiteStore:
                 )
                 for site in callsites
             ),
+            columns=14,
         )
-        self._connection.executemany(
+        self._insert_rows(
             """
             INSERT INTO call_targets(
                 project_id, id, callsite_id, target_symbol_id, certainty,
                 confidence, confidence_reason, derivation, evidence_span_json,
                 translation_unit_id, build_configuration_id, build_variant
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES {values}
             """,
             (
                 (
@@ -4230,6 +4286,7 @@ class SQLiteStore:
                 )
                 for target in targets
             ),
+            columns=12,
         )
 
     def _put_data_flow_facts(
