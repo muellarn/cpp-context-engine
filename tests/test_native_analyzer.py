@@ -296,15 +296,19 @@ def test_completed_symbol_emission_preserves_redeclarations_and_call_owners(
     target_key = target_symbols[0]["key"]
     assert {fact["key"] for fact in target_symbols} == {target_key}
     declarations = [
-        fact for fact in facts
-        if fact["fact"] == "occurrence" and fact["symbol_key"] == target_key
+        fact
+        for fact in facts
+        if fact["fact"] == "occurrence"
+        and fact["symbol_key"] == target_key
         and fact["kind"] in {"declaration", "definition"}
     ]
     assert [(fact["kind"], fact["span"]["start_line"]) for fact in declarations] == [
-        ("declaration", 2), ("definition", 7)
+        ("declaration", 2),
+        ("definition", 7),
     ]
     owners = {
-        fact["qualified_name"]: fact["key"] for fact in symbols
+        fact["qualified_name"]: fact["key"]
+        for fact in symbols
         if fact["qualified_name"] in {"sample::first", "sample::second"}
     }
     assert set(owners) == {"sample::first", "sample::second"}
@@ -316,13 +320,15 @@ def test_completed_symbol_emission_preserves_redeclarations_and_call_owners(
     assert len(macro_sites) == 2
     assert {fact["owner_key"] for fact in macro_sites} == set(owners.values())
     instantiated = [
-        fact for fact in symbols
+        fact
+        for fact in symbols
         if fact["qualified_name"] == "sample::identity"
         and fact["metadata"].get("template_kind") == "implicit_instantiation"
     ]
     assert len({fact["key"] for fact in instantiated}) == 2
     target_edges = [
-        fact for fact in facts
+        fact
+        for fact in facts
         if fact["fact"] == "call_target_v1" and fact["target_key"] == target_key
     ]
     assert len(target_edges) == 4
