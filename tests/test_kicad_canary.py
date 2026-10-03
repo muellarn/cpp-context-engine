@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from cpp_context_engine.api import DataFlowResult, FlowRequest
 from cpp_context_engine.ingestion import AnalyzerPipelineEvent, AnalyzerSlotIdleError
 from cpp_context_engine.kicad_canary import (
     CanaryLimits,
+    _AnalyzerTelemetryMonitor,
     _compare_baseline,
     _process_group_live,
     _terminate_process_group,
@@ -121,6 +123,114 @@ def phase_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         )
 
     return run
+
+
+@pytest.mark.parametrize("delay_reader", [False, True])
+def test_supervisor_applies_delayed_pipeline_burst_before_live_idle_check(
+    phase_worker, monkeypatch, delay_reader: bool
+) -> None:
+    if delay_reader:
+        release_reader = threading.Event()
+        read_lines = kicad_canary._read_lines
+
+        def delayed_read(stream, destination, kind):
+            if kind == "stdout":
+                # The start is still inside the reader, not visible via queue.empty().
+                for _ in range(2):
+                    destination.put((kind, next(stream).rstrip("\n")))
+                assert release_reader.wait(timeout=2)
+            read_lines(stream, destination, kind)
+
+        def metrics(_pid):
+            release_reader.set()
+            return kicad_canary._TreeMetrics(0, 0, 0, ())
+
+        monkeypatch.setattr(kicad_canary, "_read_lines", delayed_read)
+        monkeypatch.setattr(kicad_canary, "_process_tree_metrics", metrics)
+    events = [{"event": "phase", "name": "index", "monotonic_seconds": 1}]
+    for sequence, at, kind, slot, outcome, pending in (
+        (1, 1.1, "scheduling_state", None, None, 1),
+        (2, 1.2, "analyzer_started", 0, None, 0),
+        (3, 2.0, "analyzer_finished", 0, "succeeded", 0),
+        (4, 2.1, "conversion_started", None, None, 0),
+        (5, 2.2, "conversion_finished", None, "succeeded", 0),
+    ):
+        events.append(
+            _pipeline_event(
+                sequence,
+                at,
+                kind,
+                slot_id=slot,
+                configuration_index=None if kind == "scheduling_state" else 0,
+                outcome=outcome,
+                unscheduled_count=pending,
+                held_registries=0 if pending else 1,
+                max_spool_registries=1,
+                slot_count=1,
+            ).to_protocol_payload()
+        )
+    events.extend(
+        [
+            {"event": "tu_staging", "configuration_index": 0, "monotonic_seconds": 3},
+            {"event": "tu_staged", "completed": 1, "monotonic_seconds": 4},
+            {"event": "phase", "name": "embeddings", "monotonic_seconds": 5},
+            {"event": "phase", "name": "producer_checks", "monotonic_seconds": 6},
+            {"event": "result", "result": {}, "monotonic_seconds": 7},
+        ]
+    )
+    # All producer work is finished before delayed delivery at supervisor time 20.
+    result = phase_worker(events, pipeline=True, total_tus=1)
+    assert result["completed_translation_units"] == 1
+    assert result["analyzer_pipeline"]["slots"][0]["maximum_idle_seconds"] == pytest.approx(0.1)
+    assert [phase["duration_seconds"] for phase in result["phase_measurements"]["phases"]] == [
+        3,
+        1,
+        1,
+        1,
+    ]
+
+
+def test_supervisor_rejects_real_producer_idle_inside_delayed_burst(phase_worker) -> None:
+    events = [
+        _pipeline_event(1, 1, "scheduling_state").to_protocol_payload(),
+        _pipeline_event(
+            2, 12, "analyzer_started", slot_id=0, configuration_index=0
+        ).to_protocol_payload(),
+    ]
+    with pytest.raises(RuntimeError, match=r"slot 0.*11\.000 seconds"):
+        phase_worker(events, pipeline=True)
+
+
+@pytest.mark.parametrize("budget", ["wall", "swap"])
+def test_supervisor_checks_safety_before_exhausting_event_burst(
+    phase_worker, monkeypatch: pytest.MonkeyPatch, budget: str
+) -> None:
+    applied = 0
+    first_resource_check = None
+    original_observe = _AnalyzerTelemetryMonitor.observe_payload
+
+    def observe(self, payload):
+        nonlocal applied
+        original_observe(self, payload)
+        applied += 1
+
+    def metrics(_pid):
+        nonlocal first_resource_check
+        if first_resource_check is None:
+            first_resource_check = applied
+        return kicad_canary._TreeMetrics(0, int(budget == "swap"), 0, ())
+
+    monkeypatch.setattr(_AnalyzerTelemetryMonitor, "observe_payload", observe)
+    monkeypatch.setattr(kicad_canary, "_process_tree_metrics", metrics)
+    events = [
+        _pipeline_event(sequence, 1, "scheduling_state", unscheduled_count=0).to_protocol_payload()
+        for sequence in range(1, 1001)
+    ]
+    with pytest.raises(RuntimeError, match="wall time exceeded|swap"):
+        phase_worker(events, pipeline=True, wall_seconds=10 if budget == "wall" else 60)
+    assert first_resource_check is not None
+    assert first_resource_check < len(events)
+    assert applied == len(events)  # Preserve already queued evidence after failure.
 
 
 @pytest.mark.parametrize("stop", ["timeout", "interrupt", "worker_sigterm"])
@@ -738,6 +848,7 @@ def test_canary_child_wires_exact_analyzer_protocol_observer(
                 "analyzer_timeout_seconds": 1,
                 "analyzer_max_decoded_bytes": 536_870_912,
                 "analyzer_max_spool_bytes": 1_610_612_736,
+                "limits": {"no_progress_seconds": 10},
                 "embedding_dimensions": 1,
                 "queries": [],
                 "profile": "navigation",
@@ -752,6 +863,7 @@ def test_canary_child_wires_exact_analyzer_protocol_observer(
     assert payloads[1]["event"] == "error"
     assert observed["client"]["max_decoded_bytes"] == 536_870_912
     assert observed["ingestor"]["max_spool_bytes"] == 1_610_612_736
+    assert observed["ingestor"]["max_analyzer_idle_seconds"] == 10
 
 
 def test_canary_monitor_detects_hidden_idle_slot_from_child_protocol() -> None:
@@ -1415,7 +1527,6 @@ def test_checkpoint_rejects_unknown_remaining_work(
                 {"event": "phase", "name": "embeddings"},
             ]
         )
-    phase_events = len(events)
     # This checkpoint exercises unfinished work, not a premature success result.
     for event in events:
         event["monotonic_seconds"] = 0.0
@@ -1425,24 +1536,18 @@ def test_checkpoint_rejects_unknown_remaining_work(
         stdout = io.StringIO("".join(json.dumps(event) + "\n" for event in events))
         stderr = io.StringIO("")
 
+        def __init__(self):
+            clock.now = checkpoint
+
         def poll(self):
             return 0
 
         def wait(self, **_kwargs):
             return 0
 
-    samples = 0
-
-    def database_size(_path):
-        nonlocal samples
-        samples += 1
-        if samples >= phase_events:
-            clock.now = checkpoint
-        return 0
-
     monkeypatch.setattr(kicad_canary.time, "monotonic", clock)
     monkeypatch.setattr(kicad_canary.subprocess, "Popen", lambda *_args, **_kwargs: Process())
-    monkeypatch.setattr(kicad_canary, "_database_size", database_size)
+    monkeypatch.setattr(kicad_canary, "_database_size", lambda _path: 0)
     monkeypatch.setattr(kicad_canary, "_directory_size", lambda _path: 0)
     monkeypatch.setattr(
         kicad_canary, "_process_tree_metrics", lambda _pid: kicad_canary._TreeMetrics(0, 0, 0, ())

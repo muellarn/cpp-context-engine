@@ -12,6 +12,7 @@ from cpp_context_engine.ingestion import (
     AnalyzerSlotIdleGate,
     AnalyzerTelemetryError,
     NativeClangIngestor,
+    native,
 )
 from cpp_context_engine.ingestion.native import _FactBatchBuilder, _TelemetryDispatcher
 from cpp_context_engine.models import BuildConfiguration
@@ -231,8 +232,53 @@ def _live_telemetry_threads() -> list[threading.Thread]:
     ]
 
 
+@pytest.mark.parametrize("state", ["active", "open_idle", "closed_idle"])
+def test_producer_idle_gate_uses_current_state_while_observer_is_delayed(
+    monkeypatch, state: str
+) -> None:
+    clock = _Clock()
+    entered = threading.Event()
+    release = threading.Event()
+    delivered = []
+
+    def observe(event):
+        entered.set()
+        assert release.wait(timeout=2)
+        delivered.append(event)
+
+    monkeypatch.setattr(native.time, "monotonic", clock)
+    dispatcher = _TelemetryDispatcher(
+        observe,
+        slot_count=1,
+        total_configurations=1,
+        max_spool_registries=2,
+        max_idle_seconds=10,
+    )
+    try:
+        assert entered.wait(timeout=1)
+        if state == "active":
+            clock.now = 0.1
+            dispatcher.started(slot_id=0, configuration_index=0)
+        clock.now = 11
+        if state == "closed_idle":
+            dispatcher.started(slot_id=0, configuration_index=0)
+        failure = dispatcher.failure  # Same check as the live coordinator; observer is blocked.
+        if state == "active":
+            assert failure is None
+        else:
+            assert isinstance(failure, AnalyzerTelemetryError)
+            assert "idle for 11.000 seconds" in str(failure)
+    finally:
+        release.set()
+        dispatcher.close()
+    assert delivered
+    assert not _live_telemetry_threads()
+
+
+@pytest.mark.parametrize("idle_limit", [None, 10.0])
 def test_optional_observer_preserves_results_and_emits_balanced_sanitized_lifecycles(
     tmp_path: Path,
+    idle_limit: float | None,
 ) -> None:
     configurations = _configurations(tmp_path, 5)
     baseline = list(
@@ -253,6 +299,7 @@ def test_optional_observer_preserves_results_and_emits_balanced_sanitized_lifecy
             max_workers=2,
             max_spool_registries=3,
             observer=observe,
+            max_analyzer_idle_seconds=idle_limit,
         ).iter_configuration_batches(tmp_path, configurations)
     )
 
@@ -285,6 +332,48 @@ def test_optional_observer_preserves_results_and_emits_balanced_sanitized_lifecy
         assert conversion_finishes[index].outcome == "succeeded"
         assert conversion_starts[index].slot_id is conversion_finishes[index].slot_id is None
     assert not _live_telemetry_threads()
+
+
+def test_cancelled_dispatcher_does_not_create_idle_failure_during_shutdown(monkeypatch) -> None:
+    clock = _Clock()
+    cancelled = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def observe(_event):
+        entered.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(native.time, "monotonic", clock)
+    dispatcher = _TelemetryDispatcher(
+        observe,
+        slot_count=1,
+        total_configurations=2,
+        max_spool_registries=2,
+        max_idle_seconds=10,
+        cancelled=cancelled,
+    )
+    try:
+        assert entered.wait(timeout=1)
+        cancelled.set()
+        clock.now = 20
+        dispatcher.update_state(unscheduled_count=2, held_registries=0)
+        assert dispatcher.failure is None
+    finally:
+        release.set()
+        assert dispatcher.close() is None
+    assert not _live_telemetry_threads()
+
+
+def test_remote_idle_report_does_not_extrapolate_transport_time() -> None:
+    clock = _Clock()
+    gate = AnalyzerSlotIdleGate(max_idle_seconds=10, clock=clock)
+    gate.observe(_event(1, 1, "scheduling_state", slot_count=1))
+    gate.observe(_event(2, 2, "scheduling_state", slot_count=1))
+    clock.now = 20
+    assert gate.report(include_open_interval=False)[0]["maximum_idle_seconds"] == 1
+    with pytest.raises(AnalyzerSlotIdleError, match="19.000"):
+        gate.check()  # An authoritative local live check still uses the original clock.
 
 
 def test_conversion_failure_is_observed_and_registry_is_closed(tmp_path: Path, monkeypatch) -> None:

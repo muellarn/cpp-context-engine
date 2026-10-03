@@ -344,7 +344,8 @@ class _AnalyzerTelemetryMonitor:
     def success_report(self) -> dict[str, Any]:
         if self._event_count == 0:
             raise RuntimeError("analyzer pipeline telemetry is missing")
-        slots = self._gate.report()
+        # Producer transitions are authoritative; transport delay is not idle.
+        slots = self._gate.report(include_open_interval=False)
         if any(slot["state"] == "active" for slot in slots):
             raise RuntimeError("analyzer pipeline telemetry ended with an active slot")
         expected = set(range(self._expected_configurations))
@@ -1258,72 +1259,82 @@ def _run_supervised(
     try:
         while process.poll() is None or not (stdout_eof and stderr_eof):
             measurement_transition = False
-            try:
-                kind, line = messages.get(timeout=0.1)
-            except queue.Empty:
-                kind = line = ""
-            if kind == "stdout_eof":
-                stdout_eof = True
-            elif kind == "stderr_eof":
-                stderr_eof = True
-            elif kind == "stderr":
-                stderr_tail.append(line)
-                stderr_tail = stderr_tail[-100:]
-            elif kind == "stdout" and line:
+            completed_before = completed_tus
+            catchup_until = time.monotonic() + 0.05
+            # Apply a burst before costly resource scans/reporting, but bound
+            # catch-up so a continuous stream cannot starve safety checks.
+            for message_index in range(256):
                 try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    violation = "worker emitted non-JSON protocol output"
-                else:
-                    if isinstance(event, Mapping) and event.get("event") in {
-                        "phase",
-                        "tu_staged",
-                        "post_tu_operation",
-                        "result",
-                        "error",
-                    }:
-                        try:
-                            measurement_transition = measurements.observe(event, time.monotonic())
-                        except (KeyError, TypeError, ValueError) as error:
-                            violation = violation or f"invalid phase measurement: {error}"
-                    if not isinstance(event, Mapping):
-                        violation = "worker emitted a non-object protocol payload"
-                    elif event.get("event") == "analyzer_pipeline":
-                        try:
-                            if analyzer_telemetry is None:
-                                raise ValueError("validator emitted analyzer telemetry")
-                            analyzer_telemetry.observe_payload(event)
-                        except (RuntimeError, ValueError) as error:
-                            violation = f"invalid analyzer pipeline telemetry: {error}"
-                    elif event.get("event") in {"tu_staging", "tu_staged"}:
-                        try:
-                            if analyzer_telemetry is None:
-                                raise ValueError("validator emitted consumer telemetry")
-                            analyzer_telemetry.observe_consumer(event, time.monotonic())
-                        except (KeyError, TypeError, ValueError) as error:
-                            violation = violation or f"invalid consumer telemetry: {error}"
-                        if event["event"] == "tu_staged":
-                            completed_tus = int(event["completed"])
-                    elif event.get("event") == "result":
-                        worker_result = event["result"]
-                        if stage == "validation":
-                            phase = "complete"
-                    elif event.get("event") == "error":
-                        violation = str(event.get("message", "worker failed"))
-                    elif event.get("event") == "post_tu_operation":
-                        pass  # Validated and persisted by the existing phase measurements above.
-                    elif event.get("event") == "phase":
-                        if event.get("name") not in {
-                            "index",
-                            "embeddings",
-                            "producer_checks",
-                            "validation",
-                        }:
-                            violation = "worker emitted an unknown phase"
-                        else:
-                            phase = str(event["name"])
+                    kind, line = messages.get(timeout=0.1 if message_index == 0 else 0)
+                except queue.Empty:
+                    break
+                if kind == "stdout_eof":
+                    stdout_eof = True
+                elif kind == "stderr_eof":
+                    stderr_eof = True
+                elif kind == "stderr":
+                    stderr_tail.append(line)
+                    stderr_tail = stderr_tail[-100:]
+                elif kind == "stdout" and line:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        violation = "worker emitted non-JSON protocol output"
                     else:
-                        violation = "worker emitted an unknown protocol event"
+                        if isinstance(event, Mapping) and event.get("event") in {
+                            "phase",
+                            "tu_staged",
+                            "post_tu_operation",
+                            "result",
+                            "error",
+                        }:
+                            try:
+                                measurement_transition = (
+                                    measurements.observe(event, time.monotonic())
+                                    or measurement_transition
+                                )
+                            except (KeyError, TypeError, ValueError) as error:
+                                violation = violation or f"invalid phase measurement: {error}"
+                        if not isinstance(event, Mapping):
+                            violation = "worker emitted a non-object protocol payload"
+                        elif event.get("event") == "analyzer_pipeline":
+                            try:
+                                if analyzer_telemetry is None:
+                                    raise ValueError("validator emitted analyzer telemetry")
+                                analyzer_telemetry.observe_payload(event)
+                            except (RuntimeError, ValueError) as error:
+                                violation = f"invalid analyzer pipeline telemetry: {error}"
+                        elif event.get("event") in {"tu_staging", "tu_staged"}:
+                            try:
+                                if analyzer_telemetry is None:
+                                    raise ValueError("validator emitted consumer telemetry")
+                                analyzer_telemetry.observe_consumer(event, time.monotonic())
+                            except (KeyError, TypeError, ValueError) as error:
+                                violation = violation or f"invalid consumer telemetry: {error}"
+                            if event["event"] == "tu_staged":
+                                completed_tus = int(event["completed"])
+                        elif event.get("event") == "result":
+                            worker_result = event["result"]
+                            if stage == "validation":
+                                phase = "complete"
+                        elif event.get("event") == "error":
+                            violation = str(event.get("message", "worker failed"))
+                        elif event.get("event") == "post_tu_operation":
+                            pass  # Validated and persisted by the phase measurements above.
+                        elif event.get("event") == "phase":
+                            if event.get("name") not in {
+                                "index",
+                                "embeddings",
+                                "producer_checks",
+                                "validation",
+                            }:
+                                violation = "worker emitted an unknown phase"
+                            else:
+                                phase = str(event["name"])
+                        else:
+                            violation = "worker emitted an unknown protocol event"
+                if time.monotonic() >= catchup_until:
+                    break
             elapsed = time.monotonic() - stage_started
             total_elapsed = time.monotonic() - started
             tree = _process_tree_metrics(process.pid)
@@ -1355,13 +1366,8 @@ def _run_supervised(
                 violation = current
             if violation is None and total_elapsed > total_wall_seconds:
                 violation = "end-to-end gate deadline exceeded"
-            if violation is None and analyzer_telemetry is not None:
-                try:
-                    # Analyzer events are transition-based, so enforce open idle
-                    # intervals even while the child emits no protocol records.
-                    analyzer_telemetry.check()
-                except (RuntimeError, ValueError) as error:
-                    violation = f"analyzer slot idle gate failed: {error}"
+            # Open idle is checked at the producer under its state lock. Even
+            # an empty queue cannot prove that reader/pipe delivery is current.
             signature = (completed_tus, database_bytes, tree.cpu_ticks)
             if signature != last_signature:
                 last_signature = signature
@@ -1380,7 +1386,7 @@ def _run_supervised(
             if violation is None and full_project and total_elapsed >= 600 and phase != "complete":
                 # TU throughput cannot estimate still-unmeasured embeddings/verification.
                 violation = f"total projection unknown at decision checkpoint (phase {phase})"
-            if time.monotonic() - last_report >= 5 or kind == "stdout" and completed_tus:
+            if time.monotonic() - last_report >= 5 or completed_tus != completed_before:
                 rate = completed_tus / elapsed if elapsed > 0 else 0.0
                 eta = (
                     (total_tus - completed_tus) / rate
@@ -1755,6 +1761,7 @@ def _run_worker(spec_path: Path) -> int:
             max_spool_bytes=int(spec["analyzer_max_spool_bytes"]),
             profile=profile,
             observer=_worker_analyzer_event,
+            max_analyzer_idle_seconds=float(spec["limits"]["no_progress_seconds"]),
         )
         generated_source_roots = tuple(
             Path(path) for path in spec.get("generated_source_roots", ())
