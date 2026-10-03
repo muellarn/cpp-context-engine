@@ -119,6 +119,10 @@ DEFAULT_MAX_STDERR_BYTES = 256 * 1024
 GZIP_TRANSPORT = "gzip_jsonl_v1"
 PROFILE_CAPABILITY = "analysis_profiles_v1"
 GENERATED_SOURCE_ROOTS_CAPABILITY = "generated_source_roots_v1"
+SYMBOL_TEXT_CHUNKS_CAPABILITY = "symbol_text_chunks_v1"
+_SYMBOL_TEXT_CHUNK_KIND = "symbol_text_chunk_v1"
+_SYMBOL_TEXT_FIELDS = ("signature", "documentation", "source_text")
+_SYMBOL_TEXT_CHUNK_BYTES = 64 * 1024
 MAX_FACT_KINDS = 64
 _FRAME_HEADER = struct.Struct(">I")
 _WIRE_FACT_KEYS = {
@@ -166,6 +170,102 @@ class AnalyzerProtocolError(RuntimeError):
 
 class AnalyzerLimitError(RuntimeError):
     """Raised when the companion exceeds an operator-owned resource bound."""
+
+
+class _SymbolTextChunks:
+    """Validate one contiguous symbol's fragments without trusting declared sizes."""
+
+    def __init__(self, *, assemble: bool) -> None:
+        self._assemble = assemble
+        self._symbol: dict[str, Any] | None = None
+        self._descriptions: dict[str, Any] = {}
+        self._fields: list[str] = []
+        self._parts: list[str] = []
+        self._index = self._received = 0
+        self._digest = hashlib.sha256()
+
+    @property
+    def pending(self) -> bool:
+        return self._symbol is not None
+
+    def accept(self, record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        if record.get("fact") == _SYMBOL_TEXT_CHUNK_KIND:
+            if self._symbol is None:
+                raise AnalyzerProtocolError("analyzer emitted an unused symbol text chunk")
+            field = self._fields[0]
+            text = record.get("text")
+            if (
+                set(record) != {"type", "fact", "key", "field", "index", "text"}
+                or record.get("type") != "fact"
+                or record.get("key") != self._symbol["key"]
+                or record.get("field") != field
+                or type(record.get("index")) is not int
+                or record["index"] != self._index
+                or not isinstance(text, str)
+            ):
+                raise AnalyzerProtocolError("analyzer symbol text chunk is out of order or invalid")
+            try:
+                encoded = text.encode("utf-8")
+            except UnicodeError as error:
+                raise AnalyzerProtocolError("analyzer symbol text chunk is not UTF-8") from error
+            description = self._descriptions[field]
+            self._received += len(encoded)
+            if not 0 < len(encoded) <= _SYMBOL_TEXT_CHUNK_BYTES or (
+                self._received > description["bytes"]
+            ):
+                raise AnalyzerProtocolError("analyzer symbol text chunk has an invalid length")
+            self._digest.update(encoded)
+            self._index += 1
+            if self._assemble:
+                self._parts.append(text)
+            if self._received == description["bytes"]:
+                if self._digest.hexdigest() != description["sha256"]:
+                    raise AnalyzerProtocolError("analyzer symbol text digest is inconsistent")
+                if self._assemble:
+                    self._symbol[field] = "".join(self._parts)
+                self._parts.clear()
+                self._fields.pop(0)
+                self._index = self._received = 0
+                self._digest = hashlib.sha256()
+                if not self._fields:
+                    result, self._symbol = self._symbol, None
+                    self._descriptions = {}
+                    return result
+            return None
+        self.finish()
+        if "text_chunks" not in record:
+            return record
+        descriptions = record["text_chunks"]
+        if (
+            record.get("fact") != "symbol"
+            or not isinstance(record.get("key"), str)
+            or not record["key"]
+            or not isinstance(descriptions, dict)
+            or not descriptions
+            or not set(descriptions) <= set(_SYMBOL_TEXT_FIELDS)
+        ):
+            raise AnalyzerProtocolError("analyzer symbol text descriptor is invalid")
+        for field, description in descriptions.items():
+            if (
+                field in record
+                or not isinstance(description, dict)
+                or set(description) != {"bytes", "sha256"}
+                or type(description["bytes"]) is not int
+                or description["bytes"] <= 0
+                or not isinstance(description["sha256"], str)
+                or len(description["sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in description["sha256"])
+            ):
+                raise AnalyzerProtocolError("analyzer symbol text descriptor is invalid")
+        self._symbol = dict(record)
+        self._symbol.pop("text_chunks")
+        self._descriptions = descriptions
+        self._fields = [field for field in _SYMBOL_TEXT_FIELDS if field in descriptions]
+        return None
+
+    def finish(self) -> None:
+        if self.pending:
+            raise AnalyzerProtocolError("analyzer symbol text chunks are incomplete")
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,6 +655,36 @@ class NativeAnalyzerClient:
     ) -> None:
         """Validate one response while forwarding facts without retaining raw output."""
 
+        self._analyze_stream(project_root, configuration, on_fact, cancelled=cancelled)
+
+    def _analyze_registry(
+        self,
+        project_root: Path,
+        configuration: BuildConfiguration,
+        registry: _FactRegistry,
+        *,
+        cancelled: threading.Event,
+    ) -> None:
+        # Reassembly belongs to the Builder: never write an oversized logical
+        # symbol back through the independently bounded registry record format.
+        self._analyze_stream(
+            project_root,
+            configuration,
+            registry.add,
+            cancelled=cancelled,
+            preserve_symbol_chunks=True,
+        )
+
+    def _analyze_stream(
+        self,
+        project_root: Path,
+        configuration: BuildConfiguration,
+        on_fact: Callable[[Mapping[str, Any]], None],
+        *,
+        cancelled: threading.Event | None = None,
+        preserve_symbol_chunks: bool = False,
+    ) -> None:
+
         boundary = SourceBoundary(project_root, configuration.generated_source_roots)
         try:
             source_path = boundary.canonical_file(configuration.source_path)
@@ -592,6 +722,8 @@ class NativeAnalyzerClient:
         if self.profile is IndexProfile.NAVIGATION:
             request["profile"] = self.profile.value
         state = "hello"
+        chunks_negotiated = SYMBOL_TEXT_CHUNKS_CAPABILITY in info.capabilities
+        chunks = _SymbolTextChunks(assemble=not preserve_symbol_chunks)
 
         def accept(record: dict[str, Any]) -> None:
             nonlocal state
@@ -611,16 +743,28 @@ class NativeAnalyzerClient:
             if state != "facts":
                 raise AnalyzerProtocolError("analyzer emitted records after completion")
             if record_type == "fact":
-                on_fact(record)
+                if not chunks_negotiated and (
+                    record.get("fact") == _SYMBOL_TEXT_CHUNK_KIND or "text_chunks" in record
+                ):
+                    raise AnalyzerProtocolError("analyzer emitted unnegotiated symbol text chunks")
+                logical = chunks.accept(record)
+                if preserve_symbol_chunks:
+                    on_fact(record)
+                elif logical is not None:
+                    on_fact(logical)
                 return
             if record_type != "complete" or record.get("request_id") != unit_id:
                 raise AnalyzerProtocolError("analyzer emitted a non-fact record during analysis")
             if record.get("success") is not True:
                 raise AnalyzerProtocolError("analyzer did not complete successfully")
+            chunks.finish()
             state = "complete"
 
         self._invoke(
-            (self._hello(response_transport=transport), request),
+            (
+                self._hello(response_transport=transport, symbol_text_chunks=chunks_negotiated),
+                request,
+            ),
             output_limit=self.max_output_bytes,
             transport=transport,
             on_record=accept,
@@ -630,7 +774,11 @@ class NativeAnalyzerClient:
             raise AnalyzerProtocolError("analyzer response is incomplete")
 
     @staticmethod
-    def _hello(*, response_transport: str | None = None) -> dict[str, Any]:
+    def _hello(
+        *,
+        response_transport: str | None = None,
+        symbol_text_chunks: bool = False,
+    ) -> dict[str, Any]:
         hello: dict[str, Any] = {
             "type": "hello",
             "protocol": PROTOCOL,
@@ -640,6 +788,8 @@ class NativeAnalyzerClient:
         }
         if response_transport == GZIP_TRANSPORT:
             hello["response_transport"] = GZIP_TRANSPORT
+        if symbol_text_chunks:
+            hello["required_capabilities"].append(SYMBOL_TEXT_CHUNKS_CAPABILITY)
         return hello
 
     def _invoke(
@@ -1141,8 +1291,11 @@ class NativeClangIngestor:
                 cancelled=cancelled,
             )
             analyze_stream = getattr(self.client, "analyze_stream", None)
+            analyze_registry = getattr(self.client, "_analyze_registry", None)
             try:
-                if analyze_stream is None:
+                if analyze_registry is not None:
+                    analyze_registry(root, configuration, facts, cancelled=cancelled)
+                elif analyze_stream is None:
                     for fact in self.client.analyze(root, configuration):
                         facts.add(fact)
                 else:
@@ -1622,9 +1775,21 @@ class _FactBatchBuilder:
         for fact in self._facts(facts, "file"):
             self._check()
             self._file_fact(fact)
+        fragments = iter(_fact_records(facts, _SYMBOL_TEXT_CHUNK_KIND))
+        chunks = _SymbolTextChunks(assemble=True)
         for fact in self._facts(facts, "symbol"):
             self._check()
-            self._symbol_fact(fact)
+            logical = chunks.accept(fact)
+            while chunks.pending:
+                self._check()
+                fragment = next(fragments, None)
+                if fragment is None:
+                    chunks.finish()
+                logical = chunks.accept(fragment)
+            assert logical is not None
+            self._symbol_fact(logical)
+        if next(fragments, None) is not None:
+            raise AnalyzerProtocolError("analyzer emitted unused symbol text chunks")
         for fact in self._facts(facts, "include"):
             if isinstance(fact.get("resolved_path"), str):
                 path = self._path(fact["resolved_path"])

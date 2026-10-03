@@ -269,6 +269,29 @@ severity, exact location, diagnostic text, and warning option when available.
 
 ## Persisted facts
 
+The optional protocol-v5 `symbol_text_chunks_v1` capability preserves large symbol
+text without enlarging the record limit. The client confirms it explicitly in the
+analysis handshake. Otherwise the companion retains its original single-record
+format; upgraded clients also accept older companions. There is no signature,
+source-text, model, schema or MCP change.
+
+When negotiated, symbol `signature`, `documentation` and `source_text` fields
+larger than 64 KiB of UTF-8 are replaced by a `text_chunks` descriptor containing
+each field's byte length and SHA-256. Immediately following `symbol_text_chunk_v1`
+facts contain the same symbol key, field name, zero-based index and UTF-8 `text`
+of at most 64 KiB. Fields follow signature/documentation/source order. Fragments
+cannot interleave with another symbol or fact; missing, duplicated, reordered,
+unreferenced or inconsistent data fails the entire analysis. Length declarations
+do not allocate buffers. JSON escaping, fragment headers and all text still count
+toward the unchanged wire/decoded budgets, and each registry frame remains bounded
+and charged to the shared spool budget. Oversized non-text records still fail.
+
+The indexing path spools validated physical fragments separately and reconstructs
+one logical symbol only in the batch builder. Public native-client callbacks and
+`analyze()` results retain the original complete logical facts and their order.
+No reassembled large symbol is written back into a registry frame. Normal binary
+producer hashing invalidates results produced by the previous companion.
+
 Semantic records cover files, functions, methods, classes, structs, enums,
 namespaces, variables, aliases, and macros. Each symbol has a stable USR-derived
 ID where Clang supplies a USR, an exact source range, source text/hash,
