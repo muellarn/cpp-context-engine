@@ -835,35 +835,55 @@ def test_canary_child_wires_exact_analyzer_protocol_observer(
 
     monkeypatch.setattr(kicad_canary, "NativeAnalyzerClient", Client)
     monkeypatch.setattr(kicad_canary, "NativeClangIngestor", ingestor)
-    spec = tmp_path / "worker.json"
-    spec.write_text(
-        json.dumps(
-            {
-                "project_root": str(tmp_path),
-                "compilation_database": str(tmp_path / "compile_commands.json"),
-                "database": str(tmp_path / "index.db"),
-                "analyzer": str(tmp_path / "analyzer"),
-                "translation_units": 1,
-                "workers": 1,
-                "analyzer_timeout_seconds": 1,
-                "analyzer_max_decoded_bytes": 536_870_912,
-                "analyzer_max_spool_bytes": 1_610_612_736,
-                "limits": {"no_progress_seconds": 10},
-                "embedding_dimensions": 1,
-                "queries": [],
-                "profile": "navigation",
-            }
-        ),
-        encoding="utf-8",
+    monkeypatch.setattr(kicad_canary, "_git_revision", lambda _path: "revision")
+    source = tmp_path / "main.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    cdb = tmp_path / "compile_commands.json"
+    _write_cdb(
+        cdb,
+        [{"directory": str(tmp_path), "file": str(source), "arguments": ["c++", str(source)]}],
     )
+    analyzer = tmp_path / "analyzer"
+    analyzer.write_text("#!/bin/sh\n", encoding="utf-8")
+    analyzer.chmod(0o755)
 
-    assert kicad_canary._run_worker(spec) == 2
-    payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    def supervised(spec_path, _directory, limits, _total):
+        # Exercise the actual serialized producer→worker boundary, without indexing.
+        observed["spec"] = json.loads(spec_path.read_text(encoding="utf-8"))
+        observed["supervisor_idle_limit"] = limits.no_progress_seconds
+        assert kicad_canary._run_worker(spec_path) == 2
+        payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        observed["payloads"] = payloads
+        raise RuntimeError(payloads[-1]["message"])
+
+    monkeypatch.setattr(kicad_canary, "_run_supervised", supervised)
+    with pytest.raises(RuntimeError, match="stop after observer wiring"):
+        kicad_canary.run_canary(
+            project_root=tmp_path,
+            compilation_database=cdb,
+            analyzer=analyzer,
+            output_directory=tmp_path / "output",
+            gates=(1,),
+            gate_timeouts={"1": 30},
+            workers=1,
+            analyzer_timeout_seconds=1,
+            analyzer_max_decoded_bytes=536_870_912,
+            analyzer_max_spool_bytes=1_610_612_736,
+            embedding_dimensions=1,
+            queries=(),
+            rss_bytes=1,
+            database_bytes=1,
+            disk_bytes=1,
+            no_progress_seconds=3.25,
+        )
+    payloads = observed["payloads"]
     assert payloads[0] == event.to_protocol_payload()
     assert payloads[1]["event"] == "error"
+    assert observed["spec"]["no_progress_seconds"] == 3.25
+    assert observed["supervisor_idle_limit"] == 3.25
     assert observed["client"]["max_decoded_bytes"] == 536_870_912
     assert observed["ingestor"]["max_spool_bytes"] == 1_610_612_736
-    assert observed["ingestor"]["max_analyzer_idle_seconds"] == 10
+    assert observed["ingestor"]["max_analyzer_idle_seconds"] == 3.25
 
 
 def test_canary_monitor_detects_hidden_idle_slot_from_child_protocol() -> None:
