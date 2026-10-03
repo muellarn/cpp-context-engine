@@ -227,10 +227,11 @@ class AnalyzerSlotIdleGate:
 
         self._measure_idle(self._clock())
 
-    def report(self) -> list[dict[str, Any]]:
+    def report(self, *, include_open_interval: bool = True) -> list[dict[str, Any]]:
         """Return deterministic slot order with measured duration and current cause/state."""
 
-        self._measure_idle(self._clock(), enforce=False)
+        if include_open_interval:
+            self._measure_idle(self._clock(), enforce=False)
         if self._slots is None:
             return []
         eligible = self._idle_is_actionable()

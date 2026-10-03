@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import marshal
+import math
 import os
 import queue
 import signal
@@ -35,6 +36,8 @@ from cpp_context_engine.ingestion.telemetry import (
     AnalyzerOutcome,
     AnalyzerPipelineEvent,
     AnalyzerPipelineObserver,
+    AnalyzerSlotIdleError,
+    AnalyzerSlotIdleGate,
     AnalyzerTelemetryError,
 )
 from cpp_context_engine.models import (
@@ -831,6 +834,8 @@ class _TelemetryDispatcher:
         slot_count: int,
         total_configurations: int,
         max_spool_registries: int,
+        max_idle_seconds: float | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         self._observer = observer
         self._slot_count = slot_count
@@ -840,6 +845,12 @@ class _TelemetryDispatcher:
         self._sequence = 0
         self._last_time = 0.0
         self._failure: AnalyzerTelemetryError | None = None
+        self._idle_gate = (
+            AnalyzerSlotIdleGate(max_idle_seconds=max_idle_seconds, clock=lambda: time.monotonic())
+            if max_idle_seconds is not None
+            else None
+        )
+        self._cancelled = cancelled
         self._lock = threading.Lock()
         self._stop_requested = threading.Event()
         self._events: queue.Queue[AnalyzerPipelineEvent] = queue.Queue(
@@ -859,7 +870,23 @@ class _TelemetryDispatcher:
     @property
     def failure(self) -> AnalyzerTelemetryError | None:
         with self._lock:
+            # The coordinator also checks here while an observer is blocked.
+            # Only this locked producer state is current enough for live idle.
+            if self._failure is None and self._idle_checks_enabled():
+                try:
+                    self._idle_gate.check()
+                except AnalyzerSlotIdleError as error:
+                    self._failure = AnalyzerTelemetryError(
+                        f"analyzer slot idle gate failed: {error}"
+                    )
             return self._failure
+
+    def _idle_checks_enabled(self) -> bool:
+        return (
+            self._idle_gate is not None
+            and not self._stop_requested.is_set()
+            and not (self._cancelled is not None and self._cancelled.is_set())
+        )
 
     def update_state(self, *, unscheduled_count: int, held_registries: int) -> None:
         with self._lock:
@@ -944,6 +971,12 @@ class _TelemetryDispatcher:
             max_spool_registries=self._max_spool_registries,
             slot_count=self._slot_count,
         )
+        if self._idle_checks_enabled():
+            try:
+                self._idle_gate.observe(event)
+            except AnalyzerSlotIdleError as error:
+                self._failure = AnalyzerTelemetryError(f"analyzer slot idle gate failed: {error}")
+                return
         try:
             self._events.put_nowait(event)
         except queue.Full:
@@ -958,6 +991,7 @@ class _TelemetryDispatcher:
             try:
                 event = self._events.get(timeout=0.05)
             except queue.Empty:
+                _ = self.failure  # Check open idle even without a subsequent event.
                 continue
             if self.failure is not None:
                 continue
@@ -965,9 +999,10 @@ class _TelemetryDispatcher:
                 self._observer(event)
             except BaseException as error:
                 with self._lock:
-                    self._failure = AnalyzerTelemetryError(
-                        f"analyzer telemetry observer failed: {type(error).__name__}: {error}"
-                    )
+                    if self._failure is None:
+                        self._failure = AnalyzerTelemetryError(
+                            f"analyzer telemetry observer failed: {type(error).__name__}: {error}"
+                        )
 
 
 class NativeClangIngestor:
@@ -984,6 +1019,7 @@ class NativeClangIngestor:
         max_domain_batches: int = 2,
         profile: IndexProfile = IndexProfile.FULL,
         observer: AnalyzerPipelineObserver | None = None,
+        max_analyzer_idle_seconds: float | None = None,
     ) -> None:
         registry_limit = max_workers * 2 if max_spool_registries is None else max_spool_registries
         decoded_limit = int(getattr(client, "max_decoded_bytes", DEFAULT_MAX_DECODED_BYTES))
@@ -1004,6 +1040,12 @@ class NativeClangIngestor:
             raise ValueError("native analyzer pipeline limits must be positive")
         if registry_limit < max_workers:
             raise ValueError("registry bound must cover every analyzer worker")
+        if max_analyzer_idle_seconds is not None and (
+            observer is None
+            or not math.isfinite(max_analyzer_idle_seconds)
+            or max_analyzer_idle_seconds <= 0
+        ):
+            raise ValueError("analyzer idle gate requires an observer and a positive finite limit")
         selected_profile = IndexProfile(profile)
         client_profile = IndexProfile(getattr(client, "profile", selected_profile))
         if client_profile is not selected_profile:
@@ -1017,6 +1059,7 @@ class NativeClangIngestor:
         self.profile = selected_profile
         self.advanced_facts_complete = self.profile is IndexProfile.FULL
         self.observer = observer
+        self.max_analyzer_idle_seconds = max_analyzer_idle_seconds
 
     analysis_backend = "clang-libtooling"
 
@@ -1082,6 +1125,8 @@ class NativeClangIngestor:
                 slot_count=worker_count,
                 total_configurations=len(selected),
                 max_spool_registries=self.max_spool_registries,
+                max_idle_seconds=self.max_analyzer_idle_seconds,
+                cancelled=cancelled,
             )
             if self.observer is not None
             else None
