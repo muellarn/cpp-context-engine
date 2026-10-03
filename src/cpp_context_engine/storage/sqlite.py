@@ -4693,13 +4693,14 @@ class SQLiteStore:
             if check_cancelled is not None:
                 check_cancelled()
             placeholders = ",".join("?" for _ in frontier)
+            # DISTINCT must not make a project-wide owner scan replace target lookups.
             callers = {
                 row[0]
                 for row in self._connection.execute(
                     f"""
                     SELECT DISTINCT sites.owner_symbol_id
                     FROM call_targets targets
-                    JOIN callsites sites
+                    CROSS JOIN callsites sites
                       ON sites.project_id = targets.project_id
                      AND sites.id = targets.callsite_id
                     WHERE targets.project_id = ? AND targets.build_variant = ?
@@ -5258,6 +5259,8 @@ class SQLiteStore:
         )
         # Override edges can live in a different TU from an unchanged callsite, so deriving
         # candidates only from the current ingestion batch loses targets after incremental edits.
+        # Keep each known target outside its lookup join. Without CROSS JOIN, a fresh
+        # database can choose project-wide scans despite the target lookup indexes.
         rows = self._connection.execute(
             """
             WITH RECURSIVE override_closure(base_id, target_id) AS (
@@ -5266,7 +5269,7 @@ class SQLiteStore:
                 UNION
                 SELECT closure.base_id, edges.source_id
                 FROM override_closure AS closure
-                JOIN edges
+                CROSS JOIN edges
                   ON edges.project_id = ?
                  AND edges.build_variant = ?
                  AND edges.relation = 'overrides'
@@ -5275,8 +5278,8 @@ class SQLiteStore:
             SELECT sites.id AS callsite_id, closure.target_id,
                    sites.expansion_span_json, sites.translation_unit_id,
                    sites.build_configuration_id, sites.build_variant
-            FROM callsites AS sites
-            JOIN override_closure AS closure
+            FROM override_closure AS closure
+            CROSS JOIN callsites AS sites
               ON closure.base_id = sites.static_target_symbol_id
             WHERE sites.project_id = ? AND sites.build_variant = ?
               AND sites.dispatch_kind = 'virtual'
