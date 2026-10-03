@@ -415,6 +415,16 @@ def _hash_bytes(value: bytes) -> str:
 
 
 def _hash_text(*values: str) -> str:
+    # Composite IDs need one NUL per field. Join only small tuples (at most
+    # 16 KiB encoded); single values and large source text keep streaming.
+    if 1 < len(values) <= 4096 and sum(map(len, values)) + len(values) <= 4096:
+        try:
+            payload = ("\0".join(values) + "\0").encode("utf-8", errors="surrogateescape")
+        except UnicodeEncodeError:
+            # Preserve the original field-local encoding error and its offsets.
+            pass
+        else:
+            return hashlib.sha256(payload).hexdigest()
     digest = hashlib.sha256()
     for value in values:
         digest.update(value.encode("utf-8", errors="surrogateescape"))
