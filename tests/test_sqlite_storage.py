@@ -1414,6 +1414,127 @@ def test_embedding_batch_validates_atomically(tmp_path: Path) -> None:
         assert store.embedding_count("fixture") == 2
 
 
+def test_embedding_dimension_validation_has_bounded_index_work(tmp_path: Path) -> None:
+    with SQLiteStore(Path(":memory:"), project_root=tmp_path) as store:
+        project = store._ensure_project(str(tmp_path))  # noqa: SLF001
+        connection = store._connection  # noqa: SLF001
+        work: list[int] = []
+        statements: list[str] = []
+        for count in (256, 1024):
+            connection.execute("DELETE FROM embedding_vectors")
+            connection.executemany(
+                "INSERT INTO embedding_vectors VALUES (?, 'fixture', 'config', 2, ?, ?, 2, ?, ?)",
+                (
+                    (
+                        project,
+                        str(index),
+                        str(index),
+                        VECTOR_ENCODING_RAW_F64LE_V1,
+                        struct.pack("<2d", 1.0, 1.0),
+                    )
+                    for index in range(count)
+                ),
+            )
+            steps = 0
+
+            def count_step() -> int:
+                nonlocal steps
+                steps += 1
+                return 0
+
+            statements.clear()
+            connection.set_trace_callback(statements.append)
+            connection.set_progress_handler(count_step, 1)
+            try:
+                assert store._embedding_configuration_dimensions(  # noqa: SLF001
+                    project, "fixture", "config"
+                ) == {2}
+            finally:
+                connection.set_progress_handler(None, 0)
+                connection.set_trace_callback(None)
+            work.append(steps)
+        print(f"dimension validation VM steps: {work}")
+        assert max(work) < 200
+        assert work[1] <= work[0] + 32
+        plans = [
+            row[3]
+            for statement in statements
+            for row in connection.execute("EXPLAIN QUERY PLAN " + statement)
+        ]
+        assert all("project_id=? AND model=? AND configuration_id=?" in plan for plan in plans)
+        assert any("dimensions>?" in plan for plan in plans)
+
+
+@pytest.mark.parametrize("dimensions", [(), (2,), (2, 3), (2, 3, 4)])
+def test_embedding_dimension_states_preserve_both_callers_and_isolation(
+    tmp_path: Path, dimensions: tuple[int, ...]
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(Path(":memory:"), project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        project = store._project_id(root)  # noqa: SLF001
+        other = store._ensure_project(str(root / "other"))  # noqa: SLF001
+        connection = store._connection  # noqa: SLF001
+        for owner, model, configuration, selected in (
+            (project, "fixture", "config", dimensions),
+            (other, "fixture", "config", (5, 6)),
+            (project, "other-model", "config", (7, 8)),
+            (project, "fixture", "other-config", (9, 10)),
+        ):
+            for dimension in selected:
+                connection.execute(
+                    "INSERT INTO embedding_vectors VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        owner,
+                        model,
+                        configuration,
+                        dimension,
+                        sqlite_storage._embedding_content_hash("shared"),  # noqa: SLF001
+                        "shared",
+                        math.sqrt(dimension),
+                        VECTOR_ENCODING_RAW_F64LE_V1,
+                        struct.pack(f"<{dimension}d", *([1.0] * dimension)),
+                    ),
+                )
+        connection.commit()
+        variants = store.missing_embedding_variant_ids("fixture", configuration_id="config")
+        state = store._embedding_configuration_dimensions(project, "fixture", "config")  # noqa: SLF001
+        assert state == set(dimensions[:2])
+        if len(dimensions) > 1:
+            for operation in ("attach", "put"):
+                with (
+                    pytest.raises(RuntimeError, match="mixed dimensions"),
+                    store.embedding_write_session(root),
+                ):
+                    if operation == "attach":
+                        store.attach_existing_embeddings(
+                            ((variants[0], "shared"),), "fixture", configuration_id="config"
+                        )
+                    else:
+                        store.put_content_embeddings(
+                            ((variants[1], "new", (1.0, 1.0)),),
+                            "fixture",
+                            configuration_id="config",
+                        )
+                assert store.embedding_count("fixture", configuration_id="config") == 0
+        else:
+            with store.embedding_write_session(root):
+                missing = store.attach_existing_embeddings(
+                    ((variants[0], "shared"),), "fixture", configuration_id="config"
+                )
+                assert missing == (() if dimensions else ((variants[0], "shared"),))
+                store.put_content_embeddings(
+                    (
+                        (variant, text, (1.0, 1.0))
+                        for variant, text in (*missing, (variants[1], "new"))
+                    ),
+                    "fixture",
+                    configuration_id="config",
+                )
+            assert store.embedding_count("fixture", configuration_id="config") == 2
+
+
 def test_vector_index_shares_equal_text_and_processes_bounded_batches(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
