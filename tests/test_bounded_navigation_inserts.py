@@ -30,7 +30,10 @@ class _ExecutemanyStore(SQLiteStore):
         self._connection.executemany(sql.format(values=values), rows)
 
 
-def test_navigation_occurrences_use_bounded_multirow_statements(tmp_path: Path) -> None:
+@pytest.mark.parametrize("variable_limit", [None, 999])
+def test_navigation_occurrences_use_bounded_multirow_statements(
+    tmp_path: Path, variable_limit: int | None
+) -> None:
     batch = _batch(tmp_path)
     batch = replace(
         batch,
@@ -40,6 +43,12 @@ def test_navigation_occurrences_use_bounded_multirow_statements(tmp_path: Path) 
         occurrences=tuple(replace(batch.occurrences[0], id=f"occ-{i}") for i in range(1025)),
     )
     with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
+        if variable_limit is not None:
+            store._connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+        # Occurrence INSERTs bind 14 columns; low compiled SQLite limits still apply.
+        chunk_rows = max(
+            1, min(512, store._connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // 14)
+        )
         statements: list[str] = []
         store._connection.set_trace_callback(statements.append)
         try:
@@ -51,7 +60,11 @@ def test_navigation_occurrences_use_bounded_multirow_statements(tmp_path: Path) 
             for sql in statements
             if sql.lstrip().startswith("INSERT OR REPLACE INTO occurrences(")
         ]
-        assert len(inserts) == 3, f"expected 512/512/1 row batches, got {len(inserts)} statements"
+        expected_statements = (1025 + chunk_rows - 1) // chunk_rows
+        assert len(inserts) == expected_statements, (
+            f"expected {expected_statements} INSERTs with at most {chunk_rows} rows, "
+            f"got {len(inserts)} statements"
+        )
         assert store._connection.execute("SELECT count(*) FROM occurrences").fetchone()[0] == 1025
 
 
@@ -132,29 +145,36 @@ def test_batched_ingestion_matches_unbatched_rows_and_public_results(
 
 
 @pytest.mark.parametrize("failure", ["generator", "sql"])
+@pytest.mark.parametrize("variable_limit", [None, 999])
 def test_ingestion_failure_after_written_chunk_rolls_back_generation(
-    tmp_path: Path, failure: str
+    tmp_path: Path, failure: str, variable_limit: int | None
 ) -> None:
     batch = _batch(tmp_path)
     with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
         store.apply_ingestion(tmp_path, batch)
         before = _semantic_dump(store)
+        if variable_limit is not None:
+            store._connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+        chunk_rows = max(
+            1, min(512, store._connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // 14)
+        )
+        failure_index = chunk_rows + 1
         if failure == "sql":
-            store._connection.execute("""
+            store._connection.execute(f"""
                 CREATE TEMP TRIGGER fail_late_occurrence BEFORE INSERT ON occurrences
-                WHEN NEW.id = 'new-513' BEGIN SELECT RAISE(ABORT, 'late insert'); END
+                WHEN NEW.id = 'new-{failure_index}' BEGIN SELECT RAISE(ABORT, 'late insert'); END
             """)
         first_chunk_written = False
 
         def occurrences():
             nonlocal first_chunk_written
-            for i in range(1025):
-                if i == 513:
+            for i in range(2 * chunk_rows + 1):
+                if i == failure_index:
                     first_chunk_written = (
                         store._connection.execute(
                             "SELECT count(*) FROM occurrences WHERE id LIKE 'new-%'"
                         ).fetchone()[0]
-                        == 512
+                        == chunk_rows
                     )
                     if failure == "generator":
                         raise RuntimeError("late generator")
