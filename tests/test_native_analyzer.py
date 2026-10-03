@@ -257,6 +257,87 @@ def test_native_analyzer_indexes_explicit_out_of_tree_generated_translation_unit
 
 
 @pytest.fixture
+def completed_symbol_project(tmp_path: Path) -> tuple[Path, BuildConfiguration]:
+    project = tmp_path / "completed-symbols"
+    project.mkdir()
+    source = project / "probe.cpp"
+    source.write_text(
+        "namespace sample {\n"
+        "int target(int value);\n"
+        "#define AGAIN(value) target(value)\n"
+        "template<class T> T identity(T value) { return value; }\n"
+        "int first() { return AGAIN(1) + target(2) + identity<int>(3); }\n"
+        "int second() { return AGAIN(4) + target(5) + identity<long>(6); }\n"
+        "int target(int value) { return value + 1; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    return project, BuildConfiguration(
+        id="completed-symbols",
+        source_path=source,
+        directory=project,
+        arguments=("clang++", "-std=c++17", str(source)),
+        command_hash="completed-symbols",
+    )
+
+
+@pytest.mark.parametrize("profile", [IndexProfile.FULL, IndexProfile.NAVIGATION])
+def test_completed_symbol_emission_preserves_redeclarations_and_call_owners(
+    completed_symbol_project: tuple[Path, BuildConfiguration], profile: IndexProfile
+) -> None:
+    project, configuration = completed_symbol_project
+    facts = fresh_native_client(analyzer_binary(), timeout_seconds=5, profile=profile).analyze(
+        project, configuration
+    )
+    symbols = [fact for fact in facts if fact["fact"] == "symbol"]
+    target_symbols = [fact for fact in symbols if fact["qualified_name"] == "sample::target"]
+    assert [fact["metadata"]["is_definition"] for fact in target_symbols] == [False, True]
+    assert [fact["span"]["start_line"] for fact in target_symbols] == [2, 7]
+    target_key = target_symbols[0]["key"]
+    assert {fact["key"] for fact in target_symbols} == {target_key}
+    declarations = [
+        fact
+        for fact in facts
+        if fact["fact"] == "occurrence"
+        and fact["symbol_key"] == target_key
+        and fact["kind"] in {"declaration", "definition"}
+    ]
+    assert [(fact["kind"], fact["span"]["start_line"]) for fact in declarations] == [
+        ("declaration", 2),
+        ("definition", 7),
+    ]
+    owners = {
+        fact["qualified_name"]: fact["key"]
+        for fact in symbols
+        if fact["qualified_name"] in {"sample::first", "sample::second"}
+    }
+    assert set(owners) == {"sample::first", "sample::second"}
+    sites = [fact for fact in facts if fact["fact"] == "callsite_v1"]
+    assert Counter(fact["owner_key"] for fact in sites) == Counter(
+        {key: 3 for key in owners.values()}
+    )
+    macro_sites = [fact for fact in sites if fact["expansion_stack"]]
+    assert len(macro_sites) == 2
+    assert {fact["owner_key"] for fact in macro_sites} == set(owners.values())
+    instantiated = [
+        fact
+        for fact in symbols
+        if fact["qualified_name"] == "sample::identity"
+        and fact["metadata"].get("template_kind") == "implicit_instantiation"
+    ]
+    assert len({fact["key"] for fact in instantiated}) == 2
+    target_edges = [
+        fact
+        for fact in facts
+        if fact["fact"] == "call_target_v1" and fact["target_key"] == target_key
+    ]
+    assert len(target_edges) == 4
+    assert len({fact["callsite_key"] for fact in target_edges}) == 4
+    batch = _FactBatchBuilder(project, configuration, profile=profile).build(facts)
+    assert len(batch.callsites) == 6
+
+
+@pytest.fixture
 def relative_path_project(tmp_path: Path) -> tuple[Path, BuildConfiguration]:
     project = tmp_path / "project"
     generated = tmp_path / "generated"
