@@ -392,6 +392,16 @@ does not return freed pages to the filesystem automatically; to reclaim physical
 space in an existing migrated database, stop all users, make a verified backup,
 and run an explicit `VACUUM`. Fresh databases need no compaction step.
 
+Schema v18 stores symbol-variant snapshots as versioned zlib level-3 payloads when
+smaller than their original JSON. Decoding enforces a 512-MiB UTF-8 bound and rejects
+invalid, truncated, or trailing compressed data. Legacy JSON snapshots migrate in
+one transaction; every source/signature byte, ID, metadata field, and build/TU
+membership is retained. Search ordering, FTS content, embeddings, and navigation
+parity use decoded snapshots. This does not deduplicate distinct variants or
+redesign FTS. As with vector migration, existing files may need explicit offline
+compaction to reclaim freed pages; snapshot compression ratios are not whole-index
+size reductions or a guarantee that a full project fits a particular disk budget.
+
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by content, model/configuration identity, and dimension. `SQLiteVectorSearch` accepts any provider
 implementing `EmbeddingProvider`; `SQLiteStore.search_vector` computes true cosine

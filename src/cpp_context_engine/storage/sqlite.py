@@ -73,7 +73,9 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
+SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
+_SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
 VECTOR_ENCODING_RAW_F64LE_V1 = 0
 VECTOR_ENCODING_ZLIB_F64LE_V1 = 1
 DEFAULT_EMBEDDING_TEXT_CHARS = 32_000
@@ -477,6 +479,9 @@ class SQLiteStore:
         self._vector_query_state = threading.local()
         self._vector_search_lock = threading.RLock()
         self._connection.create_function("_cpp_context_cosine", 3, self._sqlite_cosine)
+        self._connection.create_function(
+            "_cpp_context_snapshot_name", 1, _symbol_snapshot_name, deterministic=True
+        )
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._defer_variant_fts = False
@@ -867,6 +872,37 @@ class SQLiteStore:
             self._migrate_v16()
         if current <= 16:
             self._migrate_v17()
+        if current <= 17:
+            self._migrate_v18()
+
+    def _migrate_v18(self) -> None:
+        """Compress snapshots atomically without changing their JSON or memberships."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            table = self._connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'symbol_variants'"
+            ).fetchone()
+            if table is not None:
+                for row in self._connection.execute(
+                    "SELECT rowid, snapshot_json FROM symbol_variants ORDER BY rowid"
+                ):
+                    encoded = _encode_symbol_snapshot(_decode_symbol_snapshot(row["snapshot_json"]))
+                    self._connection.execute(
+                        "UPDATE symbol_variants SET snapshot_json = ? WHERE rowid = ?",
+                        (encoded, row["rowid"]),
+                    )
+                    self._snapshot_migration_checkpoint("row")
+            self._snapshot_migration_checkpoint("publication")
+            self._connection.execute("PRAGMA user_version = 18")
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _snapshot_migration_checkpoint(self, _stage: str) -> None:
+        """Failure-injection boundary for the bounded snapshot migration."""
 
     def _migrate_v17(self) -> None:
         """Retain unknown legacy TU provenance until native reindexing replaces it."""
@@ -2496,7 +2532,7 @@ class SQLiteStore:
             """
         )
         for row in rows:
-            snapshot = json.loads(row["snapshot_json"])
+            snapshot = json.loads(_decode_symbol_snapshot(row["snapshot_json"]))
             self._connection.execute(
                 """
                 INSERT INTO symbol_variant_fts(
@@ -3092,6 +3128,8 @@ class SQLiteStore:
             actual = [
                 tuple(row) for row in self._connection.execute(statement, (project_id, tu_id))
             ]
+            if family == "symbol_variants":
+                actual = [(row[0], _decode_symbol_snapshot(row[1])) for row in actual]
             if sorted(expected) != actual:
                 raise RuntimeError(
                     f"navigation index is stale: {family} differ for translation unit {tu_id}"
@@ -3823,8 +3861,8 @@ class SQLiteStore:
         )
 
     @staticmethod
-    def _snapshot_symbol(snapshot: str) -> CodeSymbol:
-        data = json.loads(snapshot)
+    def _snapshot_symbol(snapshot: str | bytes) -> CodeSymbol:
+        data = json.loads(_decode_symbol_snapshot(snapshot))
         return CodeSymbol(
             id=data["id"],
             qualified_name=data["qualified_name"],
@@ -3880,7 +3918,7 @@ class SQLiteStore:
             chunk = variant_ids[offset : offset + 500]
             placeholders = ",".join("?" for _ in chunk)
             existing.update(
-                (row["id"], row["snapshot_json"])
+                (row["id"], _decode_symbol_snapshot(row["snapshot_json"]))
                 for row in self._connection.execute(
                     f"""
                     SELECT id, snapshot_json FROM symbol_variants
@@ -3935,7 +3973,7 @@ class SQLiteStore:
                     symbol.build_configuration_id,
                     symbol.translation_unit_id,
                     int(bool(symbol.metadata.get("is_definition"))),
-                    snapshot,
+                    _encode_symbol_snapshot(snapshot),
                 )
                 for symbol, variant_id, snapshot in records
             ),
@@ -6396,7 +6434,7 @@ class SQLiteStore:
             f"""
             SELECT * FROM symbol_variants
             WHERE project_id = ? AND build_variant IN ({placeholders})
-            ORDER BY json_extract(snapshot_json, '$.qualified_name'), build_variant, id
+            ORDER BY _cpp_context_snapshot_name(snapshot_json), build_variant, id
             """,
             (project_id, *names),
         )
@@ -8315,6 +8353,53 @@ class SQLiteStore:
         )
 
 
+def _encode_symbol_snapshot(snapshot: str) -> str | bytes:
+    if len(snapshot) > SYMBOL_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError("symbol snapshot exceeds decoded-size limit")
+    raw = snapshot.encode("utf-8")
+    if len(raw) > SYMBOL_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError("symbol snapshot exceeds decoded-size limit")
+    compressed = zlib.compress(raw, level=3)
+    encoded = _SYMBOL_SNAPSHOT_ZLIB_V1 + struct.pack(">I", len(raw)) + compressed
+    # TEXT also remains the legacy encoding; do not expand tiny/incompressible rows.
+    return encoded if len(encoded) < len(raw) else snapshot
+
+
+def _decode_symbol_snapshot(snapshot: str | bytes) -> str:
+    if isinstance(snapshot, str):
+        if (
+            len(snapshot) > SYMBOL_SNAPSHOT_MAX_BYTES
+            or len(snapshot.encode("utf-8")) > SYMBOL_SNAPSHOT_MAX_BYTES
+        ):
+            raise RuntimeError("symbol snapshot exceeds decoded-size limit")
+        return snapshot
+    if not isinstance(snapshot, bytes) or not (
+        8 < len(snapshot) <= SYMBOL_SNAPSHOT_MAX_BYTES
+        and snapshot.startswith(_SYMBOL_SNAPSHOT_ZLIB_V1)
+    ):
+        raise RuntimeError("invalid symbol snapshot encoding")
+    decoded_size = struct.unpack(">I", snapshot[4:8])[0]
+    if not 0 < decoded_size <= SYMBOL_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError("symbol snapshot exceeds decoded-size limit")
+    decoder = zlib.decompressobj()
+    try:
+        raw = decoder.decompress(snapshot[8:], decoded_size + 1)
+        if (
+            len(raw) != decoded_size
+            or not decoder.eof
+            or decoder.unused_data
+            or decoder.unconsumed_tail
+        ):
+            raise RuntimeError("invalid compressed symbol snapshot")
+        return raw.decode("utf-8")
+    except (zlib.error, UnicodeDecodeError) as error:
+        raise RuntimeError("invalid compressed symbol snapshot") from error
+
+
+def _symbol_snapshot_name(snapshot: str | bytes) -> str:
+    return json.loads(_decode_symbol_snapshot(snapshot))["qualified_name"]
+
+
 def _embedding_text(symbol: CodeSymbol, max_text_chars: int = DEFAULT_EMBEDDING_TEXT_CHARS) -> str:
     return "\n".join(
         part
@@ -8329,9 +8414,9 @@ def _embedding_text(symbol: CodeSymbol, max_text_chars: int = DEFAULT_EMBEDDING_
 
 
 def _embedding_text_from_snapshot(
-    snapshot_json: str, max_text_chars: int = DEFAULT_EMBEDDING_TEXT_CHARS
+    snapshot_json: str | bytes, max_text_chars: int = DEFAULT_EMBEDDING_TEXT_CHARS
 ) -> str:
-    snapshot = json.loads(snapshot_json)
+    snapshot = json.loads(_decode_symbol_snapshot(snapshot_json))
     return "\n".join(
         str(part)
         for part in (
