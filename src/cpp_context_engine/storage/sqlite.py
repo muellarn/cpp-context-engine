@@ -8304,27 +8304,47 @@ class SQLiteStore:
             previous_query = getattr(self._vector_query_state, "current", None)
             self._vector_query_state.current = (query_vector, query_magnitude)
             try:
+                # K scoped vectors represent at least K distinct variants. Keep
+                # every vector tied at that score before the final variant limit.
                 selected = self._connection.execute(
                     f"""
-            SELECT variants.id, variants.build_variant,
-                   _cpp_context_cosine(
-                       vectors.vector, vectors.vector_encoding, vectors.magnitude
-                   ) AS score
-            FROM variant_embeddings embeddings
-            JOIN embedding_vectors vectors
-              ON vectors.project_id = embeddings.project_id
-             AND vectors.model = embeddings.model
-             AND vectors.configuration_id = embeddings.configuration_id
-             AND vectors.dimensions = embeddings.dimensions
-             AND vectors.content_hash = embeddings.content_hash
-            JOIN symbol_variants variants
-              ON variants.project_id = embeddings.project_id
-             AND variants.id = embeddings.variant_id
+            WITH scores AS MATERIALIZED (
+                SELECT vectors.dimensions, vectors.content_hash,
+                       _cpp_context_cosine(
+                           vectors.vector, vectors.vector_encoding, vectors.magnitude
+                       ) AS score
+                FROM embedding_vectors vectors
+                WHERE vectors.project_id = ? AND vectors.model = ?
+                  AND vectors.configuration_id = ? AND vectors.dimensions = ?
+                  AND EXISTS (
+                    SELECT 1 FROM variant_embeddings embeddings
+                    CROSS JOIN symbol_variants variants
+                    WHERE embeddings.project_id = vectors.project_id
+                      AND embeddings.model = vectors.model
+                      AND embeddings.configuration_id = vectors.configuration_id
+                      AND embeddings.dimensions = vectors.dimensions
+                      AND embeddings.content_hash = vectors.content_hash
+                      AND variants.project_id = embeddings.project_id
+                      AND variants.id = embeddings.variant_id
+                      AND variants.build_variant IN ({placeholders})
+                  )
+            ), threshold AS (
+                SELECT score FROM scores ORDER BY score DESC LIMIT 1 OFFSET ?
+            )
+            SELECT variants.id, variants.build_variant, scores.score
+            FROM scores
+            CROSS JOIN variant_embeddings embeddings
+            CROSS JOIN symbol_variants variants
             WHERE embeddings.project_id = ? AND embeddings.model = ?
               AND embeddings.configuration_id = ?
-              AND embeddings.dimensions = ?
+              AND embeddings.dimensions = scores.dimensions
+              AND embeddings.content_hash = scores.content_hash
+              AND variants.project_id = embeddings.project_id
+              AND variants.id = embeddings.variant_id
               AND variants.build_variant IN ({placeholders})
-            ORDER BY score DESC, variants.build_variant, variants.id
+              AND (scores.score >= (SELECT score FROM threshold)
+                   OR NOT EXISTS (SELECT 1 FROM threshold))
+            ORDER BY scores.score DESC, variants.build_variant, variants.id
             LIMIT ?
             """,
                     (
@@ -8332,6 +8352,11 @@ class SQLiteStore:
                         model,
                         configuration,
                         len(query_vector),
+                        *names,
+                        limit - 1,
+                        project_id,
+                        model,
+                        configuration,
                         *names,
                         limit,
                     ),
