@@ -106,7 +106,9 @@ def test_scan_discards_successful_reads_after_identity_change(process_files, mon
     def metadata(path, *args, **kwargs):
         if path.parent == process_files / "fd":
             (process_files / "stat").write_text("123 (new owner) S " + "0 " * 18 + "88 0\n")
-            return SimpleNamespace(st_mode=stat.S_IFREG, st_nlink=0, st_dev=1, st_ino=2, st_size=1024)
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG, st_nlink=0, st_dev=1, st_ino=2, st_size=1024
+            )
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", metadata)
