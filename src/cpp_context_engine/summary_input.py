@@ -384,16 +384,39 @@ def prepare(request: dict, output: Path) -> dict:
     }
 
 
+def _anonymous_process_start(process: Path) -> int | None:
+    try:
+        fields = (process / "stat").read_text().rpartition(")")[2].split()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    if len(fields) < 20 or not fields[19].isdigit():
+        raise RuntimeError("unreadable process identity during anonymous-file scan")
+    return None if fields[0] in {"Z", "X"} else int(fields[19])
+
+
 def _anonymous_bytes(pids: tuple[int, ...]) -> int:
     files = {}
     for pid in pids:
-        for fd in Path(f"/proc/{pid}/fd").glob("*"):
-            try:
-                metadata = fd.stat()
-            except FileNotFoundError:
+        process = Path(f"/proc/{pid}")
+        started = _anonymous_process_start(process)
+        if started is None:
+            continue
+        observed = {}
+        try:
+            # Unlike glob, iterdir does not silently suppress access failures.
+            for fd in (process / "fd").iterdir():
+                try:
+                    metadata = fd.stat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
+                    observed[metadata.st_dev, metadata.st_ino] = metadata.st_size
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            if _anonymous_process_start(process) != started:
                 continue
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
-                files[metadata.st_dev, metadata.st_ino] = metadata.st_size
+            raise
+        if _anonymous_process_start(process) == started:
+            files.update(observed)
     return sum(files.values())
 
 
