@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import sqlite3
 import stat
@@ -394,6 +395,30 @@ def _anonymous_process_start(process: Path) -> int | None:
     return None if fields[0] in {"Z", "X"} else int(fields[19])
 
 
+def _anonymous_process_exited(process: Path, started: int) -> bool:
+    if _anonymous_process_start(process) != started:
+        return True
+    try:
+        descriptor = os.pidfd_open(int(process.name))
+    except ProcessLookupError:
+        return _anonymous_process_start(process) != started
+    try:
+        if _anonymous_process_start(process) != started:
+            return True
+        # Kernel teardown can deny fd access while stat still reports R. Wait for
+        # proven exit, never interpret the access failure itself as termination.
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN)
+        events = poller.poll(100)
+        if any(fd == descriptor and event & select.POLLIN for fd, event in events):
+            return True
+        if events:
+            raise RuntimeError("unexpected pidfd event during anonymous-file scan")
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def _anonymous_bytes(pids: tuple[int, ...]) -> int:
     files = {}
     for pid in pids:
@@ -412,7 +437,7 @@ def _anonymous_bytes(pids: tuple[int, ...]) -> int:
                 if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
                     observed[metadata.st_dev, metadata.st_ino] = metadata.st_size
         except (PermissionError, FileNotFoundError, ProcessLookupError):
-            if _anonymous_process_start(process) != started:
+            if _anonymous_process_exited(process, started):
                 continue
             raise
         if _anonymous_process_start(process) == started:
