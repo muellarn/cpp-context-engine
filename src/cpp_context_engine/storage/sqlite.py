@@ -6332,14 +6332,21 @@ class SQLiteStore:
             return None
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
+        # Stabilize the old scope-index tie by canonical ID; unlike get_symbols,
+        # this single-result API does not give an exact variant ID precedence.
         row = self._connection.execute(
             f"""
-            SELECT * FROM symbol_variants
-            WHERE project_id = ? AND (symbol_id = ? OR id = ?)
-              AND build_variant IN ({placeholders})
-            ORDER BY is_definition DESC, build_variant, translation_unit_id LIMIT 1
+            SELECT variants.* FROM (
+                SELECT id FROM symbol_variants
+                WHERE project_id = ? AND symbol_id = ? AND build_variant IN ({placeholders})
+                UNION
+                SELECT id FROM symbol_variants
+                WHERE project_id = ? AND id = ? AND build_variant IN ({placeholders})
+            ) matches CROSS JOIN symbol_variants variants
+            WHERE variants.project_id = ? AND variants.id = matches.id
+            ORDER BY is_definition DESC, build_variant, translation_unit_id, symbol_id LIMIT 1
             """,
-            (project_id, symbol_id, symbol_id, *names),
+            (project_id, symbol_id, *names, project_id, symbol_id, *names, project_id),
         ).fetchone()
         if row is not None:
             return self._variant_row_to_symbol(row)
@@ -6375,22 +6382,35 @@ class SQLiteStore:
             placeholders = ",".join("?" for _ in chunk)
             rows = self._connection.execute(
                 f"""
-                SELECT * FROM symbol_variants
-                WHERE project_id = ? AND build_variant IN ({scope_placeholders})
-                  AND (id IN ({placeholders}) OR symbol_id IN ({placeholders}))
-                ORDER BY is_definition DESC, build_variant, translation_unit_id, id
+                SELECT variants.* FROM (
+                    SELECT id FROM symbol_variants
+                    WHERE project_id = ? AND build_variant IN ({scope_placeholders})
+                      AND id IN ({placeholders})
+                    UNION
+                    SELECT id FROM symbol_variants
+                    WHERE project_id = ? AND build_variant IN ({scope_placeholders})
+                      AND symbol_id IN ({placeholders})
+                ) matches CROSS JOIN symbol_variants variants
+                WHERE variants.project_id = ? AND variants.id = matches.id
+                ORDER BY is_definition DESC, build_variant, translation_unit_id, variants.id
                 """,
-                (project_id, *names, *chunk, *chunk),
+                (project_id, *names, *chunk, project_id, *names, *chunk, project_id),
             )
             chunk_ids = set(chunk)
             canonical_matches: dict[str, CodeSymbol] = {}
             exact_matches: dict[str, CodeSymbol] = {}
             for row in rows:
+                exact = row["id"] in chunk_ids
+                canonical = (
+                    row["symbol_id"] in chunk_ids and row["symbol_id"] not in canonical_matches
+                )
+                if not (exact or canonical):
+                    continue
                 symbol = self._variant_row_to_symbol(row)
-                if row["id"] in chunk_ids:
+                if exact:
                     exact_matches[row["id"]] = symbol
-                if row["symbol_id"] in chunk_ids:
-                    canonical_matches.setdefault(row["symbol_id"], symbol)
+                if canonical:
+                    canonical_matches[row["symbol_id"]] = symbol
             resolved.update(canonical_matches)
             # A variant ID is an exact identity; it must win even in the
             # pathological case where it equals another symbol's canonical ID.
