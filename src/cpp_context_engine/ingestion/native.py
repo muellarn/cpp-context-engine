@@ -1166,7 +1166,7 @@ class NativeClangIngestor:
         max_spool_registries: int | None = None,
         max_spool_bytes: int | None = None,
         max_spool_fds: int | None = None,
-        max_domain_batches: int = 2,
+        max_domain_batches: int = 1,
         profile: IndexProfile = IndexProfile.FULL,
         observer: AnalyzerPipelineObserver | None = None,
         max_analyzer_idle_seconds: float | None = None,

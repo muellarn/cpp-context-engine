@@ -9,6 +9,7 @@ from cpp_context_engine.models import IndexProfile
 def test_environment_configuration_uses_project_local_index(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CPP_CONTEXT_PROJECT_ROOT", raising=False)
     monkeypatch.delenv("CPP_CONTEXT_INDEX_DIRECTORY", raising=False)
+    monkeypatch.delenv("CPP_CONTEXT_ANALYZER_MAX_DOMAIN_BATCHES", raising=False)
 
     config = AppConfig.from_environment(cwd=tmp_path)
 
@@ -18,6 +19,10 @@ def test_environment_configuration_uses_project_local_index(tmp_path, monkeypatc
     assert config.compilation_database == tmp_path / "build" / "compile_commands.json"
     assert config.embedding_provider == "local"
     assert config.index_profile is IndexProfile.FULL
+    assert config.analyzer_max_domain_batches == 1
+    assert (
+        AppConfig(project_root=tmp_path, index_directory=tmp_path).analyzer_max_domain_batches == 1
+    )
 
 
 def test_environment_selects_navigation_profile_explicitly(tmp_path, monkeypatch) -> None:

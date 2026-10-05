@@ -33,7 +33,7 @@ class AppConfig:
     analyzer_max_spool_registries: int | None = None
     analyzer_max_spool_bytes: int | None = None
     analyzer_max_spool_files: int | None = None
-    analyzer_max_domain_batches: int = 2
+    analyzer_max_domain_batches: int = 1
     max_context_tokens: int = 16_000
     retrieval_limit: int = 20
     embedding_provider: str = "local"
@@ -183,7 +183,7 @@ class AppConfig:
             ),
             analyzer_max_spool_bytes=_optional_positive_int("CPP_CONTEXT_ANALYZER_MAX_SPOOL_BYTES"),
             analyzer_max_spool_files=_optional_positive_int("CPP_CONTEXT_ANALYZER_MAX_SPOOL_FILES"),
-            analyzer_max_domain_batches=_positive_int("CPP_CONTEXT_ANALYZER_MAX_DOMAIN_BATCHES", 2),
+            analyzer_max_domain_batches=_positive_int("CPP_CONTEXT_ANALYZER_MAX_DOMAIN_BATCHES", 1),
             max_context_tokens=_positive_int("CPP_CONTEXT_MAX_TOKENS", 16_000),
             retrieval_limit=_positive_int("CPP_CONTEXT_RETRIEVAL_LIMIT", 20),
             embedding_provider=os.getenv("CPP_CONTEXT_EMBEDDING_PROVIDER", "local").casefold(),

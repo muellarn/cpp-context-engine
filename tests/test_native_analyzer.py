@@ -915,6 +915,66 @@ def test_native_configuration_batches_refill_on_completion_with_a_bounded_window
     ]
 
 
+def test_default_pipeline_serializes_conversion_with_consumer_but_refills_native_slots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    converted: list[str] = []
+    analyzed: list[str] = []
+    native_window_filled = threading.Event()
+    lock = threading.Lock()
+    original_build = _FactBatchBuilder.build
+
+    def record_build(builder: _FactBatchBuilder, facts: object) -> object:
+        with lock:
+            converted.append(builder.configuration.id)
+        return original_build(builder, facts)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_FactBatchBuilder, "build", record_build)
+
+    class EmptyClient:
+        def probe(self) -> object:
+            return object()
+
+        def analyze(
+            self, _root: Path, configuration: BuildConfiguration
+        ) -> list[dict[str, object]]:
+            with lock:
+                analyzed.append(configuration.id)
+                if len(analyzed) == 3:
+                    native_window_filled.set()
+            return []
+
+    configurations = []
+    for index in range(6):
+        source = tmp_path / f"serialized-{index}.cpp"
+        source.write_text(f"int value_{index};\n", encoding="utf-8")
+        configurations.append(
+            BuildConfiguration(
+                f"build-{index}", source, tmp_path, ("clang++", str(source)), f"hash-{index}"
+            )
+        )
+    ingestor = NativeClangIngestor(  # type: ignore[arg-type]
+        EmptyClient(), max_workers=2, max_spool_registries=3
+    )
+    assert ingestor.max_domain_batches == 1
+    batches = ingestor.iter_configuration_batches(tmp_path, configurations)
+    try:
+        first = next(batches)
+        assert first.translation_units[0].build_configuration_id == "build-0"
+        assert native_window_filled.wait(timeout=2)
+        # The writer still owns the first result: readers may fill the spool,
+        # but a second converter must not compete with SQLite/codec GIL handoffs.
+        with lock:
+            assert converted == ["build-0"]
+            assert len(analyzed) == 3
+        assert [b.translation_units[0].build_configuration_id for b in batches] == [
+            f"build-{i}" for i in range(1, 6)
+        ]
+        assert converted == [f"build-{i}" for i in range(6)]
+    finally:
+        batches.close()
+
+
 def test_native_pipeline_bounds_converted_batches_retained_by_writer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
