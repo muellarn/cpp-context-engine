@@ -9,7 +9,7 @@ known and equal. Primary/unique constraints, triggers and rollback journaling
 remain active; nonunique lookup indexes are rebuilt before finalization. Full
 foreign-key, integrity and FTS checks precede commit. Online foreign-key enforcement
 is restored and verified outside the transaction before the database can be used
-or published. This path temporarily uses a bounded 128 MiB SQLite page cache.
+or published. This path temporarily uses a 128 MiB SQLite page-cache target.
 Existing databases, unknown/replacing streams, subsequent ingestions, full-profile
 and Deep updates retain normal online foreign-key/cascade behavior. Failed rollback
 or enforcement restoration closes the private connection and prevents publication.
