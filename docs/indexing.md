@@ -3,6 +3,17 @@
 `ProjectIndexer` combines a validated JSON compilation database, libclang, and
 `SQLiteStore`. The LLM and transport layers are deliberately not involved.
 
+The first navigation ingestion into an owned, unpublished private database uses
+batch foreign-key validation when both complete current and changed TU sets are
+known and equal. Primary/unique constraints, triggers and rollback journaling
+remain active; nonunique lookup indexes are rebuilt before finalization. Full
+foreign-key, integrity and FTS checks precede commit. Online foreign-key enforcement
+is restored and verified outside the transaction before the database can be used
+or published. This path temporarily uses a bounded 128 MiB SQLite page cache.
+Existing databases, unknown/replacing streams, subsequent ingestions, full-profile
+and Deep updates retain normal online foreign-key/cascade behavior. Failed rollback
+or enforcement restoration closes the private connection and prevents publication.
+
 Install the optional compiler binding and point the adapter at libclang when it
 is not on the platform's default library path:
 
