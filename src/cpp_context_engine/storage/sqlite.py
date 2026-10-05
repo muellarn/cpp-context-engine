@@ -7553,29 +7553,29 @@ class SQLiteStore:
                 endpoint_sql = "target_id = ?"
                 parameters = [project_id, *names, current]
             else:
-                endpoint_sql = "(source_id = ? OR target_id = ?)"
-                parameters = [project_id, *names, current, current]
+                endpoint_sql = "source_id = ?"
+                parameters = [project_id, *names, current]
             relation_sql = ""
             if relations:
                 placeholders = ",".join("?" for _ in relations)
                 relation_sql = f" AND relation IN ({placeholders})"
                 parameters.extend(relation.value for relation in sorted(relations, key=str))
-            limit_sql = ""
-            if per_node_limit is not None:
-                limit_sql = " LIMIT ?"
-                parameters.append(per_node_limit)
-            rows = self._connection.execute(
-                (
-                    "SELECT id, translation_unit_id, build_configuration_id, build_variant, "
-                    "source_id, target_id, relation FROM edges "
-                    f"WHERE project_id = ? AND build_variant IN ({scope_placeholders}) "
-                    f"AND {endpoint_sql}"
-                    + relation_sql
-                    + " ORDER BY relation, source_id, target_id, build_variant, id"
-                    + limit_sql
-                ),
-                parameters,
+            select_sql = (
+                "SELECT id, translation_unit_id, build_configuration_id, build_variant, "
+                "source_id, target_id, relation FROM edges "
+                f"WHERE project_id = ? AND build_variant IN ({scope_placeholders}) AND "
             )
+            query = select_sql + endpoint_sql + relation_sql
+            if direction == GraphDirection.BOTH:
+                # Separate endpoint seeks avoid a build-wide scan for the OR.
+                # UNION deduplicates self-loops before the global ordering and limit.
+                query += " UNION " + select_sql + "target_id = ?" + relation_sql
+                parameters *= 2
+            query += " ORDER BY relation, source_id, target_id, build_variant, id"
+            if per_node_limit is not None:
+                query += " LIMIT ?"
+                parameters.append(per_node_limit)
+            rows = self._connection.execute(query, parameters)
             for row in rows:
                 relation = GraphRelation(row["relation"])
                 edge_id = row["id"]
