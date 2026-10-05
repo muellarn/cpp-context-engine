@@ -1406,6 +1406,95 @@ def test_cosine_search_validates_query_once_and_unpacks_each_candidate_once(
     assert unpacks == 2
 
 
+def test_vector_search_scores_shared_content_once(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    batch = replace(batch, symbols=batch.symbols + (replace(batch.symbols[1], id="alpha-copy"),))
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.put_embedding("symbol-alpha", "fixture", [1.0, 0.0])
+        store.put_embedding("alpha-copy", "fixture", [1.0, 0.0])
+        assert store.embedding_vector_count("fixture") == 1
+        original = sqlite_storage._sqlite_cosine_candidate
+        calls = []
+
+        def cosine(*args):
+            calls.append(args)
+            return original(*args)
+
+        monkeypatch.setattr(sqlite_storage, "_sqlite_cosine_candidate", cosine)
+        hits = store.search_vector([1.0, 0.0], model="fixture")
+        assert len(hits) == 2
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 9])
+@pytest.mark.parametrize("query", [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0)])
+def test_shared_vector_ranking_preserves_all_cutoff_ties(tmp_path, limit, query):
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    symbols = tuple(
+        replace(
+            batch.symbols[1],
+            id=f"s-{group}-{copy}",
+            qualified_name=f"group-{group}",
+            variant_id=f"v-{copy}-{group}",
+        )
+        for group in range(3)
+        for copy in range(2)
+    )
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, replace(batch, symbols=batch.symbols + symbols))
+        expected = []
+        for symbol in symbols:
+            vector = (-1.0, 0.0) if symbol.qualified_name == "group-2" else (1.0, 0.0)
+            store.put_embedding(symbol.id, "fixture", vector)
+            expected.append((symbol.variant_id, vector[0] * query[0]))
+        assert store.embedding_vector_count("fixture") == 3
+        expected.sort(key=lambda item: (-item[1], item[0]))
+        actual = store.search_vector(query, model="fixture", limit=limit)
+        assert [(hit.symbol.variant_id, hit.score) for hit in actual] == expected[:limit]
+
+
+def test_shared_vector_search_excludes_unattached_and_foreign_corruption(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    batch = _batch(root)
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, batch)
+        store.put_embedding("symbol-alpha", "fixture", [1.0, 0.0])
+        store.put_embedding("file-a", "fixture", [0.0, 1.0])
+        store.put_embedding("file-a", "other-model", [1.0, 0.0])
+        store.put_embedding("file-a", "fixture", [1.0, 0.0], configuration_id="other-config")
+        connection = store._connection
+        connection.execute(
+            "UPDATE symbol_variants SET build_variant='alternate' WHERE symbol_id='file-a'"
+        )
+        connection.execute(
+            "UPDATE embedding_vectors SET vector = zeroblob(dimensions * 8) "
+            "WHERE model != 'fixture' OR configuration_id != 'fixture' "
+            "OR content_hash IN (SELECT e.content_hash FROM variant_embeddings e "
+            "JOIN symbol_variants v ON v.project_id=e.project_id AND v.id=e.variant_id "
+            "WHERE v.build_variant='alternate')"
+        )
+        connection.execute("""INSERT INTO embedding_vectors
+            (project_id,model,configuration_id,dimensions,content_hash,content_text,magnitude,vector,vector_encoding)
+            SELECT project_id,model,configuration_id,dimensions,'orphan','orphan',
+                   magnitude,zeroblob(dimensions * 8),vector_encoding
+            FROM embedding_vectors WHERE model='fixture' AND configuration_id='fixture'
+            LIMIT 1""")
+        connection.commit()
+        assert len(store.search_vector([1.0, 0.0], model="fixture")) == 1
+        assert store.search_vector([1.0, 0.0], model="fixture", build_scope=("missing",)) == ()
+        with pytest.raises(sqlite3.OperationalError, match="user-defined function"):
+            store.search_vector([1.0, 0.0], model="fixture", build_scope=("alternate",))
+        with pytest.raises(ValueError, match="dimension"):
+            store.search_vector([1.0, 0.0, 0.0], model="fixture")
+        assert not hasattr(store._vector_query_state, "current")
+
+
 def test_concurrent_vector_searches_are_isolated_and_release_lock_on_error(
     tmp_path: Path,
 ) -> None:
