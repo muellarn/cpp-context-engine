@@ -1190,6 +1190,65 @@ def test_graph_traversal_enforces_direction_depth_and_limits(tmp_path: Path) -> 
             store.neighbors(beta.id, max_edges=0)
 
 
+def test_bidirectional_neighbors_seek_both_endpoints(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        statements: list[str] = []
+        store._connection.set_trace_callback(statements.append)
+        store.neighbors("symbol-alpha", per_node_limit=40)
+        store._connection.set_trace_callback(None)
+        query = next(sql for sql in statements if "relation FROM edges" in sql)
+        details = [row[3] for row in store._connection.execute("EXPLAIN QUERY PLAN " + query)]
+
+    assert any("source_id=?" in detail for detail in details), details
+    assert any("target_id=?" in detail for detail in details), details
+
+
+@pytest.mark.parametrize("per_node_limit", [None, 1, 2, 5])
+@pytest.mark.parametrize("relations", [None, frozenset({GraphRelation.CALLS})])
+def test_bidirectional_neighbors_preserve_union_order_and_self_loops(
+    tmp_path: Path, per_node_limit: int | None, relations: frozenset[GraphRelation] | None
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "index.db", project_root=root) as store:
+        store.apply_ingestion(root, _batch(root))
+        store.put_edges(
+            (
+                GraphEdge("symbol-alpha", "symbol-alpha", GraphRelation.CALLS, "unit-a"),
+                GraphEdge("symbol-alpha", "file-a", GraphRelation.CALLS, "unit-a"),
+                GraphEdge("file-a", "symbol-alpha", GraphRelation.CALLS, "unit-a"),
+                GraphEdge("symbol-alpha", "file-a", GraphRelation.REFERENCES, "unit-a"),
+            )
+        )
+        parameters: list[object] = [
+            store._project_id(root),
+            "default",
+            "symbol-alpha",
+            "symbol-alpha",
+        ]
+        relation_sql = ""
+        if relations:
+            relation_sql = " AND relation IN (?)"
+            parameters.append(GraphRelation.CALLS.value)
+        expected = list(
+            store._connection.execute(
+                "SELECT id FROM edges WHERE project_id = ? AND build_variant = ? "
+                "AND (source_id = ? OR target_id = ?)"
+                + relation_sql
+                + " ORDER BY relation, source_id, target_id, build_variant, id",
+                parameters,
+            )
+        )
+        if per_node_limit is not None:
+            expected = expected[:per_node_limit]
+        actual = store.neighbors("symbol-alpha", relations=relations, per_node_limit=per_node_limit)
+
+    assert [edge.id for edge in actual] == [row[0] for row in expected]
+
+
 def test_symbol_search_weights_names_above_signature_only_matches(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()

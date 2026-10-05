@@ -133,6 +133,51 @@ def _measured_rows(connection, sql):
     return rows, steps
 
 
+@pytest.mark.parametrize("scope", [("default",), ("alternate",), ("default", "alternate")])
+@pytest.mark.parametrize("limit", [None, 1, 3])
+def test_neighbor_endpoint_union_preserves_scopes_and_bounds(tmp_path: Path, scope, limit):
+    with SQLiteStore(Path(":memory:")) as store:
+        project = _seed_graph(store, tmp_path)
+        connection = store._connection
+        statements = []
+        connection.set_trace_callback(statements.append)
+        try:
+            actual = store.neighbors(
+                "B",
+                project_root=tmp_path,
+                build_scope=scope,
+                per_node_limit=limit,
+                relations=frozenset({GraphRelation.OVERRIDES, GraphRelation.CALLS}),
+            )
+        finally:
+            connection.set_trace_callback(None)
+        sql = next(item for item in statements if "relation FROM edges" in item)
+        names = ",".join("?" for _ in scope)
+        expected = list(
+            connection.execute(
+                "SELECT id FROM edges WHERE project_id = ? "
+                f"AND build_variant IN ({names}) AND (source_id = ? OR target_id = ?) "
+                "AND relation IN (?, ?) ORDER BY relation, source_id, target_id, build_variant, id",
+                (
+                    project,
+                    *scope,
+                    "B",
+                    "B",
+                    GraphRelation.OVERRIDES.value,
+                    GraphRelation.CALLS.value,
+                ),
+            )
+        )
+        if limit is not None:
+            expected = expected[:limit]
+        assert [edge.id for edge in actual] == [row[0] for row in expected]
+        assert all(edge.source_id != "OtherOnly" for edge in actual)
+        assert {edge.build_variant for edge in actual} <= set(scope)
+        plan = [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + sql)]
+        assert any("source_id=?" in detail for detail in plan), plan
+        assert any("target_id=?" in detail for detail in plan), plan
+
+
 @pytest.mark.parametrize("query", ["override", "reverse"])
 def test_graph_queries_use_target_lookups_and_preserve_results(tmp_path: Path, query: str):
     with SQLiteStore(Path(":memory:")) as store:
