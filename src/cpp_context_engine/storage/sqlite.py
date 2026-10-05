@@ -439,16 +439,20 @@ class SQLiteStore:
             mode = store._connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
             if mode != "delete":
                 raise RuntimeError("private generation did not acquire rollback journaling")
+            store._private_first_ingestion = True
             try:
                 yield store
+                if store._closed:
+                    raise RuntimeError("private generation connection closed before publication")
                 if store._connection.in_transaction:
                     raise RuntimeError("private generation has uncommitted changes")
             finally:
-                if store._connection.in_transaction:
-                    store._connection.rollback()
-                mode = store._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-                if mode != "wal":
-                    raise RuntimeError("private generation did not restore WAL")
+                if not store._closed:
+                    if store._connection.in_transaction:
+                        store._connection.rollback()
+                    mode = store._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                    if mode != "wal":
+                        raise RuntimeError("private generation did not restore WAL")
         if any(item != staged for item in private.iterdir()):
             raise RuntimeError("private generation still has SQLite sidecars")
         if any(item.exists() or item.is_symlink() for item in sidecars):
@@ -475,6 +479,7 @@ class SQLiteStore:
         # FastAPI executes synchronous handlers in worker threads; SQLite's serialized
         # mode safely supports this read-heavy connection when the thread guard is off.
         self._connection = sqlite3.connect(path, check_same_thread=False)
+        self._closed = False
         self._connection.row_factory = sqlite3.Row
         self._vector_query_state = threading.local()
         self._vector_search_lock = threading.RLock()
@@ -485,6 +490,8 @@ class SQLiteStore:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._defer_variant_fts = False
+        self._private_first_ingestion = False
+        self._batch_validate_foreign_keys = False
         self._embedding_session_token: object | None = None
         self._trusted_embedding_registry: dict[object, _TrustedEmbeddingState] | None = None
         self._migrate()
@@ -527,9 +534,13 @@ class SQLiteStore:
             retained = {str(row["name"]) for row in indexes if row["unique"]}
             # Deferred FK debt makes later parent INSERTs consult existing children.
             # Keep one full lookup per FK; dropping it turns ingestion quadratic.
-            for columns in sorted(
-                (tuple(column for _, column in sorted(key)) for key in foreign_keys.values()),
-                key=lambda columns: (-len(columns), columns),
+            for columns in (
+                sorted(
+                    (tuple(column for _, column in sorted(key)) for key in foreign_keys.values()),
+                    key=lambda columns: (-len(columns), columns),
+                )
+                if not self._batch_validate_foreign_keys
+                else ()
             ):
                 candidates = [
                     name
@@ -607,7 +618,8 @@ class SQLiteStore:
         )
         if rows := list(self._connection.execute("PRAGMA foreign_key_check")):
             raise RuntimeError(f"fresh generation failed foreign-key validation: {rows[0]}")
-        quick_check = self._connection.execute("PRAGMA quick_check").fetchone()[0]
+        check = "integrity_check" if self._batch_validate_foreign_keys else "quick_check"
+        quick_check = self._connection.execute(f"PRAGMA {check}").fetchone()[0]
         if quick_check != "ok":
             raise RuntimeError(f"fresh generation failed integrity validation: {quick_check}")
 
@@ -618,7 +630,13 @@ class SQLiteStore:
         self.close()
 
     def close(self) -> None:
+        self._closed = True
         self._connection.close()
+
+    def _set_foreign_key_enforcement(self, enabled: bool) -> None:
+        self._connection.execute(f"PRAGMA foreign_keys = {int(enabled)}")
+        if self._connection.execute("PRAGMA foreign_keys").fetchone()[0] != int(enabled):
+            raise RuntimeError("foreign-key enforcement did not change outside the transaction")
 
     def _sqlite_cosine(
         self, candidate_blob: bytes, candidate_encoding: int, candidate_magnitude: float
@@ -2601,8 +2619,23 @@ class SQLiteStore:
         # without a redundant provisional canonical-symbol write pass.
         self._reset_ingestion_tracking()
         fresh_generation = self._should_defer_fresh_generation()
+        # Only the owned unpublished first NAV generation can use insert-only
+        # validation. Unknown/replacing streams require online CASCADE semantics.
+        bulk_navigation = (
+            self._private_first_ingestion
+            and fresh_generation
+            and index_profile is IndexProfile.NAVIGATION
+            and current_translation_unit_ids is not None
+            and changed_translation_unit_ids == current_translation_unit_ids
+        )
+        self._private_first_ingestion = False
+        previous_cache_size = self._connection.execute("PRAGMA cache_size").fetchone()[0]
         deferred_indexes: tuple[SchemaIndexClassification, ...] = ()
         try:
+            if bulk_navigation:
+                self._set_foreign_key_enforcement(False)
+                self._batch_validate_foreign_keys = True
+                self._connection.execute("PRAGMA cache_size = -131072")
             with self._connection:
                 # Start the transaction explicitly: Python's sqlite3 wrapper does
                 # not implicitly begin one for DDL, and index drops must never be
@@ -2729,8 +2762,20 @@ class SQLiteStore:
                 return invalidated_summaries
         finally:
             self._defer_variant_fts = False
-            if self._connection.in_transaction:
-                self._connection.rollback()
+            try:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                if bulk_navigation:
+                    self._set_foreign_key_enforcement(True)
+                    self._connection.execute(f"PRAGMA cache_size = {previous_cache_size}")
+            except BaseException:
+                if bulk_navigation:
+                    # Failed rollback or restoration leaves no reusable or
+                    # publishable private connection, even if the caller catches it.
+                    self.close()
+                raise
+            finally:
+                self._batch_validate_foreign_keys = False
 
     def apply_deep_overlay(
         self,
@@ -6332,14 +6377,21 @@ class SQLiteStore:
             return None
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
+        # Stabilize the old scope-index tie by canonical ID; unlike get_symbols,
+        # this single-result API does not give an exact variant ID precedence.
         row = self._connection.execute(
             f"""
-            SELECT * FROM symbol_variants
-            WHERE project_id = ? AND (symbol_id = ? OR id = ?)
-              AND build_variant IN ({placeholders})
-            ORDER BY is_definition DESC, build_variant, translation_unit_id LIMIT 1
+            SELECT variants.* FROM (
+                SELECT id FROM symbol_variants
+                WHERE project_id = ? AND symbol_id = ? AND build_variant IN ({placeholders})
+                UNION
+                SELECT id FROM symbol_variants
+                WHERE project_id = ? AND id = ? AND build_variant IN ({placeholders})
+            ) matches CROSS JOIN symbol_variants variants
+            WHERE variants.project_id = ? AND variants.id = matches.id
+            ORDER BY is_definition DESC, build_variant, translation_unit_id, symbol_id LIMIT 1
             """,
-            (project_id, symbol_id, symbol_id, *names),
+            (project_id, symbol_id, *names, project_id, symbol_id, *names, project_id),
         ).fetchone()
         if row is not None:
             return self._variant_row_to_symbol(row)
@@ -6375,22 +6427,35 @@ class SQLiteStore:
             placeholders = ",".join("?" for _ in chunk)
             rows = self._connection.execute(
                 f"""
-                SELECT * FROM symbol_variants
-                WHERE project_id = ? AND build_variant IN ({scope_placeholders})
-                  AND (id IN ({placeholders}) OR symbol_id IN ({placeholders}))
-                ORDER BY is_definition DESC, build_variant, translation_unit_id, id
+                SELECT variants.* FROM (
+                    SELECT id FROM symbol_variants
+                    WHERE project_id = ? AND build_variant IN ({scope_placeholders})
+                      AND id IN ({placeholders})
+                    UNION
+                    SELECT id FROM symbol_variants
+                    WHERE project_id = ? AND build_variant IN ({scope_placeholders})
+                      AND symbol_id IN ({placeholders})
+                ) matches CROSS JOIN symbol_variants variants
+                WHERE variants.project_id = ? AND variants.id = matches.id
+                ORDER BY is_definition DESC, build_variant, translation_unit_id, variants.id
                 """,
-                (project_id, *names, *chunk, *chunk),
+                (project_id, *names, *chunk, project_id, *names, *chunk, project_id),
             )
             chunk_ids = set(chunk)
             canonical_matches: dict[str, CodeSymbol] = {}
             exact_matches: dict[str, CodeSymbol] = {}
             for row in rows:
+                exact = row["id"] in chunk_ids
+                canonical = (
+                    row["symbol_id"] in chunk_ids and row["symbol_id"] not in canonical_matches
+                )
+                if not (exact or canonical):
+                    continue
                 symbol = self._variant_row_to_symbol(row)
-                if row["id"] in chunk_ids:
+                if exact:
                     exact_matches[row["id"]] = symbol
-                if row["symbol_id"] in chunk_ids:
-                    canonical_matches.setdefault(row["symbol_id"], symbol)
+                if canonical:
+                    canonical_matches[row["symbol_id"]] = symbol
             resolved.update(canonical_matches)
             # A variant ID is an exact identity; it must win even in the
             # pathological case where it equals another symbol's canonical ID.
@@ -7508,29 +7573,29 @@ class SQLiteStore:
                 endpoint_sql = "target_id = ?"
                 parameters = [project_id, *names, current]
             else:
-                endpoint_sql = "(source_id = ? OR target_id = ?)"
-                parameters = [project_id, *names, current, current]
+                endpoint_sql = "source_id = ?"
+                parameters = [project_id, *names, current]
             relation_sql = ""
             if relations:
                 placeholders = ",".join("?" for _ in relations)
                 relation_sql = f" AND relation IN ({placeholders})"
                 parameters.extend(relation.value for relation in sorted(relations, key=str))
-            limit_sql = ""
-            if per_node_limit is not None:
-                limit_sql = " LIMIT ?"
-                parameters.append(per_node_limit)
-            rows = self._connection.execute(
-                (
-                    "SELECT id, translation_unit_id, build_configuration_id, build_variant, "
-                    "source_id, target_id, relation FROM edges "
-                    f"WHERE project_id = ? AND build_variant IN ({scope_placeholders}) "
-                    f"AND {endpoint_sql}"
-                    + relation_sql
-                    + " ORDER BY relation, source_id, target_id, build_variant, id"
-                    + limit_sql
-                ),
-                parameters,
+            select_sql = (
+                "SELECT id, translation_unit_id, build_configuration_id, build_variant, "
+                "source_id, target_id, relation FROM edges "
+                f"WHERE project_id = ? AND build_variant IN ({scope_placeholders}) AND "
             )
+            query = select_sql + endpoint_sql + relation_sql
+            if direction == GraphDirection.BOTH:
+                # Separate endpoint seeks avoid a build-wide scan for the OR.
+                # UNION deduplicates self-loops before the global ordering and limit.
+                query += " UNION " + select_sql + "target_id = ?" + relation_sql
+                parameters *= 2
+            query += " ORDER BY relation, source_id, target_id, build_variant, id"
+            if per_node_limit is not None:
+                query += " LIMIT ?"
+                parameters.append(per_node_limit)
+            rows = self._connection.execute(query, parameters)
             for row in rows:
                 relation = GraphRelation(row["relation"])
                 edge_id = row["id"]
