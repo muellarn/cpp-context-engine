@@ -1406,6 +1406,108 @@ def test_cosine_search_validates_query_once_and_unpacks_each_candidate_once(
     assert unpacks == 2
 
 
+@pytest.mark.parametrize("distinct_content", (False, True))
+def test_vector_dimension_preflight_does_not_scan_equal_attachments(
+    tmp_path: Path, distinct_content: bool
+) -> None:
+    batch = _batch(tmp_path)
+    symbols = tuple(
+        replace(
+            batch.symbols[1],
+            id=f"copy-{i}",
+            qualified_name=f"copy_{i}" if distinct_content else batch.symbols[1].qualified_name,
+        )
+        for i in range(1024)
+    )
+    with SQLiteStore(Path(":memory:"), project_root=tmp_path) as store:
+        store.apply_ingestion(tmp_path, replace(batch, symbols=batch.symbols + symbols))
+        work = []
+        for count in (256, 1024):
+            store.put_embeddings(((s.id, (1.0, 0.0)) for s in symbols[:count]), "fixture")
+            assert store._connection.execute("SELECT count(*) FROM embedding_vectors").fetchone()[
+                0
+            ] == (count if distinct_content else 1)
+            steps = 0
+
+            def count_step() -> int:
+                nonlocal steps
+                steps += 1
+                return 0
+
+            def count_dimension_preflight(statement: str) -> None:
+                dimension_check = (
+                    "vectors.dimensions" in statement and "_cpp_context_cosine(" not in statement
+                )
+                store._connection.set_progress_handler(count_step if dimension_check else None, 1)
+
+            store._connection.set_trace_callback(count_dimension_preflight)
+            try:
+                assert len(store.search_vector((1.0, 0.0), model="fixture", limit=1)) == 1
+            finally:
+                store._connection.set_progress_handler(None, 0)
+                store._connection.set_trace_callback(None)
+            work.append(steps)
+        print(f"scoped dimension preflight VM steps: {work}")
+        # SQLite can count the next statement's one-time preparation before its
+        # trace callback disables the handler; that fixed cost is not a scan.
+        assert max(work) < 1000
+        assert work[1] <= work[0] + 32
+
+
+@pytest.mark.parametrize("dimension", (1, 3))
+@pytest.mark.parametrize(
+    "location", ("selected", "alternate", "other-model", "other-config", "orphan")
+)
+def test_vector_dimension_witness_requires_matching_scoped_attachment(
+    tmp_path: Path, dimension: int, location: str
+) -> None:
+    with SQLiteStore(Path(":memory:"), project_root=tmp_path) as store:
+        store.apply_ingestion(tmp_path, _batch(tmp_path))
+        store.put_embeddings((("symbol-alpha", (1.0, 0.0)), ("file-a", (0.0, 1.0))), "fixture")
+        project = store._project_id(tmp_path)
+        model = "other" if location == "other-model" else "fixture"
+        configuration = "other" if location == "other-config" else "fixture"
+        connection = store._connection
+        connection.execute(
+            "INSERT INTO embedding_vectors(project_id, model, configuration_id, dimensions, "
+            "content_hash, content_text, magnitude, vector_encoding, vector) "
+            "VALUES (?, ?, ?, ?, 'wrong', 'wrong', ?, ?, ?)",
+            (
+                project,
+                model,
+                configuration,
+                dimension,
+                math.sqrt(dimension),
+                VECTOR_ENCODING_RAW_F64LE_V1,
+                struct.pack(f"<{dimension}d", *([1.0] * dimension)),
+            ),
+        )
+        if location != "orphan":
+            if location == "alternate":
+                connection.execute(
+                    "UPDATE symbol_variants SET build_variant='alternate' WHERE symbol_id='file-a'"
+                )
+            connection.execute(
+                "UPDATE variant_embeddings SET model=?, configuration_id=?, dimensions=?, "
+                "content_hash='wrong' "
+                "WHERE variant_id IN (SELECT id FROM symbol_variants WHERE symbol_id='file-a')",
+                (model, configuration, dimension),
+            )
+        connection.commit()
+        if location == "selected":
+            with pytest.raises(ValueError, match="dimension"):
+                store.search_vector((1.0, 0.0), model="fixture")
+        else:
+            assert store.search_vector((1.0, 0.0), model="fixture")
+        assert store.search_vector((1.0, 0.0), model="fixture", build_scope=("missing",)) == ()
+        if location == "alternate":
+            with pytest.raises(ValueError, match="dimension"):
+                store.search_vector(
+                    (1.0, 0.0), model="fixture", build_scope=("default", "alternate")
+                )
+        assert not hasattr(store._vector_query_state, "current")
+
+
 def test_vector_search_scores_shared_content_once(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "project"
     root.mkdir()

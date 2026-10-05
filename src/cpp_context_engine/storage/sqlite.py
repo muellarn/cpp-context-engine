@@ -8340,32 +8340,35 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in names)
         with self._vector_search_lock:
             project_id = self._project_id(project_root)
-            dimensions = {
-                row[0]
-                for row in self._connection.execute(
+            # Two primary-key ranges skip the entire correct-dimension pool.
+            # Only an attached vector in the requested build scope is a witness.
+            for comparison in ("<", ">"):
+                mismatch = self._connection.execute(
                     f"""
-                SELECT DISTINCT vectors.dimensions FROM variant_embeddings embeddings
-                JOIN embedding_vectors vectors
-                  ON vectors.project_id = embeddings.project_id
-                 AND vectors.model = embeddings.model
-                 AND vectors.configuration_id = embeddings.configuration_id
-                 AND vectors.dimensions = embeddings.dimensions
-                 AND vectors.content_hash = embeddings.content_hash
-                JOIN symbol_variants variants
-                  ON variants.project_id = embeddings.project_id
-                 AND variants.id = embeddings.variant_id
-                WHERE embeddings.project_id = ? AND embeddings.model = ?
-                  AND embeddings.configuration_id = ?
-                  AND variants.build_variant IN ({placeholders})
+                SELECT vectors.dimensions FROM embedding_vectors vectors
+                WHERE vectors.project_id = ? AND vectors.model = ?
+                  AND vectors.configuration_id = ? AND vectors.dimensions {comparison} ?
+                  AND EXISTS (
+                    SELECT 1 FROM variant_embeddings embeddings
+                    CROSS JOIN symbol_variants variants
+                    WHERE embeddings.project_id = vectors.project_id
+                      AND embeddings.model = vectors.model
+                      AND embeddings.configuration_id = vectors.configuration_id
+                      AND embeddings.dimensions = vectors.dimensions
+                      AND embeddings.content_hash = vectors.content_hash
+                      AND variants.project_id = embeddings.project_id
+                      AND variants.id = embeddings.variant_id
+                      AND variants.build_variant IN ({placeholders})
+                  )
+                ORDER BY vectors.dimensions LIMIT 1
                 """,
-                    (project_id, model, configuration, *names),
-                )
-            }
-            if dimensions and dimensions != {len(query_vector)}:
-                raise ValueError(
-                    f"query dimension {len(query_vector)} does not match model {model!r} "
-                    f"dimension {next(iter(dimensions))}"
-                )
+                    (project_id, model, configuration, len(query_vector), *names),
+                ).fetchone()
+                if mismatch is not None:
+                    raise ValueError(
+                        f"query dimension {len(query_vector)} does not match model {model!r} "
+                        f"dimension {mismatch[0]}"
+                    )
             previous_query = getattr(self._vector_query_state, "current", None)
             self._vector_query_state.current = (query_vector, query_magnitude)
             try:
