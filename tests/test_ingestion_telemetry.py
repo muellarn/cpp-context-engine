@@ -419,7 +419,7 @@ def test_closing_pipeline_records_active_converter_cancellation(
 
     monkeypatch.setattr(_FactBatchBuilder, "build", blocked_build)
     batches = NativeClangIngestor(
-        _EmptyClient(), max_workers=2, observer=events.append
+        _EmptyClient(), max_workers=2, max_domain_batches=2, observer=events.append
     ).iter_configuration_batches(tmp_path, _configurations(tmp_path, 2))
     next(batches)
     batches.close()
