@@ -3,6 +3,7 @@ import sqlite3
 from dataclasses import replace
 
 import pytest
+from embedding_fixtures import materialize_v24_embeddings
 from test_symbol_snapshot_compression import _batch, _put
 
 import cpp_context_engine.storage.sqlite as storage
@@ -27,6 +28,7 @@ def _documents(connection):
 
 
 def _legacy_layout(connection):
+    materialize_v24_embeddings(connection)
     documents = _documents(connection)
     connection.execute("DROP TABLE symbol_variant_fts")
     connection.execute("DROP VIEW IF EXISTS symbol_variant_fts_source")
