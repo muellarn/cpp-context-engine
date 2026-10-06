@@ -868,18 +868,47 @@ def _semantic_reader(spec: Mapping[str, Any]) -> dict[str, Any]:
             return _semantic_snapshot_tables(database, tables, _connection=connection)
 
 
+def _integrity_reader(spec: Mapping[str, Any]) -> dict[str, str]:
+    deadline = float(spec["deadline_monotonic"])
+    if not math.isfinite(deadline) or time.monotonic() >= deadline:
+        raise TimeoutError("integrity verification deadline exceeded")
+    database = Path(spec["database"])
+    uri = database.resolve(strict=True).as_uri() + "?mode=ro"
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        with _semantic_deadline(connection, deadline):
+            return {"integrity": _validate_database_integrity(connection)}
+
+
+def _parallel_database_checks(
+    database: Path, owner: sqlite3.Connection, *, deadline_monotonic: float
+) -> tuple[dict[str, Any], str]:
+    """Overlap complete committed integrity and semantic checks under one owner."""
+    with _semantic_deadline(owner, deadline_monotonic):
+        snapshot, integrity = _parallel_semantic_snapshot_locked(
+            database, owner, deadline_monotonic, verify_integrity=True
+        )
+    if integrity != "ok":
+        raise RuntimeError("missing successful integrity verification")
+    return snapshot, integrity
+
+
 def _parallel_semantic_snapshot(
     database: Path, owner: sqlite3.Connection, *, deadline_monotonic: float
 ) -> dict[str, Any]:
     """Read disjoint tables under the caller's fresh, write-free BEGIN IMMEDIATE."""
 
     with _semantic_deadline(owner, deadline_monotonic):
-        return _parallel_semantic_snapshot_locked(database, owner, deadline_monotonic)
+        return _parallel_semantic_snapshot_locked(database, owner, deadline_monotonic)[0]
 
 
 def _parallel_semantic_snapshot_locked(
-    database: Path, owner: sqlite3.Connection, deadline_monotonic: float
-) -> dict[str, Any]:
+    database: Path,
+    owner: sqlite3.Connection,
+    deadline_monotonic: float,
+    *,
+    verify_integrity: bool = False,
+) -> tuple[dict[str, Any], str | None]:
     def check_deadline() -> None:
         if not math.isfinite(deadline_monotonic) or time.monotonic() >= deadline_monotonic:
             raise TimeoutError("semantic verification deadline exceeded")
@@ -897,7 +926,9 @@ def _parallel_semantic_snapshot_locked(
     available = _available_semantic_tables(owner)
     tables = [table for table in _SEMANTIC_TABLES if table in available]
     if len(tables) < 2:
-        return semantic_snapshot(database, _connection=owner)
+        snapshot = semantic_snapshot(database, _connection=owner)
+        integrity = _validate_database_integrity(owner) if verify_integrity else None
+        return snapshot, integrity
     counts = {}
     widths = {}
     for table in tables:
@@ -917,26 +948,31 @@ def _parallel_semantic_snapshot_locked(
     schema = int(owner.execute("PRAGMA user_version").fetchone()[0])
     processes: list[subprocess.Popen[bytes]] = []
     results = []
+    integrity = None
+    reader_groups: list[list[str] | None] = list(groups)
+    if verify_integrity:
+        reader_groups.append(None)
     with contextlib.ExitStack() as stack:
         outputs = []
         try:
-            for group in groups:
+            for group in reader_groups:
                 check_deadline()
                 output = stack.enter_context(tempfile.TemporaryFile())
                 errors = stack.enter_context(tempfile.TemporaryFile())
                 outputs.append(output)
                 spec = {
                     "database": str(database.resolve()),
-                    "tables": group,
                     "deadline_monotonic": deadline_monotonic,
                 }
+                if group is not None:
+                    spec["tables"] = group
                 processes.append(
                     subprocess.Popen(
                         [
                             sys.executable,
                             "-m",
                             "cpp_context_engine.kicad_canary",
-                            "--_semantic-spec",
+                            "--_semantic-spec" if group is not None else "--_integrity-spec",
                             json.dumps(spec),
                         ],
                         stdin=subprocess.DEVNULL,
@@ -947,17 +983,22 @@ def _parallel_semantic_snapshot_locked(
             while any(process.poll() is None for process in processes):
                 check_deadline()
                 if any(process.poll() not in (None, 0) for process in processes):
-                    raise RuntimeError("semantic reader failed")
+                    raise RuntimeError("semantic or integrity reader failed")
                 time.sleep(0.02)
             check_deadline()
-            for process, output, group in zip(processes, outputs, groups, strict=True):
+            for process, output, group in zip(processes, outputs, reader_groups, strict=True):
                 if process.returncode != 0:
-                    raise RuntimeError("semantic reader failed")
+                    raise RuntimeError("semantic or integrity reader failed")
                 output.seek(0)
                 payload = output.read(65537)
                 if len(payload) > 65536:
                     raise RuntimeError("semantic reader output limit exceeded")
                 result = json.loads(payload)
+                if group is None:
+                    if result != {"integrity": "ok"}:
+                        raise RuntimeError("invalid integrity reader result")
+                    integrity = "ok"
+                    continue
                 if (
                     not isinstance(result, dict)
                     or set(result) != {"digest", "counts", "schema_version", "table_digests"}
@@ -997,7 +1038,7 @@ def _parallel_semantic_snapshot_locked(
         "counts": counts,
         "schema_version": schema,
         "table_digests": table_digests,
-    }
+    }, integrity
 
 
 def database_provenance(
@@ -1957,8 +1998,7 @@ def _revalidate_final_artifacts(
 
         with _database_writer_exclusion(database) as connection:
             database_artifact = _database_artifact_digest(database)
-            integrity = _validate_database_integrity(connection)
-            snapshot = _parallel_semantic_snapshot(
+            snapshot, integrity = _parallel_database_checks(
                 database, connection, deadline_monotonic=deadline_monotonic
             )
             provenance = database_provenance(database, _connection=connection)
@@ -2098,13 +2138,12 @@ def _run_worker(spec_path: Path) -> int:
             config, tuple(spec["queries"])
         )
         with _database_writer_exclusion(database) as connection:
-            snapshot = _parallel_semantic_snapshot(
+            snapshot, integrity = _parallel_database_checks(
                 database,
                 connection,
                 deadline_monotonic=spec["gate_started_monotonic"] + spec["total_wall_seconds"],
             )
             provenance = database_provenance(database, _connection=connection)
-            integrity = _validate_database_integrity(connection)
             database_artifact = _database_artifact_digest(database)
         analyzer_sha256 = _sha256(analyzer)
         expected_analyzer = spec.get("measurement_provenance", {}).get("analyzer_sha256")
@@ -2588,6 +2627,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--_worker-spec", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--_semantic-spec", help=argparse.SUPPRESS)
+    parser.add_argument("--_integrity-spec", help=argparse.SUPPRESS)
     return parser
 
 
@@ -2596,6 +2636,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args._worker_spec is not None:
         return _run_worker(args._worker_spec)
     try:
+        if args._integrity_spec is not None:
+            print(json.dumps(_integrity_reader(json.loads(args._integrity_spec))))
+            return 0
         if args._semantic_spec is not None:
             print(json.dumps(_semantic_reader(json.loads(args._semantic_spec))))
             return 0
