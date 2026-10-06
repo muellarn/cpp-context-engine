@@ -74,7 +74,7 @@ def summary_input(tmp_path):
         "database_artifact_sha256": "a" * 64,
         "producer_pins": {
             "profile": "full",
-            "expected_fact_schema_version": 24,
+            "expected_fact_schema_version": 25,
             "engine_commit": "b" * 40,
             "project_commit": "c" * 40,
             "analyzer_sha256": "d" * 64,
@@ -82,7 +82,7 @@ def summary_input(tmp_path):
             "subset_cdb_sha256": "f" * 64,
         },
         "semantic_snapshot": {
-            "schema_version": 24,
+            "schema_version": 25,
             "digest": "a" * 64,
             "counts": {
                 **dict.fromkeys(_SEMANTIC_TABLES, 0),

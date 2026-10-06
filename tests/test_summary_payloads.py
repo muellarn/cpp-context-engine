@@ -200,8 +200,13 @@ def test_schema_v11_stores_propagated_summary_payloads_separately(tmp_path: Path
             )
         }
 
-    assert SCHEMA_VERSION == 24
-    assert {"summary_solution_payloads", "embedding_vectors", "variant_embeddings"} <= tables
+    assert SCHEMA_VERSION == 25
+    assert {
+        "summary_solution_payloads",
+        "embedding_content_records",
+        "embedding_attachment_records",
+        "embedding_namespaces",
+    } <= tables
 
 
 def test_v11_summary_database_upgrades_to_v12_without_changing_solution_payloads(
@@ -214,7 +219,7 @@ def test_v11_summary_database_upgrades_to_v12_without_changing_solution_payloads
         _downgrade_embedding_schema_to_v11(store)
 
     with SQLiteStore(database, project_root=FIXTURE) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 24  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 25  # noqa: SLF001
         assert _solution_rows(migrated) == before
         assert migrated._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
 
@@ -471,7 +476,7 @@ def test_v10_migration_compacts_existing_rows_without_changing_results(
         _insert_legacy_propagated_rows(store)
 
     with SQLiteStore(database, project_root=FIXTURE) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 24  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 25  # noqa: SLF001
         assert (
             migrated._connection.execute(  # noqa: SLF001
                 "SELECT count(*) FROM summary_effects WHERE is_local = 0"
@@ -509,7 +514,7 @@ def test_v10_direct_upgrade_preserves_summaries_and_local_vector_bytes(
         _insert_legacy_propagated_rows(store)
 
     with SQLiteStore(database, project_root=FIXTURE) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 24  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 25  # noqa: SLF001
         assert _solution_rows(migrated) == summary_rows
         assert (
             migrated._connection.execute(  # noqa: SLF001

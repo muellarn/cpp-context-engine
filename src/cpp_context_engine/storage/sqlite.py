@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
 _SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
@@ -939,6 +939,132 @@ class SQLiteStore:
             self._migrate_v23()
         if current <= 23:
             self._migrate_v24()
+        if current <= 24:
+            self._migrate_v25()
+
+    def _migrate_v25(self) -> None:
+        """Intern embedding namespaces and content references without re-embedding."""
+
+        connection = self._connection
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # Minimal historical fixtures may not have an embedding pool.
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='embedding_vectors'"
+            ).fetchone():
+                connection.execute("PRAGMA user_version=25")
+                return
+            connection.execute("ALTER TABLE variant_embeddings RENAME TO variant_embeddings_v24")
+            connection.execute("ALTER TABLE embedding_vectors RENAME TO embedding_vectors_v24")
+            _execute_script(
+                connection,
+                f"""
+                CREATE TABLE embedding_namespaces (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    configuration_id TEXT NOT NULL,
+                    UNIQUE(project_id,model,configuration_id),
+                    UNIQUE(project_id,id)
+                );
+                CREATE TABLE embedding_content_records (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    namespace_id INTEGER NOT NULL,
+                    dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+                    content_hash TEXT NOT NULL,
+                    content_text TEXT NOT NULL,
+                    magnitude REAL NOT NULL CHECK(magnitude > 0),
+                    vector_encoding INTEGER NOT NULL CHECK(vector_encoding IN (
+                        {VECTOR_ENCODING_RAW_F64LE_V1},{VECTOR_ENCODING_ZLIB_F64LE_V1})),
+                    vector BLOB NOT NULL CHECK(typeof(vector)='blob'),
+                    CHECK((vector_encoding={VECTOR_ENCODING_RAW_F64LE_V1}
+                           AND length(vector)=dimensions*8)
+                        OR (vector_encoding={VECTOR_ENCODING_ZLIB_F64LE_V1}
+                            AND length(vector)>0)),
+                    UNIQUE(project_id,namespace_id,dimensions,content_hash),
+                    UNIQUE(project_id,namespace_id,id),
+                    FOREIGN KEY(project_id,namespace_id)
+                        REFERENCES embedding_namespaces(project_id,id) ON DELETE CASCADE
+                );
+                CREATE TABLE embedding_attachment_records (
+                    project_id INTEGER NOT NULL,
+                    variant_id TEXT NOT NULL,
+                    namespace_id INTEGER NOT NULL,
+                    content_id INTEGER NOT NULL,
+                    PRIMARY KEY(project_id,variant_id,namespace_id),
+                    FOREIGN KEY(project_id,variant_id)
+                        REFERENCES symbol_variants(project_id,id) ON DELETE CASCADE,
+                    FOREIGN KEY(project_id,namespace_id,content_id)
+                        REFERENCES embedding_content_records(project_id,namespace_id,id)
+                ) WITHOUT ROWID;
+                CREATE INDEX embedding_attachments_content
+                    ON embedding_attachment_records(project_id,namespace_id,content_id);
+                CREATE VIEW embedding_vectors (
+                    project_id,model,configuration_id,dimensions,content_hash,
+                    content_text,magnitude,vector_encoding,vector
+                ) AS SELECT c.project_id,n.model,n.configuration_id,c.dimensions,c.content_hash,
+                    c.content_text,c.magnitude,c.vector_encoding,c.vector
+                    FROM embedding_content_records c JOIN embedding_namespaces n
+                        ON n.project_id=c.project_id AND n.id=c.namespace_id;
+                CREATE VIEW variant_embeddings (
+                    project_id,variant_id,model,configuration_id,dimensions,content_hash
+                ) AS SELECT a.project_id,a.variant_id,n.model,n.configuration_id,
+                    c.dimensions,c.content_hash FROM embedding_attachment_records a
+                    JOIN embedding_namespaces n
+                        ON n.project_id=a.project_id AND n.id=a.namespace_id
+                    JOIN embedding_content_records c ON c.project_id=a.project_id
+                        AND c.namespace_id=a.namespace_id AND c.id=a.content_id;
+                """,
+            )
+            self._embedding_migration_checkpoint("namespace-created")
+            if connection.execute("SELECT 1 FROM embedding_vectors_v24 LIMIT 1").fetchone():
+                connection.execute(
+                    "INSERT INTO embedding_namespaces(project_id,model,configuration_id) "
+                    "SELECT DISTINCT project_id,model,configuration_id FROM embedding_vectors_v24 "
+                    "ORDER BY project_id,model,configuration_id"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO embedding_content_records(project_id,namespace_id,dimensions,
+                        content_hash,content_text,magnitude,vector_encoding,vector)
+                    SELECT v.project_id,n.id,v.dimensions,v.content_hash,v.content_text,
+                        v.magnitude,v.vector_encoding,v.vector FROM embedding_vectors_v24 v
+                    JOIN embedding_namespaces n ON n.project_id=v.project_id
+                        AND n.model=v.model AND n.configuration_id=v.configuration_id
+                    ORDER BY v.project_id,v.model,v.configuration_id,v.dimensions,v.content_hash
+                    """
+                )
+            if connection.execute("SELECT 1 FROM variant_embeddings_v24 LIMIT 1").fetchone():
+                connection.execute(
+                    """
+                    INSERT INTO embedding_attachment_records
+                    SELECT a.project_id,a.variant_id,n.id,c.id FROM variant_embeddings_v24 a
+                    LEFT JOIN embedding_namespaces n ON n.project_id=a.project_id
+                        AND n.model=a.model AND n.configuration_id=a.configuration_id
+                    LEFT JOIN embedding_content_records c ON c.project_id=a.project_id
+                        AND c.namespace_id=n.id AND c.dimensions=a.dimensions
+                        AND c.content_hash=a.content_hash
+                    """
+                )
+            self._embedding_migration_checkpoint("namespace-copied")
+            for table in ("embedding_vectors", "variant_embeddings"):
+                for source, target in ((table, f"{table}_v24"), (f"{table}_v24", table)):
+                    if connection.execute(
+                        f"SELECT * FROM {source} EXCEPT SELECT * FROM {target} LIMIT 1"
+                    ).fetchone():
+                        raise RuntimeError("embedding namespace migration changed logical rows")
+            connection.execute("DROP TABLE variant_embeddings_v24")
+            connection.execute("DROP TABLE embedding_vectors_v24")
+            for table in (
+                "embedding_namespaces",
+                "embedding_content_records",
+                "embedding_attachment_records",
+            ):
+                if connection.execute(f"PRAGMA foreign_key_check({table})").fetchone():
+                    raise RuntimeError("embedding namespace migration failed foreign-key check")
+            self._embedding_migration_checkpoint("namespace-validated")
+            connection.execute("PRAGMA user_version=25")
 
     def _migrate_v24(self) -> None:
         """Intern occurrence context without changing its TU-local replace identity."""
@@ -4253,7 +4379,7 @@ class SQLiteStore:
         )
         self._connection.execute(
             f"""
-            DELETE FROM variant_embeddings
+            DELETE FROM embedding_attachment_records
             WHERE project_id = ? AND variant_id IN (
                 SELECT id FROM symbol_variants
                 WHERE project_id = ? AND translation_unit_id IN ({placeholders})
@@ -4647,7 +4773,7 @@ class SQLiteStore:
             placeholders = ",".join("?" for _ in chunk)
             self._connection.execute(
                 f"""
-                DELETE FROM variant_embeddings
+                DELETE FROM embedding_attachment_records
                 WHERE project_id = ? AND variant_id IN ({placeholders})
                 """,
                 (project_id, *chunk),
@@ -8487,6 +8613,48 @@ class SQLiteStore:
 
         self._connection.commit()
 
+    def _embedding_namespace(
+        self, project_id: int, model: str, configuration: str, *, create: bool = False
+    ) -> int | None:
+        scope = (project_id, model, configuration)
+        if create:
+            self._connection.execute(
+                "INSERT INTO embedding_namespaces(project_id,model,configuration_id) "
+                "VALUES(?,?,?) ON CONFLICT(project_id,model,configuration_id) DO NOTHING",
+                scope,
+            )
+        row = self._connection.execute(
+            "SELECT id FROM embedding_namespaces "
+            "WHERE project_id=? AND model=? AND configuration_id=?",
+            scope,
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def _write_embedding_attachments(
+        self, project_id: int, model: str, configuration: str, rows: Iterable[tuple[object, ...]]
+    ) -> None:
+        namespace = self._embedding_namespace(project_id, model, configuration)
+        if namespace is None:
+            raise RuntimeError("embedding namespace is missing")
+        # LEFT JOIN makes a missing validated content key fail its NOT NULL
+        # constraint instead of silently dropping an attachment from the batch.
+        self._insert_rows(
+            """
+            WITH incoming(project_id,variant_id,namespace_id,dimensions,content_hash)
+                AS (VALUES {values})
+            INSERT INTO embedding_attachment_records
+            SELECT i.project_id,i.variant_id,i.namespace_id,c.id FROM incoming i
+            LEFT JOIN embedding_content_records c ON c.project_id=i.project_id
+                AND c.namespace_id=i.namespace_id AND c.dimensions=i.dimensions
+                AND c.content_hash=i.content_hash
+            WHERE 1
+            ON CONFLICT(project_id,variant_id,namespace_id) DO UPDATE SET
+                content_id=excluded.content_id
+            """,
+            ((project_id, row[1], namespace, row[4], row[5]) for row in rows),
+            columns=5,
+        )
+
     def attach_existing_embeddings(
         self,
         entries: Sequence[tuple[str, str]],
@@ -8534,6 +8702,7 @@ class SQLiteStore:
         if len(dimensions) != 1:
             raise RuntimeError(f"embedding configuration {configuration!r} has mixed dimensions")
         dimension = next(iter(dimensions))
+        namespace = self._embedding_namespace(project_id, model, configuration)
         texts_by_hash: dict[str, str] = {}
         for _, text in entries:
             content_hash = _embedding_content_hash(text)
@@ -8547,12 +8716,11 @@ class SQLiteStore:
             placeholders = ",".join("?" for _ in chunk)
             for row in self._connection.execute(
                 f"""
-                SELECT content_hash, content_text FROM embedding_vectors
-                WHERE project_id = ? AND model = ?
-                  AND configuration_id = ? AND dimensions = ?
+                SELECT content_hash, content_text FROM embedding_content_records
+                WHERE project_id = ? AND namespace_id = ? AND dimensions = ?
                   AND content_hash IN ({placeholders})
                 """,
-                (project_id, model, configuration, dimension, *chunk),
+                (project_id, namespace, dimension, *chunk),
             ):
                 if texts_by_hash[row["content_hash"]] != row["content_text"]:
                     raise ValueError("embedding content hash collision")
@@ -8569,17 +8737,7 @@ class SQLiteStore:
             for variant_id, text in entries
             if _embedding_content_hash(text) in existing
         ]
-        self._connection.executemany(
-            """
-            INSERT INTO variant_embeddings(
-                project_id, variant_id, model, configuration_id, dimensions, content_hash
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(project_id, variant_id, model, configuration_id) DO UPDATE SET
-                dimensions = excluded.dimensions,
-                content_hash = excluded.content_hash
-            """,
-            attached,
-        )
+        self._write_embedding_attachments(project_id, model, configuration, attached)
         return tuple(
             (variant_id, text)
             for variant_id, text in entries
@@ -8659,11 +8817,11 @@ class SQLiteStore:
             references.append(
                 (project_id, variant_id, model, configuration, len(normalized), content_hash)
             )
+        namespace = self._embedding_namespace(project_id, model, configuration, create=True)
         vector_rows = tuple(
             (
                 project_id,
-                model,
-                configuration,
+                namespace,
                 dimensions,
                 content_hash,
                 text,
@@ -8675,12 +8833,12 @@ class SQLiteStore:
         for offset in range(0, len(vector_rows), 512):
             self._connection.executemany(
                 """
-                INSERT INTO embedding_vectors(
-                    project_id, model, configuration_id, dimensions, content_hash,
+                INSERT INTO embedding_content_records(
+                    project_id, namespace_id, dimensions, content_hash,
                     content_text, magnitude, vector_encoding, vector
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(
-                    project_id, model, configuration_id, dimensions, content_hash
+                    project_id, namespace_id, dimensions, content_hash
                 ) DO NOTHING
                 """,
                 vector_rows[offset : offset + 512],
@@ -8693,11 +8851,11 @@ class SQLiteStore:
             for row in self._connection.execute(
                 f"""
                 SELECT content_hash, content_text, vector_encoding, vector
-                FROM embedding_vectors
-                WHERE project_id = ? AND model = ? AND configuration_id = ?
+                FROM embedding_content_records
+                WHERE project_id = ? AND namespace_id = ?
                   AND dimensions = ? AND content_hash IN ({placeholders})
                 """,
-                (project_id, model, configuration, expected, *chunk),
+                (project_id, namespace, expected, *chunk),
             ):
                 text, _, _, encoded = vectors[row["content_hash"]]
                 if row["content_text"] != text:
@@ -8710,17 +8868,7 @@ class SQLiteStore:
                 validated.add(row["content_hash"])
         if len(validated) != len(vectors):
             raise RuntimeError("failed to persist all embedding vectors")
-        self._connection.executemany(
-            """
-            INSERT INTO variant_embeddings(
-                project_id, variant_id, model, configuration_id, dimensions, content_hash
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(project_id, variant_id, model, configuration_id) DO UPDATE SET
-                dimensions = excluded.dimensions,
-                content_hash = excluded.content_hash
-            """,
-            references,
-        )
+        self._write_embedding_attachments(project_id, model, configuration, references)
 
     def _embedding_configuration_dimensions(
         self, project_id: int, model: str, configuration_id: str
@@ -8730,11 +8878,14 @@ class SQLiteStore:
         # Both callers reject a mixed pool; enumerating every dimension with
         # DISTINCT rescans all equal vectors on every embedding batch. Seek in
         # the existing composite primary key instead, without caching pool state.
-        scope = (project_id, model, configuration_id)
+        namespace = self._embedding_namespace(project_id, model, configuration_id)
+        if namespace is None:
+            return set()
+        scope = (project_id, namespace)
         first = self._connection.execute(
             """
-            SELECT dimensions FROM embedding_vectors
-            WHERE project_id = ? AND model = ? AND configuration_id = ?
+            SELECT dimensions FROM embedding_content_records
+            WHERE project_id = ? AND namespace_id = ?
             ORDER BY dimensions LIMIT 1
             """,
             scope,
@@ -8744,8 +8895,8 @@ class SQLiteStore:
         dimension = int(first[0])
         other = self._connection.execute(
             """
-            SELECT dimensions FROM embedding_vectors
-            WHERE project_id = ? AND model = ? AND configuration_id = ?
+            SELECT dimensions FROM embedding_content_records
+            WHERE project_id = ? AND namespace_id = ?
               AND dimensions > ?
             ORDER BY dimensions LIMIT 1
             """,
@@ -8784,16 +8935,21 @@ class SQLiteStore:
     def _delete_orphan_embedding_vectors(self, project_id: int) -> None:
         self._connection.execute(
             """
-            DELETE FROM embedding_vectors
+            DELETE FROM embedding_content_records
             WHERE project_id = ? AND NOT EXISTS (
-                SELECT 1 FROM variant_embeddings references_
-                WHERE references_.project_id = embedding_vectors.project_id
-                  AND references_.configuration_id = embedding_vectors.configuration_id
-                  AND references_.model = embedding_vectors.model
-                  AND references_.dimensions = embedding_vectors.dimensions
-                  AND references_.content_hash = embedding_vectors.content_hash
+                SELECT 1 FROM embedding_attachment_records references_
+                WHERE references_.project_id = embedding_content_records.project_id
+                  AND references_.namespace_id = embedding_content_records.namespace_id
+                  AND references_.content_id = embedding_content_records.id
             )
             """,
+            (project_id,),
+        )
+        self._connection.execute(
+            "DELETE FROM embedding_namespaces WHERE project_id=? AND NOT EXISTS ("
+            "SELECT 1 FROM embedding_content_records c "
+            "WHERE c.project_id=embedding_namespaces.project_id "
+            "AND c.namespace_id=embedding_namespaces.id)",
             (project_id,),
         )
 
@@ -8809,6 +8965,7 @@ class SQLiteStore:
 
         project_id = self._project_id(project_root)
         configuration = configuration_id or model
+        namespace = self._embedding_namespace(project_id, model, configuration)
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
         return tuple(
@@ -8817,17 +8974,16 @@ class SQLiteStore:
                 for row in self._connection.execute(
                     f"""
                     SELECT variants.symbol_id FROM symbol_variants variants
-                    LEFT JOIN variant_embeddings embeddings
+                    LEFT JOIN embedding_attachment_records embeddings
                      ON embeddings.project_id = variants.project_id
                      AND embeddings.variant_id = variants.id
-                     AND embeddings.model = ?
-                     AND embeddings.configuration_id = ?
+                     AND embeddings.namespace_id = ?
                     WHERE variants.project_id = ?
                       AND variants.build_variant IN ({placeholders})
                       AND embeddings.variant_id IS NULL
                     ORDER BY variants.build_variant, variants.symbol_id
                     """,
-                    (model, configuration, project_id, *names),
+                    (namespace, project_id, *names),
                 )
             )
         )
@@ -8842,6 +8998,7 @@ class SQLiteStore:
     ) -> tuple[str, ...]:
         project_id = self._project_id(project_root)
         configuration = configuration_id or model
+        namespace = self._embedding_namespace(project_id, model, configuration)
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
         return tuple(
@@ -8849,17 +9006,16 @@ class SQLiteStore:
             for row in self._connection.execute(
                 f"""
                 SELECT variants.id FROM symbol_variants variants
-                LEFT JOIN variant_embeddings embeddings
+                LEFT JOIN embedding_attachment_records embeddings
                  ON embeddings.project_id = variants.project_id
                  AND embeddings.variant_id = variants.id
-                 AND embeddings.model = ?
-                 AND embeddings.configuration_id = ?
+                 AND embeddings.namespace_id = ?
                 WHERE variants.project_id = ?
                   AND variants.build_variant IN ({placeholders})
                   AND embeddings.variant_id IS NULL
                 ORDER BY variants.build_variant, variants.id
                 """,
-                (model, configuration, project_id, *names),
+                (namespace, project_id, *names),
             )
         )
 
@@ -8880,14 +9036,15 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in names)
         last_variant = ""
         while True:
+            # Public writes between yields can delete and recreate a namespace.
+            namespace = self._embedding_namespace(project_id, model, configuration)
             rows = self._connection.execute(
                 f"""
                 SELECT variants.id FROM symbol_variants variants
-                LEFT JOIN variant_embeddings embeddings
+                LEFT JOIN embedding_attachment_records embeddings
                  ON embeddings.project_id = variants.project_id
                  AND embeddings.variant_id = variants.id
-                 AND embeddings.model = ?
-                 AND embeddings.configuration_id = ?
+                 AND embeddings.namespace_id = ?
                 WHERE variants.project_id = ?
                   AND variants.build_variant IN ({placeholders})
                   AND variants.id > ?
@@ -8895,7 +9052,7 @@ class SQLiteStore:
                 ORDER BY variants.id
                 LIMIT ?
                 """,
-                (model, configuration, project_id, *names, last_variant, batch_size),
+                (namespace, project_id, *names, last_variant, batch_size),
             ).fetchall()
             if not rows:
                 return
@@ -8936,16 +9093,17 @@ class SQLiteStore:
         select = f"""
             SELECT variants.rowid AS record_key, variants.id, variants.snapshot_id
             FROM symbol_variants variants
-            LEFT JOIN variant_embeddings embeddings
+            LEFT JOIN embedding_attachment_records embeddings
               ON embeddings.project_id=variants.project_id AND embeddings.variant_id=variants.id
-             AND embeddings.model=? AND embeddings.configuration_id=?
+             AND embeddings.namespace_id=?
             WHERE variants.project_id=? AND variants.build_variant IN ({placeholders})
               AND embeddings.variant_id IS NULL
         """
-        parameters = (model, configuration, project_id, *names)
         while True:
             if self._trusted_embedding_registry:
                 raise RuntimeError("trusted embedding batch is still outstanding")
+            namespace = self._embedding_namespace(project_id, model, configuration)
+            parameters = (namespace, project_id, *names)
             rows = []
             # Separate seeks avoid rescanning the start of a large shared-content
             # group. The existing (project, snapshot_id) index includes rowid.
@@ -9101,13 +9259,14 @@ class SQLiteStore:
     ) -> int:
         project_id = self._project_id(project_root)
         configuration = configuration_id or model
+        namespace = self._embedding_namespace(project_id, model, configuration)
         return int(
             self._connection.execute(
                 """
-                SELECT count(*) FROM variant_embeddings
-                WHERE project_id = ? AND model = ? AND configuration_id = ?
+                SELECT count(*) FROM embedding_attachment_records
+                WHERE project_id = ? AND namespace_id = ?
                 """,
-                (project_id, model, configuration),
+                (project_id, namespace),
             ).fetchone()[0]
         )
 
@@ -9120,13 +9279,14 @@ class SQLiteStore:
     ) -> int:
         project_id = self._project_id(project_root)
         configuration = configuration_id or model
+        namespace = self._embedding_namespace(project_id, model, configuration)
         return int(
             self._connection.execute(
                 """
-                SELECT count(*) FROM embedding_vectors
-                WHERE project_id = ? AND model = ? AND configuration_id = ?
+                SELECT count(*) FROM embedding_content_records
+                WHERE project_id = ? AND namespace_id = ?
                 """,
-                (project_id, model, configuration),
+                (project_id, namespace),
             ).fetchone()[0]
         )
 
@@ -9149,29 +9309,30 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in names)
         with self._vector_search_lock:
             project_id = self._project_id(project_root)
+            namespace = self._embedding_namespace(project_id, model, configuration)
+            if namespace is None:
+                return ()
             # Two primary-key ranges skip the entire correct-dimension pool.
             # Only an attached vector in the requested build scope is a witness.
             for comparison in ("<", ">"):
                 mismatch = self._connection.execute(
                     f"""
-                SELECT vectors.dimensions FROM embedding_vectors vectors
-                WHERE vectors.project_id = ? AND vectors.model = ?
-                  AND vectors.configuration_id = ? AND vectors.dimensions {comparison} ?
+                SELECT vectors.dimensions FROM embedding_content_records vectors
+                WHERE vectors.project_id = ? AND vectors.namespace_id = ?
+                  AND vectors.dimensions {comparison} ?
                   AND EXISTS (
-                    SELECT 1 FROM variant_embeddings embeddings
+                    SELECT 1 FROM embedding_attachment_records embeddings
                     CROSS JOIN symbol_variants variants
                     WHERE embeddings.project_id = vectors.project_id
-                      AND embeddings.model = vectors.model
-                      AND embeddings.configuration_id = vectors.configuration_id
-                      AND embeddings.dimensions = vectors.dimensions
-                      AND embeddings.content_hash = vectors.content_hash
+                      AND embeddings.namespace_id = vectors.namespace_id
+                      AND embeddings.content_id = vectors.id
                       AND variants.project_id = embeddings.project_id
                       AND variants.id = embeddings.variant_id
                       AND variants.build_variant IN ({placeholders})
                   )
                 ORDER BY vectors.dimensions LIMIT 1
                 """,
-                    (project_id, model, configuration, len(query_vector), *names),
+                    (project_id, namespace, len(query_vector), *names),
                 ).fetchone()
                 if mismatch is not None:
                     raise ValueError(
@@ -9186,21 +9347,19 @@ class SQLiteStore:
                 selected = self._connection.execute(
                     f"""
             WITH scores AS MATERIALIZED (
-                SELECT vectors.dimensions, vectors.content_hash,
+                SELECT vectors.id,
                        _cpp_context_cosine(
                            vectors.vector, vectors.vector_encoding, vectors.magnitude
                        ) AS score
-                FROM embedding_vectors vectors
-                WHERE vectors.project_id = ? AND vectors.model = ?
-                  AND vectors.configuration_id = ? AND vectors.dimensions = ?
+                FROM embedding_content_records vectors
+                WHERE vectors.project_id = ? AND vectors.namespace_id = ?
+                  AND vectors.dimensions = ?
                   AND EXISTS (
-                    SELECT 1 FROM variant_embeddings embeddings
+                    SELECT 1 FROM embedding_attachment_records embeddings
                     CROSS JOIN symbol_variants variants
                     WHERE embeddings.project_id = vectors.project_id
-                      AND embeddings.model = vectors.model
-                      AND embeddings.configuration_id = vectors.configuration_id
-                      AND embeddings.dimensions = vectors.dimensions
-                      AND embeddings.content_hash = vectors.content_hash
+                      AND embeddings.namespace_id = vectors.namespace_id
+                      AND embeddings.content_id = vectors.id
                       AND variants.project_id = embeddings.project_id
                       AND variants.id = embeddings.variant_id
                       AND variants.build_variant IN ({placeholders})
@@ -9210,12 +9369,10 @@ class SQLiteStore:
             )
             SELECT variants.id, variants.build_variant, scores.score
             FROM scores
-            CROSS JOIN variant_embeddings embeddings
+            CROSS JOIN embedding_attachment_records embeddings
             CROSS JOIN symbol_variants variants
-            WHERE embeddings.project_id = ? AND embeddings.model = ?
-              AND embeddings.configuration_id = ?
-              AND embeddings.dimensions = scores.dimensions
-              AND embeddings.content_hash = scores.content_hash
+            WHERE embeddings.project_id = ? AND embeddings.namespace_id = ?
+              AND embeddings.content_id = scores.id
               AND variants.project_id = embeddings.project_id
               AND variants.id = embeddings.variant_id
               AND variants.build_variant IN ({placeholders})
@@ -9226,14 +9383,12 @@ class SQLiteStore:
             """,
                     (
                         project_id,
-                        model,
-                        configuration,
+                        namespace,
                         len(query_vector),
                         *names,
                         limit - 1,
                         project_id,
-                        model,
-                        configuration,
+                        namespace,
                         *names,
                         limit,
                     ),

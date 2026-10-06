@@ -709,6 +709,28 @@ def _ordered_occurrence_rows(
                 yield from rows
 
 
+def _ordered_embedding_vector_rows(
+    connection: sqlite3.Connection, projection: str
+) -> Iterator[Sequence[Any]]:
+    # The public five-column key is unique; local namespace IDs are not ordered.
+    with contextlib.closing(
+        connection.execute(
+            "SELECT project_id,model,configuration_id FROM embedding_namespaces "
+            "ORDER BY project_id,model,configuration_id"
+        )
+    ) as namespaces:
+        for project_id, model, configuration in namespaces:
+            with contextlib.closing(
+                connection.execute(
+                    f'SELECT {projection} FROM "embedding_vectors" '
+                    "WHERE project_id=? AND model=? AND configuration_id=? "
+                    "ORDER BY dimensions,content_hash",
+                    (project_id, model, configuration),
+                )
+            ) as rows:
+                yield from rows
+
+
 def semantic_snapshot(
     database: Path, *, _connection: sqlite3.Connection | None = None
 ) -> dict[str, Any]:
@@ -723,7 +745,8 @@ def semantic_snapshot(
             row[0]: row[1]
             for row in connection.execute(
                 "SELECT name, type FROM sqlite_master "
-                "WHERE type='table' OR (type='view' AND name IN ('edges','occurrences')) "
+                "WHERE type='table' OR (type='view' AND name IN "
+                "('edges','occurrences','embedding_vectors','variant_embeddings')) "
                 "ORDER BY name"
             )
         }
@@ -765,6 +788,15 @@ def semantic_snapshot(
                 and columns[:3] == ("project_id", "translation_unit_id", "id")
             ):
                 rows = _ordered_occurrence_rows(connection, projection)
+            elif (
+                table == "embedding_vectors"
+                and schema_version >= 25
+                and available[table] == "view"
+                and "embedding_namespaces" in available
+                and columns[:5]
+                == ("project_id", "model", "configuration_id", "dimensions", "content_hash")
+            ):
+                rows = _ordered_embedding_vector_rows(connection, projection)
             else:
                 rows = connection.execute(f"SELECT {projection} FROM {source} ORDER BY {ordering}")
             visited = 0
