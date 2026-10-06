@@ -431,7 +431,8 @@ def test_full_facts_produce_distinct_input_without_embeddings(full_facts, tmp_pa
     assert result["whole_index_success"] is False
     assert result["embedding_completeness"] == "not_validated"
     assert result["semantic_snapshot"]["counts"]["embedding_vectors"] == 0
-    assert len(result["semantic_snapshot"]["table_digests"]) == 28
+    assert len(result["semantic_snapshot"]["table_digests"]) == 29
+    assert "symbol_snapshot_contents" in result["semantic_snapshot"]["table_digests"]
     assert result["summary_orderings"]["function"]["available"] is True
     assert result["guard"]["processes_clean"] is True
     assert summary_input._sha256(original) == before
