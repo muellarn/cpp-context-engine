@@ -1007,7 +1007,7 @@ def test_symbol_refresh_batches_preference_reads(tmp_path: Path) -> None:
         assert store.get_symbol("symbol-alpha") is not None
 
     assert (
-        sum("SELECT * FROM symbol_variant_snapshots" in statement for statement in statements) == 1
+        sum("JOIN symbol_variant_snapshots variants" in statement for statement in statements) == 1
     )
 
 
