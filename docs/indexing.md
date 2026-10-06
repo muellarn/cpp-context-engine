@@ -480,3 +480,14 @@ use integer references, with a separate partial override index. Migration checks
 bidirectional exact row parity and all new foreign keys inside one transaction.
 Fresh writes intern bounded batches, and TU replacement removes leaf facts before
 their provenance rows. This layout does not deduplicate or discard edge evidence.
+
+Schema v24 interns occurrence TU/configuration/build/path context while retaining
+all fourteen logical values through the `occurrences` read view. The original
+`(project, TU, occurrence ID)` replacement identity and direct canonical-symbol
+foreign key remain; enclosing-symbol strings intentionally have no such foreign
+key. Migration preserves row order keys, exact provenance (including historical
+configuration mismatches), and verifies bidirectional row parity and foreign keys
+atomically. Bounded writes retain input order, including multirow replacements;
+public ordering ties retain the original row-order key. Every child foreign key
+keeps a complete lookup index. Semantic validation hashes the logical view, not
+the allocation-dependent map or row keys.
