@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
 _SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
@@ -929,6 +929,61 @@ class SQLiteStore:
             self._migrate_v20()
         if current <= 20:
             self._migrate_v21()
+        if current <= 21:
+            self._migrate_v22()
+
+    def _migrate_v22(self) -> None:
+        """Store embedding attachments once, with one covering content lookup."""
+
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                "ALTER TABLE variant_embeddings RENAME TO variant_embeddings_v21"
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE variant_embeddings (
+                    project_id INTEGER NOT NULL,
+                    variant_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    configuration_id TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (project_id, variant_id, model, configuration_id),
+                    FOREIGN KEY (project_id, variant_id)
+                        REFERENCES symbol_variants(project_id, id) ON DELETE CASCADE,
+                    FOREIGN KEY (
+                        project_id, model, configuration_id, dimensions, content_hash
+                    ) REFERENCES embedding_vectors(
+                        project_id, model, configuration_id, dimensions, content_hash
+                    )
+                ) WITHOUT ROWID
+                """
+            )
+            # Empty legacy schemas can lack the FK parent tables.
+            if self._connection.execute("SELECT 1 FROM variant_embeddings_v21 LIMIT 1").fetchone():
+                self._connection.execute(
+                    "INSERT INTO variant_embeddings SELECT * FROM variant_embeddings_v21"
+                )
+            for source, destination in (
+                ("variant_embeddings_v21", "variant_embeddings"),
+                ("variant_embeddings", "variant_embeddings_v21"),
+            ):
+                if self._connection.execute(
+                    f"SELECT * FROM {source} EXCEPT SELECT * FROM {destination} LIMIT 1"
+                ).fetchone():
+                    raise RuntimeError("embedding attachment migration changed rows")
+            self._connection.execute("DROP TABLE variant_embeddings_v21")
+            self._connection.execute(
+                """
+                CREATE INDEX variant_embeddings_content ON variant_embeddings(
+                    project_id, model, configuration_id, dimensions, content_hash
+                )
+                """
+            )
+            if self._connection.execute("PRAGMA foreign_key_check(variant_embeddings)").fetchone():
+                raise RuntimeError("embedding attachment migration failed foreign-key check")
+            self._connection.execute("PRAGMA user_version=22")
 
     def _migrate_v20(self) -> None:
         """Share endpoint indexes between scoped graph queries and FK lookups."""

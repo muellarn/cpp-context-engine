@@ -62,7 +62,8 @@ def test_attachment_migration_preserves_rows_search_and_is_atomic(tmp_path, monk
         rows = [
             tuple(row)
             for row in store._connection.execute(
-                "SELECT * FROM variant_embeddings ORDER BY project_id,variant_id,model,configuration_id"
+                "SELECT * FROM variant_embeddings "
+                "ORDER BY project_id,variant_id,model,configuration_id"
             )
         ]
     original = SQLiteStore._migrate_v22
@@ -89,7 +90,8 @@ def test_attachment_migration_preserves_rows_search_and_is_atomic(tmp_path, monk
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
         assert (
             connection.execute(
-                "SELECT * FROM variant_embeddings ORDER BY project_id,variant_id,model,configuration_id"
+                "SELECT * FROM variant_embeddings "
+                "ORDER BY project_id,variant_id,model,configuration_id"
             ).fetchall()
             == rows
         )
@@ -101,7 +103,8 @@ def test_attachment_migration_preserves_rows_search_and_is_atomic(tmp_path, monk
         assert [
             tuple(row)
             for row in store._connection.execute(
-                "SELECT * FROM variant_embeddings ORDER BY project_id,variant_id,model,configuration_id"
+                "SELECT * FROM variant_embeddings "
+                "ORDER BY project_id,variant_id,model,configuration_id"
             )
         ] == rows
         assert store.search_vector((1.0, 0.0), model="fixture") == expected
@@ -119,11 +122,15 @@ def test_attachment_queries_ignore_unselected_configurations(tmp_path):
             for index in range(0 if upper == 32 else 32, upper):
                 configuration = f"excluded-{index}"
                 connection.execute(
-                    "INSERT INTO embedding_vectors SELECT project_id,model,?,dimensions,content_hash,content_text,magnitude,vector_encoding,vector FROM embedding_vectors WHERE configuration_id='fixture'",
+                    "INSERT INTO embedding_vectors SELECT project_id,model,?,dimensions,"
+                    "content_hash,content_text,magnitude,vector_encoding,vector "
+                    "FROM embedding_vectors WHERE configuration_id='fixture'",
                     (configuration,),
                 )
                 connection.execute(
-                    "INSERT INTO variant_embeddings SELECT project_id,variant_id,model,?,dimensions,content_hash FROM variant_embeddings WHERE configuration_id='fixture'",
+                    "INSERT INTO variant_embeddings SELECT project_id,variant_id,model,?,"
+                    "dimensions,content_hash FROM variant_embeddings "
+                    "WHERE configuration_id='fixture'",
                     (configuration,),
                 )
             connection.commit()
@@ -151,11 +158,13 @@ def test_attachment_content_and_variant_lookups_are_indexed(tmp_path):
         connection = store._connection
         for predicate, expected in (
             (
-                "project_id=1 AND variant_id='v' AND model='fixture' AND configuration_id='fixture'",
+                "project_id=1 AND variant_id='v' AND model='fixture' "
+                "AND configuration_id='fixture'",
                 "variant_id=?",
             ),
             (
-                "project_id=1 AND model='fixture' AND configuration_id='fixture' AND dimensions=2 AND content_hash='h'",
+                "project_id=1 AND model='fixture' AND configuration_id='fixture' "
+                "AND dimensions=2 AND content_hash='h'",
                 "content_hash=?",
             ),
             (
