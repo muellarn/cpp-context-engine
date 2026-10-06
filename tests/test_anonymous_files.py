@@ -8,6 +8,40 @@ import pytest
 from cpp_context_engine import summary_input
 
 
+@pytest.mark.parametrize("exit_after_ms", [250, 1000, 1001, None])
+def test_large_process_exit_wait_remains_bounded(process_files, monkeypatch, exit_after_ms):
+    original = Path.iterdir
+    closed = []
+    waits = []
+
+    def denied(path):
+        if path == process_files / "fd":
+            raise PermissionError("large process has released mm but is not yet a zombie")
+        return original(path)
+
+    class SlowExitPoll:
+        def register(self, fd, event):
+            assert (fd, event) == (42, select.POLLIN)
+
+        def poll(self, milliseconds):
+            waits.append(milliseconds)
+            if exit_after_ms is not None and exit_after_ms <= milliseconds:
+                return [(42, select.POLLIN)]
+            return []
+
+    monkeypatch.setattr(Path, "iterdir", denied)
+    monkeypatch.setattr(summary_input.os, "pidfd_open", lambda pid: 42)
+    monkeypatch.setattr(summary_input.os, "close", closed.append)
+    monkeypatch.setattr(select, "poll", SlowExitPoll)
+    if exit_after_ms is not None and exit_after_ms <= 1000:
+        assert summary_input._anonymous_bytes((123,)) == 0
+    else:
+        with pytest.raises(PermissionError):
+            summary_input._anonymous_bytes((123,))
+    assert len(waits) == 1 and waits[0] <= 1000
+    assert closed == [42]
+
+
 @pytest.mark.parametrize("exited", [True, False])
 def test_scan_synchronizes_with_kernel_exit_before_zombie(process_files, monkeypatch, exited):
     process = process_files
@@ -37,7 +71,7 @@ def test_scan_synchronizes_with_kernel_exit_before_zombie(process_files, monkeyp
     else:
         with pytest.raises(PermissionError):
             summary_input._anonymous_bytes((123,))
-    assert waits == [100]
+    assert waits == [1000]
     assert closed == [42]
 
 
@@ -111,7 +145,7 @@ def test_exit_synchronization_is_bounded_and_closes_pidfd(process_files, monkeyp
     else:
         assert summary_input._anonymous_process_exited(process_files, 77) == (outcome == "replaced")
     assert closed == [42]
-    assert waits == ([] if outcome == "replaced" else [100])
+    assert waits == ([] if outcome == "replaced" else [1000])
 
 
 @pytest.mark.parametrize("outcome", ["gone", "still_live", "denied"])

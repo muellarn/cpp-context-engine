@@ -405,11 +405,12 @@ def _anonymous_process_exited(process: Path, started: int) -> bool:
     try:
         if _anonymous_process_start(process) != started:
             return True
-        # Kernel teardown can deny fd access while stat still reports R. Wait for
-        # proven exit, never interpret the access failure itself as termination.
+        # Kernel teardown can deny fd access while stat still reports R; large
+        # processes can take longer than 100 ms. Bound each exit wait to one second,
+        # and never interpret the access failure or timeout itself as termination.
         poller = select.poll()
         poller.register(descriptor, select.POLLIN)
-        events = poller.poll(100)
+        events = poller.poll(1000)
         if any(fd == descriptor and event & select.POLLIN for fd, event in events):
             return True
         if events:
