@@ -340,6 +340,11 @@ now-unreferenced symbols, occurrences, graph edges, embeddings, and FTS rows.
 Symbols seen by multiple translation units retain origin mappings so updating or
 removing one unit does not discard facts still used by another.
 
+Canonical refresh seeks the preferred variant ID before loading its full snapshot,
+in bounded batches of requested symbols. Definition, build, and translation-unit
+preference ordering is unchanged; discarded variants no longer transfer their
+snapshot payloads to Python. Persisted legacy snapshot provenance is preserved.
+
 Schema v3 separates canonical Clang symbol identity from deduplicated
 build/configuration/translation-unit `symbol_variants`. Occurrences and graph edges
 carry the same provenance. Graph edges have stable evidence IDs, so repeated calls

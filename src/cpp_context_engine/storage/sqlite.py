@@ -4731,14 +4731,25 @@ class SQLiteStore:
         ids = sorted(symbol_ids)
         for offset in range(0, len(ids), 500):
             chunk = ids[offset : offset + 500]
-            placeholders = ",".join("?" for _ in chunk)
+            placeholders = ",".join("(?)" for _ in chunk)
             for row in self._connection.execute(
                 f"""
-                SELECT * FROM symbol_variant_snapshots
-                WHERE project_id = ? AND symbol_id IN ({placeholders})
-                ORDER BY symbol_id, is_definition DESC, build_variant, translation_unit_id
+                WITH requested(symbol_id) AS (VALUES {placeholders}),
+                preferred(id) AS MATERIALIZED (
+                    SELECT (
+                        SELECT id FROM symbol_variants
+                        WHERE project_id = ? AND symbol_id = requested.symbol_id
+                        ORDER BY is_definition DESC, build_variant, translation_unit_id
+                        LIMIT 1
+                    ) FROM requested
+                )
+                SELECT variants.* FROM preferred
+                -- Keep winners outermost; otherwise ordering can favor a project-wide scan.
+                CROSS JOIN symbol_variant_snapshots variants
+                  ON variants.project_id = ? AND variants.id = preferred.id
+                ORDER BY variants.symbol_id
                 """,
-                (project_id, *chunk),
+                (*chunk, project_id, project_id),
             ):
                 if row["symbol_id"] not in preferred:
                     preferred[row["symbol_id"]] = self._snapshot_symbol(
