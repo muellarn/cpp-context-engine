@@ -4744,7 +4744,8 @@ class SQLiteStore:
                     ) FROM requested
                 )
                 SELECT variants.* FROM preferred
-                JOIN symbol_variant_snapshots variants
+                -- Keep winners outermost; otherwise ordering can favor a project-wide scan.
+                CROSS JOIN symbol_variant_snapshots variants
                   ON variants.project_id = ? AND variants.id = preferred.id
                 ORDER BY variants.symbol_id
                 """,

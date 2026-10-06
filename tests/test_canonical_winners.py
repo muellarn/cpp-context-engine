@@ -127,7 +127,7 @@ def test_refresh_plan_limits_preference_seek_before_snapshot_fetch(tmp_path):
         _seed(store, tmp_path, 3)
         statements = []
         store._connection.set_trace_callback(statements.append)
-        store._refresh_symbols(store._project_id(), {"symbol-0000", "symbol-0001"})
+        store._refresh_symbols(store._project_id(), {f"symbol-{i:04}" for i in range(500)})
         store._connection.set_trace_callback(None)
         (selection,) = [statement for statement in statements if "WITH requested" in statement]
         plan = [row[3] for row in store._connection.execute("EXPLAIN QUERY PLAN " + selection)]
@@ -137,5 +137,8 @@ def test_refresh_plan_limits_preference_seek_before_snapshot_fetch(tmp_path):
             "symbol_variants_symbol_preference (project_id=? AND symbol_id=?)" in step
             for step in plan
         )
-        assert any("SEARCH variants USING INDEX" in step and "id=?" in step for step in plan)
-        assert any("SEARCH contents USING" in step and "id=?" in step for step in plan)
+        assert any(
+            "SEARCH variants USING INDEX" in step and "(project_id=? AND id=?)" in step
+            for step in plan
+        ), plan
+        assert "SEARCH contents USING INTEGER PRIMARY KEY (rowid=?)" in plan
