@@ -686,7 +686,8 @@ def semantic_snapshot(
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='table' OR (type='view' AND name='edges') ORDER BY name"
+                "WHERE type='table' OR (type='view' AND name IN ('edges','occurrences')) "
+                "ORDER BY name"
             )
         }
         for table in _SEMANTIC_TABLES:

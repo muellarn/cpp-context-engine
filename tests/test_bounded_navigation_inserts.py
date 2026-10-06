@@ -56,9 +56,7 @@ def test_navigation_occurrences_use_bounded_multirow_statements(
         finally:
             store._connection.set_trace_callback(None)
         inserts = [
-            sql
-            for sql in statements
-            if sql.lstrip().startswith("INSERT OR REPLACE INTO occurrences(")
+            sql for sql in statements if "INSERT OR REPLACE INTO occurrence_records (" in sql
         ]
         expected_statements = (1025 + chunk_rows - 1) // chunk_rows
         assert len(inserts) == expected_statements, (
@@ -161,7 +159,7 @@ def test_ingestion_failure_after_written_chunk_rolls_back_generation(
         failure_index = chunk_rows + 1
         if failure == "sql":
             store._connection.execute(f"""
-                CREATE TEMP TRIGGER fail_late_occurrence BEFORE INSERT ON occurrences
+                CREATE TEMP TRIGGER fail_late_occurrence BEFORE INSERT ON occurrence_records
                 WHEN NEW.id = 'new-{failure_index}' BEGIN SELECT RAISE(ABORT, 'late insert'); END
             """)
         first_chunk_written = False

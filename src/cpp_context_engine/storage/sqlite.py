@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
 _SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
@@ -110,7 +110,7 @@ _TRANSLATION_UNIT_DELETE_ORDER = (
     "cfg_blocks",
     "cfg_graphs",
     "callsites",
-    "occurrences",
+    "occurrence_units",
     "edge_provenance",
     "symbol_variants",
     "translation_unit_symbols",
@@ -140,7 +140,9 @@ _BULK_INGESTION_TABLES = frozenset(
         "dependencies",
         "translation_unit_symbols",
         "symbol_variants",
-        "occurrences",
+        "occurrence_units",
+        "occurrence_contexts",
+        "occurrence_records",
         "edge_records",
         "edge_provenance",
         "edge_symbols",
@@ -935,6 +937,135 @@ class SQLiteStore:
             self._migrate_v22()
         if current <= 22:
             self._migrate_v23()
+        if current <= 23:
+            self._migrate_v24()
+
+    def _migrate_v24(self) -> None:
+        """Intern occurrence context without changing its TU-local replace identity."""
+
+        connection = self._connection
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='occurrences'"
+            ).fetchone():
+                connection.execute("PRAGMA user_version=24")
+                return
+            connection.execute("ALTER TABLE occurrences RENAME TO occurrences_v23")
+            _execute_script(
+                connection,
+                """
+                CREATE TABLE occurrence_units (
+                    key INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    UNIQUE(project_id, translation_unit_id),
+                    UNIQUE(project_id, key),
+                    FOREIGN KEY(project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+                CREATE TABLE occurrence_contexts (
+                    key INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    unit_key INTEGER NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    UNIQUE(project_id, unit_key, build_configuration_id, build_variant, path),
+                    UNIQUE(project_id, unit_key, key),
+                    FOREIGN KEY(project_id, unit_key)
+                        REFERENCES occurrence_units(project_id, key) ON DELETE CASCADE
+                );
+                CREATE TABLE occurrence_records (
+                    record_key INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    unit_key INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    enclosing_symbol_id TEXT,
+                    kind TEXT NOT NULL,
+                    context_key INTEGER NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    start_column INTEGER NOT NULL,
+                    end_column INTEGER NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    UNIQUE(project_id, unit_key, id),
+                    FOREIGN KEY(project_id, unit_key, context_key)
+                        REFERENCES occurrence_contexts(project_id, unit_key, key) ON DELETE CASCADE,
+                    FOREIGN KEY(project_id, symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE
+                );
+                CREATE VIEW occurrences (
+                    project_id, translation_unit_id, id, symbol_id, enclosing_symbol_id,
+                    kind, path, start_line, end_line, start_column, end_column,
+                    build_variant, build_configuration_id, metadata_json
+                ) AS SELECT r.project_id, u.translation_unit_id, r.id, r.symbol_id,
+                    r.enclosing_symbol_id, r.kind, c.path, r.start_line, r.end_line,
+                    r.start_column, r.end_column, c.build_variant, c.build_configuration_id,
+                    r.metadata_json FROM occurrence_records r
+                    JOIN occurrence_units u ON u.project_id=r.project_id AND u.key=r.unit_key
+                    JOIN occurrence_contexts c ON c.project_id=r.project_id
+                        AND c.unit_key=r.unit_key AND c.key=r.context_key;
+                """,
+            )
+            if connection.execute("SELECT 1 FROM occurrences_v23 LIMIT 1").fetchone():
+                connection.execute(
+                    "INSERT INTO occurrence_units(project_id,translation_unit_id) "
+                    "SELECT DISTINCT project_id,translation_unit_id FROM occurrences_v23 "
+                    "ORDER BY project_id,translation_unit_id"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO occurrence_contexts
+                        (project_id,unit_key,build_configuration_id,build_variant,path)
+                    SELECT DISTINCT o.project_id,u.key,
+                        o.build_configuration_id,o.build_variant,o.path
+                    FROM occurrences_v23 o JOIN occurrence_units u
+                        ON u.project_id=o.project_id AND u.translation_unit_id=o.translation_unit_id
+                    ORDER BY o.project_id,u.key,o.build_configuration_id,o.build_variant,o.path
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO occurrence_records
+                    SELECT o.rowid,o.project_id,u.key,o.id,o.symbol_id,
+                        o.enclosing_symbol_id,o.kind,c.key,
+                        o.start_line,o.end_line,o.start_column,o.end_column,o.metadata_json
+                    FROM occurrences_v23 o
+                    JOIN occurrence_units u ON u.project_id=o.project_id
+                        AND u.translation_unit_id=o.translation_unit_id
+                    JOIN occurrence_contexts c ON c.project_id=o.project_id AND c.unit_key=u.key
+                        AND c.build_configuration_id=o.build_configuration_id
+                        AND c.build_variant=o.build_variant AND c.path=o.path
+                    ORDER BY o.rowid
+                    """
+                )
+            for source, destination in (
+                ("occurrences_v23", "occurrences"),
+                ("occurrences", "occurrences_v23"),
+            ):
+                if connection.execute(
+                    f"SELECT * FROM {source} EXCEPT SELECT * FROM {destination} LIMIT 1"
+                ).fetchone():
+                    raise RuntimeError("occurrence storage migration changed facts")
+            connection.execute("DROP TABLE occurrences_v23")
+            _execute_script(
+                connection,
+                """
+                CREATE INDEX occurrences_symbol ON occurrence_records(project_id,symbol_id);
+                CREATE INDEX occurrences_context
+                    ON occurrence_records(project_id,unit_key,context_key);
+                """,
+            )
+            for table in (
+                "occurrence_units",
+                "occurrence_contexts",
+                "occurrence_records",
+            ):
+                if connection.execute(f"PRAGMA foreign_key_check({table})").fetchone():
+                    raise RuntimeError("occurrence storage migration failed foreign-key check")
+            connection.execute("PRAGMA user_version=24")
 
     def _migrate_v23(self) -> None:
         """Intern repeated graph endpoints and exact TU/configuration provenance."""
@@ -4135,6 +4266,15 @@ class SQLiteStore:
         # for a shared-header reindex of the measured 200-TU smoke workload.
         self._connection.execute(
             f"""
+            DELETE FROM occurrence_records WHERE project_id=? AND unit_key IN (
+                SELECT key FROM occurrence_units
+                WHERE project_id=? AND translation_unit_id IN ({placeholders})
+            )
+            """,
+            (project_id, project_id, *ids),
+        )
+        self._connection.execute(
+            f"""
             DELETE FROM edge_records WHERE project_id=? AND provenance_key IN (
                 SELECT key FROM edge_provenance
                 WHERE project_id=? AND translation_unit_id IN ({placeholders})
@@ -4673,35 +4813,70 @@ class SQLiteStore:
             yield tuple(pending)
 
     def _put_occurrences(self, project_id: int, occurrences: Iterable[SymbolOccurrence]) -> None:
-        self._insert_rows(
-            """
-            INSERT OR REPLACE INTO occurrences(
-                project_id, translation_unit_id, id, symbol_id, enclosing_symbol_id,
-                kind, path, start_line, end_line, start_column, end_column,
-                build_configuration_id, build_variant, metadata_json
-            ) VALUES {values}
-            """,
+        rows = (
             (
-                (
-                    project_id,
-                    occurrence.translation_unit_id,
-                    occurrence.id,
-                    occurrence.symbol_id,
-                    occurrence.enclosing_symbol_id,
-                    occurrence.kind.value,
-                    str(occurrence.span.path),
-                    occurrence.span.start_line,
-                    occurrence.span.end_line,
-                    occurrence.span.start_column,
-                    occurrence.span.end_column,
-                    occurrence.build_configuration_id,
-                    occurrence.build_variant,
-                    json.dumps(dict(occurrence.metadata), sort_keys=True),
-                )
-                for occurrence in occurrences
-            ),
-            columns=14,
+                project_id,
+                occurrence.translation_unit_id,
+                occurrence.id,
+                occurrence.symbol_id,
+                occurrence.enclosing_symbol_id,
+                occurrence.kind.value,
+                str(occurrence.span.path),
+                occurrence.span.start_line,
+                occurrence.span.end_line,
+                occurrence.span.start_column,
+                occurrence.span.end_column,
+                occurrence.build_configuration_id,
+                occurrence.build_variant,
+                json.dumps(dict(occurrence.metadata), sort_keys=True),
+            )
+            for occurrence in occurrences
         )
+        for chunk in self._ingestion_row_batches(rows, columns=14):
+            self._insert_rows(
+                "INSERT INTO occurrence_units(project_id,translation_unit_id) "
+                "VALUES {values} ON CONFLICT(project_id,translation_unit_id) DO NOTHING",
+                dict.fromkeys((row[0], row[1]) for row in chunk),
+                columns=2,
+            )
+            self._insert_rows(
+                """
+                WITH incoming(project_id,translation_unit_id,configuration,variant,path)
+                    AS (VALUES {values})
+                INSERT INTO occurrence_contexts
+                    (project_id,unit_key,build_configuration_id,build_variant,path)
+                SELECT i.project_id,u.key,i.configuration,i.variant,i.path
+                FROM incoming i JOIN occurrence_units u ON u.project_id=i.project_id
+                    AND u.translation_unit_id=i.translation_unit_id
+                WHERE 1
+                ON CONFLICT(project_id,unit_key,build_configuration_id,build_variant,path)
+                    DO NOTHING
+                """,
+                dict.fromkeys((row[0], row[1], row[11], row[12], row[6]) for row in chunk),
+                columns=5,
+            )
+            # Keep input order for last-ID-wins replacements and occurrence
+            # ordering ties, matching the former rowid table's INSERT behavior.
+            self._insert_rows(
+                """
+                WITH incoming(project_id,translation_unit_id,id,symbol_id,enclosing_symbol_id,
+                    kind,path,start_line,end_line,start_column,end_column,
+                    build_configuration_id,build_variant,metadata_json) AS (VALUES {values})
+                INSERT OR REPLACE INTO occurrence_records (
+                    project_id,unit_key,id,symbol_id,enclosing_symbol_id,kind,context_key,
+                    start_line,end_line,start_column,end_column,metadata_json)
+                SELECT i.project_id,u.key,i.id,i.symbol_id,i.enclosing_symbol_id,i.kind,c.key,
+                    i.start_line,i.end_line,i.start_column,i.end_column,i.metadata_json
+                FROM incoming i
+                CROSS JOIN occurrence_units u ON u.project_id=i.project_id
+                    AND u.translation_unit_id=i.translation_unit_id
+                CROSS JOIN occurrence_contexts c ON c.project_id=i.project_id AND c.unit_key=u.key
+                    AND c.build_configuration_id=i.build_configuration_id
+                    AND c.build_variant=i.build_variant AND c.path=i.path
+                """,
+                chunk,
+                columns=14,
+            )
 
     def _put_edges(self, project_id: int, edges: Iterable[GraphEdge]) -> None:
         rows = (
@@ -7981,10 +8156,15 @@ class SQLiteStore:
             )
             for row in self._connection.execute(
                 f"""
-                SELECT * FROM occurrences
-                WHERE project_id = ? AND symbol_id = ?
-                  AND build_variant IN ({placeholders})
-                ORDER BY build_variant, path, start_line, start_column
+                SELECT r.*, u.translation_unit_id, c.path,
+                    c.build_configuration_id, c.build_variant
+                FROM occurrence_records r
+                JOIN occurrence_units u ON u.project_id=r.project_id AND u.key=r.unit_key
+                JOIN occurrence_contexts c ON c.project_id=r.project_id AND c.unit_key=r.unit_key
+                    AND c.key=r.context_key
+                WHERE r.project_id = ? AND r.symbol_id = ?
+                  AND c.build_variant IN ({placeholders})
+                ORDER BY c.build_variant, c.path, r.start_line, r.start_column, r.record_key
                 """,
                 (project_id, symbol_id, *names),
             )
