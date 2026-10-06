@@ -2,6 +2,7 @@ import sqlite3
 from dataclasses import replace
 
 import pytest
+from test_compact_graph_facts import _legacy_graph_layout
 from test_external_variant_fts import _legacy_layout as _legacy_fts_layout
 from test_symbol_snapshot_compression import _batch, _put
 
@@ -28,7 +29,7 @@ def _seed_graph(store, root):
 def _indexes(connection):
     return {
         row[1]: tuple(item[2] for item in connection.execute(f'PRAGMA index_info("{row[1]}")'))
-        for row in connection.execute("PRAGMA index_list(edges)")
+        for row in connection.execute("PRAGMA index_list(edge_records)")
     }
 
 
@@ -39,7 +40,7 @@ def _assert_endpoint_indexes(connection):
     for endpoint in ("source", "target"):
         assert indexes[f"edges_scope_{endpoint}"] == (
             "project_id",
-            f"{endpoint}_id",
+            f"{endpoint}_key",
             "build_variant",
             "relation",
         )
@@ -47,15 +48,16 @@ def _assert_endpoint_indexes(connection):
             plan = [
                 row[3]
                 for row in connection.execute(
-                    "EXPLAIN QUERY PLAN SELECT rowid FROM edges "
-                    f"WHERE project_id=1 AND {endpoint}_id='B'{suffix}"
+                    "EXPLAIN QUERY PLAN SELECT rowid FROM edge_records "
+                    f"WHERE project_id=1 AND {endpoint}_key=2{suffix}"
                 )
             ]
-            assert any(f"{endpoint}_id=?" in step for step in plan), plan
+            assert any(f"{endpoint}_key=?" in step for step in plan), plan
             assert not any("SCAN" in step for step in plan), plan
 
 
 def _legacy_layout(connection):
+    _legacy_graph_layout(connection)
     _legacy_fts_layout(connection)
     connection.execute("DROP INDEX IF EXISTS edges_overrides_scope")
     for name in ("edges_source", "edges_target", "edges_scope_source", "edges_scope_target"):
@@ -108,7 +110,9 @@ def test_graph_endpoint_migration_is_atomic(tmp_path, monkeypatch):
     with SQLiteStore(path, project_root=tmp_path) as store:
         _seed_graph(store, tmp_path)
         _legacy_layout(store._connection)
-        expected = _indexes(store._connection)
+        expected = tuple(
+            tuple(row) for row in store._connection.execute("PRAGMA index_list(edges)")
+        )
     original = SQLiteStore._migrate_v20
 
     def fail_second_index(store):
@@ -130,7 +134,7 @@ def test_graph_endpoint_migration_is_atomic(tmp_path, monkeypatch):
         SQLiteStore(path, project_root=tmp_path)
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
-        assert _indexes(connection) == expected
+        assert tuple(connection.execute("PRAGMA index_list(edges)")) == expected
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -209,10 +213,10 @@ def test_ordered_neighbors_keep_endpoint_seeks(tmp_path, direction, relations, l
             store._connection.set_trace_callback(None)
         query = next(sql for sql in statements if "relation FROM edges" in sql)
         plan = [row[3] for row in store._connection.execute("EXPLAIN QUERY PLAN " + query)]
-        assert not any("SCAN edges" in step for step in plan), plan
-        edges = [step for step in plan if "edges USING" in step]
+        assert not any(step.startswith("SCAN e ") for step in plan), plan
+        edges = [step for step in plan if step.startswith("SEARCH e ")]
         assert edges
-        assert all("source_id=?" in step or "target_id=?" in step for step in edges), plan
+        assert all("source_key=?" in step or "target_key=?" in step for step in edges), plan
 
 
 @pytest.mark.parametrize("direction", list(GraphDirection))

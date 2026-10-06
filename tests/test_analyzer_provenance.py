@@ -182,4 +182,4 @@ def test_v16_migration_preserves_unknown_tu_provenance(tmp_path: Path, deny_vers
         assert len(states) == 2
         assert all(state.analyzer_identity == "" for state in states.values())
         assert all(state.index_profile is IndexProfile.FULL for state in states.values())
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 22  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 23  # noqa: SLF001
