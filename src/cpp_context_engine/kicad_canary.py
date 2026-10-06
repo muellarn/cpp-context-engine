@@ -669,6 +669,46 @@ def _encode_digest_value(value: Any) -> bytes:
     return b"s" + len(encoded).to_bytes(8, "big") + encoded
 
 
+@contextlib.contextmanager
+def _semantic_read_connection(
+    database: Path, supplied: sqlite3.Connection | None
+) -> Iterator[sqlite3.Connection]:
+    connection = supplied if supplied is not None else sqlite3.connect(database)
+    owns_transaction = not connection.in_transaction
+    try:
+        if owns_transaction:
+            connection.execute("BEGIN")
+        try:
+            yield connection
+        finally:
+            if owns_transaction and connection.in_transaction:
+                connection.rollback()
+    finally:
+        if supplied is None:
+            connection.close()
+
+
+def _ordered_occurrence_rows(
+    connection: sqlite3.Connection, projection: str
+) -> Iterator[Sequence[Any]]:
+    # Public (project, TU, ID) is unique; local mapping keys do not define order.
+    with contextlib.closing(
+        connection.execute(
+            "SELECT project_id, translation_unit_id FROM occurrence_units "
+            "ORDER BY project_id, translation_unit_id"
+        )
+    ) as units:
+        for project_id, unit_id in units:
+            with contextlib.closing(
+                connection.execute(
+                    f'SELECT {projection} FROM "occurrences" '
+                    "WHERE project_id = ? AND translation_unit_id = ? ORDER BY id",
+                    (project_id, unit_id),
+                )
+            ) as rows:
+                yield from rows
+
+
 def semantic_snapshot(
     database: Path, *, _connection: sqlite3.Connection | None = None
 ) -> dict[str, Any]:
@@ -677,15 +717,12 @@ def semantic_snapshot(
     digest = hashlib.sha256()
     counts: dict[str, int] = {}
     table_digests: dict[str, str] = {}
-    connection_context = (
-        sqlite3.connect(database) if _connection is None else contextlib.nullcontext(_connection)
-    )
-    with connection_context as connection:
+    with _semantic_read_connection(database, _connection) as connection:
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         available = {
-            row[0]
+            row[0]: row[1]
             for row in connection.execute(
-                "SELECT name FROM sqlite_master "
+                "SELECT name, type FROM sqlite_master "
                 "WHERE type='table' OR (type='view' AND name IN ('edges','occurrences')) "
                 "ORDER BY name"
             )
@@ -720,10 +757,25 @@ def semantic_snapshot(
                 continue
             projection = ", ".join(f'"{column}"' for column in columns)
             ordering = ", ".join(str(position) for position in range(1, len(columns) + 1))
-            for row in connection.execute(f"SELECT {projection} FROM {source} ORDER BY {ordering}"):
-                for value in row:
-                    table_digest.update(_encode_digest_value(value))
-                table_digest.update(b"\xff")
+            if (
+                table == "occurrences"
+                and schema_version >= 24
+                and available[table] == "view"
+                and "occurrence_units" in available
+                and columns[:3] == ("project_id", "translation_unit_id", "id")
+            ):
+                rows = _ordered_occurrence_rows(connection, projection)
+            else:
+                rows = connection.execute(f"SELECT {projection} FROM {source} ORDER BY {ordering}")
+            visited = 0
+            with contextlib.closing(rows):
+                for row in rows:
+                    for value in row:
+                        table_digest.update(_encode_digest_value(value))
+                    table_digest.update(b"\xff")
+                    visited += 1
+            if visited != counts[table]:
+                raise RuntimeError(f"semantic snapshot row count changed for {table}")
             table_digests[table] = table_digest.hexdigest()
             digest.update(table.encode())
             digest.update(bytes.fromhex(table_digests[table]))
