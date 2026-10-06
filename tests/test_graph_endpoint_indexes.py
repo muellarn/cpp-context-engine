@@ -2,6 +2,7 @@ import sqlite3
 from dataclasses import replace
 
 import pytest
+from test_external_variant_fts import _legacy_layout as _legacy_fts_layout
 from test_symbol_snapshot_compression import _batch, _put
 
 from cpp_context_engine.models import GraphDirection, GraphEdge, GraphRelation
@@ -55,6 +56,7 @@ def _assert_endpoint_indexes(connection):
 
 
 def _legacy_layout(connection):
+    _legacy_fts_layout(connection)
     connection.execute("DROP INDEX IF EXISTS edges_overrides_scope")
     for name in ("edges_source", "edges_target", "edges_scope_source", "edges_scope_target"):
         connection.execute(f"DROP INDEX IF EXISTS {name}")

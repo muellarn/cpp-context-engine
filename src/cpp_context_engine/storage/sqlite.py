@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
 _SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
@@ -488,6 +488,10 @@ class SQLiteStore:
         self._connection.create_function(
             "_cpp_context_snapshot_name", 1, _symbol_snapshot_name, deterministic=True
         )
+        self._fts_snapshot_cache: tuple[str | bytes, dict[str, str]] | None = None
+        self._connection.create_function(
+            "_cpp_context_snapshot_field", 2, self._sqlite_snapshot_field, deterministic=True
+        )
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._defer_variant_fts = False
@@ -613,9 +617,16 @@ class SQLiteStore:
             self._execute_deferred_schema_step(f"create-index:{item.name}", item.create_sql)
 
     def _validate_fresh_generation(self) -> None:
+        if self._connection.execute(
+            "SELECT 1 FROM symbol_variants variants "
+            "LEFT JOIN symbol_variant_fts_rows documents "
+            "ON documents.project_id=variants.project_id AND documents.variant_id=variants.id "
+            "WHERE documents.record_id IS NULL LIMIT 1"
+        ).fetchone():
+            raise RuntimeError("fresh generation failed FTS document coverage validation")
         self._execute_deferred_schema_step(
             "fts:variant-integrity",
-            "INSERT INTO symbol_variant_fts(symbol_variant_fts) VALUES('integrity-check')",
+            "INSERT INTO symbol_variant_fts(symbol_variant_fts,rank) VALUES('integrity-check',1)",
         )
         if rows := list(self._connection.execute("PRAGMA foreign_key_check")):
             raise RuntimeError(f"fresh generation failed foreign-key validation: {rows[0]}")
@@ -633,6 +644,25 @@ class SQLiteStore:
     def close(self) -> None:
         self._closed = True
         self._connection.close()
+        self._fts_snapshot_cache = None
+
+    def _sqlite_snapshot_field(self, snapshot: str | bytes, field: str) -> str:
+        # FTS reads four fields from the same snapshot consecutively. Cache only
+        # one small decoded document; large source bodies never stay resident.
+        cached = self._fts_snapshot_cache
+        if cached is not None and cached[0] == snapshot:
+            return cached[1][field]
+        document = json.loads(_decode_symbol_snapshot(snapshot))
+        values = {
+            key: document[key]
+            for key in ("qualified_name", "signature", "documentation", "source_text")
+        }
+        self._fts_snapshot_cache = (
+            (snapshot, values)
+            if len(snapshot) <= 65536 and sum(len(value) for value in values.values()) <= 262144
+            else None
+        )
+        return values[field]
 
     def _set_foreign_key_enforcement(self, enabled: bool) -> None:
         self._connection.execute(f"PRAGMA foreign_keys = {int(enabled)}")
@@ -897,6 +927,8 @@ class SQLiteStore:
             self._migrate_v19()
         if current <= 19:
             self._migrate_v20()
+        if current <= 20:
+            self._migrate_v21()
 
     def _migrate_v20(self) -> None:
         """Share endpoint indexes between scoped graph queries and FK lookups."""
@@ -919,6 +951,91 @@ class SQLiteStore:
                     "WHERE relation='overrides'"
                 )
             self._connection.execute("PRAGMA user_version=20")
+
+    def _migrate_v21(self) -> None:
+        """Keep FTS postings while sourcing the original text from snapshots."""
+
+        connection = self._connection
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name='symbol_variant_fts'"
+            ).fetchone():
+                _execute_script(
+                    connection,
+                    """
+                    CREATE TABLE symbol_variant_fts_rows (
+                        record_id INTEGER PRIMARY KEY,
+                        project_id INTEGER NOT NULL,
+                        variant_id TEXT NOT NULL,
+                        UNIQUE(project_id,variant_id),
+                        FOREIGN KEY(project_id,variant_id)
+                            REFERENCES symbol_variants(project_id,id) ON DELETE CASCADE
+                    );
+                    INSERT INTO symbol_variant_fts_rows(record_id,project_id,variant_id)
+                        SELECT fts.rowid, variants.project_id, variants.id
+                        FROM symbol_variant_fts fts JOIN symbol_variants variants
+                          ON variants.project_id=fts.project_id AND variants.id=fts.variant_id;
+                    CREATE VIEW symbol_variant_fts_source AS
+                        SELECT documents.record_id, variants.project_id, variants.id AS variant_id,
+                               variants.symbol_id, variants.build_variant,
+                               _cpp_context_snapshot_field(contents.snapshot_json,'qualified_name')
+                                   AS qualified_name,
+                               _cpp_context_snapshot_field(contents.snapshot_json,'signature')
+                                   AS signature,
+                               _cpp_context_snapshot_field(contents.snapshot_json,'documentation')
+                                   AS documentation,
+                               _cpp_context_snapshot_field(contents.snapshot_json,'source_text')
+                                   AS source_text
+                        FROM symbol_variant_fts_rows documents
+                        JOIN symbol_variants variants
+                          ON variants.project_id=documents.project_id
+                         AND variants.id=documents.variant_id
+                        JOIN symbol_snapshot_contents contents
+                          ON contents.project_id=variants.project_id
+                         AND contents.id=variants.snapshot_id;
+                """,
+                )
+                counts = [
+                    connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                    for table in (
+                        "symbol_variant_fts",
+                        "symbol_variants",
+                        "symbol_variant_fts_rows",
+                    )
+                ]
+                if len(set(counts)) != 1:
+                    raise RuntimeError("FTS documents do not match all variants")
+                old_rows = connection.execute(
+                    "SELECT rowid,* FROM symbol_variant_fts ORDER BY rowid"
+                )
+                new_rows = connection.execute(
+                    "SELECT * FROM symbol_variant_fts_source ORDER BY record_id"
+                )
+                for old, new in zip(old_rows, new_rows, strict=True):
+                    if tuple(old) != tuple(new):
+                        raise RuntimeError("FTS document differs from its preserved snapshot")
+                _execute_script(
+                    connection,
+                    """
+                    ALTER TABLE symbol_variant_fts RENAME TO symbol_variant_fts_v20;
+                    CREATE VIRTUAL TABLE symbol_variant_fts USING fts5(
+                        project_id UNINDEXED,variant_id UNINDEXED,symbol_id UNINDEXED,
+                        build_variant UNINDEXED,qualified_name,signature,documentation,source_text,
+                        content='symbol_variant_fts_source',content_rowid='record_id',
+                        tokenize='unicode61'
+                    );
+                    INSERT INTO symbol_variant_fts(rowid,project_id,variant_id,symbol_id,
+                        build_variant,qualified_name,signature,documentation,source_text)
+                        SELECT rowid,* FROM symbol_variant_fts_v20;
+                    INSERT INTO symbol_variant_fts(symbol_variant_fts,rank)
+                        VALUES('integrity-check',1);
+                    DROP TABLE symbol_variant_fts_v20;
+                """,
+                )
+                if connection.execute("PRAGMA foreign_key_check").fetchone():
+                    raise RuntimeError("external FTS foreign-key failure")
+            connection.execute("PRAGMA user_version=21")
 
     def _migrate_v19(self) -> None:
         """Pool immutable snapshots without changing legacy provenance or FTS."""
@@ -2729,7 +2846,24 @@ class SQLiteStore:
             if manage_transaction:
                 self._connection.commit()
 
+    def _variant_fts_clear_sql(self) -> str:
+        return "INSERT INTO symbol_variant_fts(symbol_variant_fts) VALUES('delete-all')"
+
     def _rebuild_variant_fts(self, *, clear: bool = True) -> None:
+        if self._connection.execute("PRAGMA user_version").fetchone()[0] >= 21:
+            if clear:
+                self._connection.execute(self._variant_fts_clear_sql())
+            self._connection.execute(
+                "INSERT INTO symbol_variant_fts_rows(project_id,variant_id) "
+                "SELECT project_id,id FROM symbol_variants WHERE 1 "
+                "ON CONFLICT(project_id,variant_id) DO NOTHING"
+            )
+            self._connection.execute(
+                "INSERT INTO symbol_variant_fts(rowid,project_id,variant_id,symbol_id,"
+                "build_variant,qualified_name,signature,documentation,source_text) "
+                "SELECT * FROM symbol_variant_fts_source ORDER BY record_id"
+            )
+            return
         if clear:
             self._connection.execute("DELETE FROM symbol_variant_fts")
         # Older schema migrations invoke this helper before the pool exists.
@@ -2936,7 +3070,7 @@ class SQLiteStore:
                 self._refresh_tracked_symbols(project_id)
                 if fresh_generation:
                     self._execute_deferred_schema_step(
-                        "fts:variant-rebuild", "DELETE FROM symbol_variant_fts"
+                        "fts:variant-rebuild", self._variant_fts_clear_sql()
                     )
                     self._rebuild_variant_fts(clear=False)
                 self._delete_orphans(project_id)
@@ -3808,12 +3942,14 @@ class SQLiteStore:
         self._connection.execute(
             f"""
             DELETE FROM symbol_variant_fts
-            WHERE project_id = ? AND variant_id IN (
-                SELECT id FROM symbol_variants
-                WHERE project_id = ? AND translation_unit_id IN ({placeholders})
+            WHERE rowid IN (
+                SELECT documents.record_id FROM symbol_variant_fts_rows documents
+                JOIN symbol_variants variants
+                  ON variants.project_id=documents.project_id AND variants.id=documents.variant_id
+                WHERE variants.project_id = ? AND variants.translation_unit_id IN ({placeholders})
             )
             """,
-            (project_id, project_id, *ids),
+            (project_id, *ids),
         )
         self._connection.execute(
             f"""
@@ -4191,7 +4327,10 @@ class SQLiteStore:
                 self._connection.execute(
                     f"""
                     DELETE FROM symbol_variant_fts
-                    WHERE project_id = ? AND variant_id IN ({placeholders})
+                    WHERE rowid IN (
+                        SELECT record_id FROM symbol_variant_fts_rows
+                        WHERE project_id = ? AND variant_id IN ({placeholders})
+                    )
                     """,
                     (project_id, *chunk),
                 )
@@ -4245,14 +4384,32 @@ class SQLiteStore:
         )
         if not self._defer_variant_fts:
             self._connection.executemany(
+                "INSERT INTO symbol_variant_fts_rows(project_id,variant_id) VALUES(?,?) "
+                "ON CONFLICT(project_id,variant_id) DO NOTHING",
+                ((project_id, variant_id) for _, variant_id, _ in records),
+            )
+            document_ids = {}
+            for offset in range(0, len(variant_ids), 500):
+                chunk = variant_ids[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                document_ids.update(
+                    (row["variant_id"], row["record_id"])
+                    for row in self._connection.execute(
+                        "SELECT variant_id,record_id FROM symbol_variant_fts_rows "
+                        f"WHERE project_id=? AND variant_id IN ({placeholders})",
+                        (project_id, *chunk),
+                    )
+                )
+            self._connection.executemany(
                 """
                 INSERT INTO symbol_variant_fts(
-                    project_id, variant_id, symbol_id, build_variant,
+                    rowid, project_id, variant_id, symbol_id, build_variant,
                     qualified_name, signature, documentation, source_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     (
+                        document_ids[variant_id],
                         project_id,
                         variant_id,
                         symbol.id,
@@ -7636,9 +7793,11 @@ class SQLiteStore:
                    bm25(symbol_variant_fts, 0.0, 0.0, 0.0, 0.0, 8.0, 4.0, 2.0, 1.0)
                        AS rank
             FROM symbol_variant_fts
+            JOIN symbol_variant_fts_rows documents
+              ON documents.record_id = symbol_variant_fts.rowid
             JOIN symbol_variant_snapshots variants
-              ON variants.project_id = CAST(symbol_variant_fts.project_id AS INTEGER)
-             AND variants.id = symbol_variant_fts.variant_id
+              ON variants.project_id = documents.project_id
+             AND variants.id = documents.variant_id
             WHERE symbol_variant_fts MATCH ? AND variants.project_id = ?
               AND variants.build_variant IN ({placeholders})
             ORDER BY rank, variants.build_variant, variants.id
@@ -7687,9 +7846,11 @@ class SQLiteStore:
                    bm25(symbol_variant_fts, 0.0, 0.0, 0.0, 0.0, 12.0, 6.0, 0.0, 0.0)
                        AS rank
             FROM symbol_variant_fts
+            JOIN symbol_variant_fts_rows documents
+              ON documents.record_id = symbol_variant_fts.rowid
             JOIN symbol_variant_snapshots variants
-              ON variants.project_id = CAST(symbol_variant_fts.project_id AS INTEGER)
-             AND variants.id = symbol_variant_fts.variant_id
+              ON variants.project_id = documents.project_id
+             AND variants.id = documents.variant_id
             WHERE symbol_variant_fts MATCH ? AND variants.project_id = ?
               AND variants.build_variant IN ({placeholders})
             ORDER BY rank, variants.build_variant, variants.id
