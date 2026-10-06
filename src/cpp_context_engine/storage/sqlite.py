@@ -8917,7 +8917,7 @@ class SQLiteStore:
         batch_size: int = EMBEDDING_BATCH_SIZE,
         max_text_chars: int = DEFAULT_EMBEDDING_TEXT_CHARS,
     ) -> Iterator[_TrustedEmbeddingBatch]:
-        """Stream missing variant IDs and exact embedding inputs without symbol hydration."""
+        """Stream missing variants grouped by immutable content, with bounded projection."""
 
         if (
             not self._connection.in_transaction
@@ -8933,37 +8933,62 @@ class SQLiteStore:
         configuration = configuration_id or model
         names = self._scope_names(build_scope)
         placeholders = ",".join("?" for _ in names)
-        last_variant = ""
+        last_snapshot: int | None = None
+        last_row = 0
+        projected_snapshot: int | None = None
+        projected_text = ""
+        select = f"""
+            SELECT variants.rowid AS record_key, variants.id, variants.snapshot_id
+            FROM symbol_variants variants
+            LEFT JOIN variant_embeddings embeddings
+              ON embeddings.project_id=variants.project_id AND embeddings.variant_id=variants.id
+             AND embeddings.model=? AND embeddings.configuration_id=?
+            WHERE variants.project_id=? AND variants.build_variant IN ({placeholders})
+              AND embeddings.variant_id IS NULL
+        """
+        parameters = (model, configuration, project_id, *names)
         while True:
             if self._trusted_embedding_registry:
                 raise RuntimeError("trusted embedding batch is still outstanding")
-            rows = self._connection.execute(
-                f"""
-                SELECT variants.id, variants.snapshot_json
-                FROM symbol_variant_snapshots variants
-                LEFT JOIN variant_embeddings embeddings
-                  ON embeddings.project_id = variants.project_id
-                 AND embeddings.variant_id = variants.id
-                 AND embeddings.model = ?
-                 AND embeddings.configuration_id = ?
-                WHERE variants.project_id = ?
-                  AND variants.build_variant IN ({placeholders})
-                  AND variants.id > ?
-                  AND embeddings.variant_id IS NULL
-                ORDER BY variants.id
-                LIMIT ?
-                """,
-                (model, configuration, project_id, *names, last_variant, batch_size),
-            ).fetchall()
+            rows = []
+            # Separate seeks avoid rescanning the start of a large shared-content
+            # group. The existing (project, snapshot_id) index includes rowid.
+            if last_snapshot is not None:
+                rows = self._connection.execute(
+                    select + " AND variants.snapshot_id=? AND variants.rowid>? "
+                    "ORDER BY variants.rowid LIMIT ?",
+                    (*parameters, last_snapshot, last_row, batch_size),
+                ).fetchall()
+            if len(rows) < batch_size:
+                range_sql = "" if last_snapshot is None else " AND variants.snapshot_id>?"
+                range_parameters = () if last_snapshot is None else (last_snapshot,)
+                rows.extend(
+                    self._connection.execute(
+                        select
+                        + range_sql
+                        + " ORDER BY variants.snapshot_id,variants.rowid LIMIT ?",
+                        (*parameters, *range_parameters, batch_size - len(rows)),
+                    ).fetchall()
+                )
             if not rows:
                 return
-            batch = tuple(
-                (
-                    row["id"],
-                    _embedding_text_from_snapshot(row["snapshot_json"], max_text_chars),
-                )
-                for row in rows
-            )
+            records = []
+            for row in rows:
+                if row["snapshot_id"] != projected_snapshot:
+                    snapshot = self._connection.execute(
+                        "SELECT snapshot_json FROM symbol_snapshot_contents "
+                        "WHERE project_id=? AND id=?",
+                        (project_id, row["snapshot_id"]),
+                    ).fetchone()
+                    if snapshot is None:
+                        raise RuntimeError("embedding snapshot content is missing")
+                    projected_text = _embedding_text_from_snapshot(
+                        snapshot["snapshot_json"], max_text_chars
+                    )
+                    del snapshot
+                    projected_snapshot = row["snapshot_id"]
+                records.append((row["id"], projected_text))
+            batch = tuple(records)
             capability = object()
             trusted_batch = _TrustedEmbeddingBatch(capability)
             self._trusted_embedding_registry[capability] = _TrustedEmbeddingState(
@@ -8975,7 +9000,8 @@ class SQLiteStore:
                 configuration_id=configuration,
             )
             yield trusted_batch
-            last_variant = batch[-1][0]
+            last_snapshot = rows[-1]["snapshot_id"]
+            last_row = rows[-1]["record_key"]
 
     def _trusted_embedding_state(
         self,

@@ -491,3 +491,11 @@ atomically. Bounded writes retain input order, including multirow replacements;
 public ordering ties retain the original row-order key. Every child foreign key
 keeps a complete lookup index. Semantic validation hashes the logical view, not
 the allocation-dependent map or row keys.
+
+Missing-embedding projection traverses variants by immutable snapshot-content ID
+and row-order key. It loads and decodes a shared stored snapshot once per group,
+retaining only one bounded projected text rather than one payload per variant in
+the batch. Attachments remain per variant, and all batches publish in the same
+atomic embedding session. Provider batch order can differ; exact vector-byte
+parity is verified for the deterministic local provider, not promised for remote
+providers whose output depends on batch order or mutable external state.
