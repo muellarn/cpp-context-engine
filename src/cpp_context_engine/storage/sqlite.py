@@ -903,12 +903,20 @@ class SQLiteStore:
 
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
-            for endpoint in ("source", "target"):
-                self._connection.execute(f"DROP INDEX IF EXISTS edges_{endpoint}")
-                self._connection.execute(f"DROP INDEX IF EXISTS edges_scope_{endpoint}")
+            if self._connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='edges'"
+            ).fetchone():
+                for endpoint in ("source", "target"):
+                    self._connection.execute(f"DROP INDEX IF EXISTS edges_{endpoint}")
+                    self._connection.execute(f"DROP INDEX IF EXISTS edges_scope_{endpoint}")
+                    self._connection.execute(
+                        f"CREATE INDEX edges_scope_{endpoint} "
+                        f"ON edges(project_id, {endpoint}_id, build_variant, relation)"
+                    )
                 self._connection.execute(
-                    f"CREATE INDEX edges_scope_{endpoint} "
-                    f"ON edges(project_id, {endpoint}_id, build_variant, relation)"
+                    "CREATE INDEX IF NOT EXISTS edges_overrides_scope "
+                    "ON edges(project_id, build_variant, target_id, source_id) "
+                    "WHERE relation='overrides'"
                 )
             self._connection.execute("PRAGMA user_version=20")
 

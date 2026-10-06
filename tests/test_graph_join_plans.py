@@ -203,8 +203,14 @@ def test_graph_queries_use_target_lookups_and_preserve_results(tmp_path: Path, q
         plan = [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + sql)]
         print(query, "PLAN", plan)
         if query == "override":
+            partial_sql = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE name='edges_overrides_scope'"
+            ).fetchone()[0]
+            assert "WHERE relation='overrides'" in partial_sql
             assert any(
-                "SEARCH edges" in step and "target_id=?" in step and "relation=?" in step
+                "SEARCH edges" in step
+                and "target_id=?" in step
+                and ("relation=?" in step or "edges_overrides_scope" in step)
                 for step in plan
             )
             assert any(

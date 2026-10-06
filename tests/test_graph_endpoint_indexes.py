@@ -55,6 +55,7 @@ def _assert_endpoint_indexes(connection):
 
 
 def _legacy_layout(connection):
+    connection.execute("DROP INDEX IF EXISTS edges_overrides_scope")
     for name in ("edges_source", "edges_target", "edges_scope_source", "edges_scope_target"):
         connection.execute(f"DROP INDEX IF EXISTS {name}")
     for endpoint in ("source", "target"):
@@ -129,3 +130,62 @@ def test_graph_endpoint_migration_is_atomic(tmp_path, monkeypatch):
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert _indexes(connection) == expected
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_override_seed_avoids_excluded_build_edges(tmp_path):
+    costs = []
+    for extra in (32, 1024):
+        root = tmp_path / str(extra)
+        root.mkdir()
+        with SQLiteStore(root / "index.db", project_root=root) as store:
+            _seed_graph(store, root)
+            store.put_edges(
+                (
+                    GraphEdge(
+                        "B",
+                        "A",
+                        GraphRelation.OVERRIDES,
+                        "unit",
+                        id="override",
+                        build_configuration_id="configuration-unit",
+                    ),
+                )
+            )
+            batch = _batch(root, "excluded-unit", "excluded")
+            symbols = tuple(
+                replace(symbol, id=name)
+                for symbol, name in zip(batch.symbols, ("A", "B"), strict=True)
+            )
+            edges = tuple(
+                GraphEdge(
+                    "A",
+                    "B",
+                    GraphRelation.CALLS,
+                    "excluded-unit",
+                    id=f"noise{index}",
+                    build_configuration_id="configuration-excluded-unit",
+                    build_variant="excluded",
+                )
+                for index in range(extra)
+            )
+            _put(store, root, replace(batch, symbols=symbols, edges=edges))
+            steps = 0
+
+            def progress():
+                nonlocal steps
+                steps += 1
+                return 0
+
+            query = (
+                "SELECT target_id,source_id FROM edges WHERE project_id=? "
+                "AND build_variant=? AND relation='overrides'"
+            )
+            parameters = (store._project_id(root), "default")
+            store._connection.set_progress_handler(progress, 1)
+            try:
+                rows = [tuple(row) for row in store._connection.execute(query, parameters)]
+            finally:
+                store._connection.set_progress_handler(None, 0)
+            assert rows == [("A", "B")]
+            costs.append(steps)
+    assert costs[1] <= costs[0] + 100, costs

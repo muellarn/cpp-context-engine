@@ -440,6 +440,8 @@ Schema v20 consolidates the four overlapping graph endpoint indexes into two:
 Their endpoint prefix supports foreign-key lookups without scanning a project,
 while scoped graph reads still seek endpoint, build and relation. The edge table,
 its primary key, TU index, evidence IDs and every provenance field are unchanged.
+One narrow partial index covers build-wide override-closure seeds and contains
+only override edges, avoiding scans of unrelated builds or non-override evidence.
 Index replacement is transactional. Existing database files retain freed pages
 for reuse; the index-byte reduction is not an automatic file-size reduction.
 
