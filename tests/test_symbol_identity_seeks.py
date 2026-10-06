@@ -188,3 +188,71 @@ def test_bulk_identity_seeks_keep_parameter_batches_bounded(tmp_path):
             None,
             "v404",
         ]
+
+
+@pytest.mark.parametrize("requested_count", (3, 10, 400))
+def test_bulk_identity_work_does_not_grow_with_unrelated_build_rows(tmp_path, requested_count):
+    costs = []
+    for extra in (64, 2048):
+        root = tmp_path / str(extra)
+        root.mkdir()
+        with SQLiteStore(root / "index.db", project_root=root) as store:
+            _ingest(
+                store,
+                root,
+                "unit",
+                tuple((f"s{i}", f"v{i}", f"name{i}", True) for i in range(requested_count + extra)),
+            )
+            statements = []
+            steps = 0
+
+            def progress():
+                nonlocal steps
+                steps += 1
+                return 0
+
+            store._connection.set_trace_callback(statements.append)
+            store._connection.set_progress_handler(progress, 1)
+            requested = tuple(f"v{i}" for i in range(requested_count))
+            actual = store.get_symbols(requested)
+            store._connection.set_progress_handler(None, 0)
+            store._connection.set_trace_callback(None)
+            assert tuple(symbol.variant_id for symbol in actual) == requested
+            costs.append(steps)
+            query = next(sql for sql in statements if "FROM symbol_variants" in sql)
+            plan = [row[3] for row in store._connection.execute("EXPLAIN QUERY PLAN " + query)]
+            assert not any(
+                "USING INDEX symbol_variants_scope " in item and "symbol_id=?" not in item
+                for item in plan
+            ), plan
+    assert costs[1] <= costs[0] + 500, costs
+
+
+def test_bulk_exact_id_in_excluded_build_does_not_override_scoped_canonical_match(tmp_path):
+    with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
+        _ingest(
+            store,
+            tmp_path,
+            "one",
+            (
+                ("default", "shared", "default-exact", False),
+                ("second", "two", "second", True),
+                ("third", "three", "third", True),
+            ),
+        )
+        _ingest(
+            store,
+            tmp_path,
+            "two",
+            (("shared", "alternate", "alternate-canonical", True),),
+            "alternate",
+        )
+        requested = ("shared", "two", "three")
+        only_alternate = store.get_symbols(requested, build_scope=("alternate",))
+        assert only_alternate[0].qualified_name == "alternate-canonical"
+        assert only_alternate[1:] == (None, None)
+        assert store.get_symbols(requested)[0].qualified_name == "default-exact"
+        assert (
+            store.get_symbols(requested, build_scope=("default", "alternate"))[0].qualified_name
+            == "default-exact"
+        )
