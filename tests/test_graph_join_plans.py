@@ -174,8 +174,8 @@ def test_neighbor_endpoint_union_preserves_scopes_and_bounds(tmp_path: Path, sco
         assert all(edge.source_id != "OtherOnly" for edge in actual)
         assert {edge.build_variant for edge in actual} <= set(scope)
         plan = [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + sql)]
-        assert any("source_id=?" in detail for detail in plan), plan
-        assert any("target_id=?" in detail for detail in plan), plan
+        assert any("source_key=?" in detail for detail in plan), plan
+        assert any("target_key=?" in detail for detail in plan), plan
 
 
 @pytest.mark.parametrize("query", ["override", "reverse"])
@@ -208,8 +208,8 @@ def test_graph_queries_use_target_lookups_and_preserve_results(tmp_path: Path, q
             ).fetchone()[0]
             assert "WHERE relation='overrides'" in partial_sql
             assert any(
-                "SEARCH edges" in step
-                and "target_id=?" in step
+                "SEARCH e " in step
+                and "target_key=?" in step
                 and ("relation=?" in step or "edges_overrides_scope" in step)
                 for step in plan
             )

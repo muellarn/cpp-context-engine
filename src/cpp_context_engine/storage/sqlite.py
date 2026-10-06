@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
 _SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
@@ -111,7 +111,7 @@ _TRANSLATION_UNIT_DELETE_ORDER = (
     "cfg_graphs",
     "callsites",
     "occurrences",
-    "edges",
+    "edge_provenance",
     "symbol_variants",
     "translation_unit_symbols",
     "dependencies",
@@ -141,7 +141,9 @@ _BULK_INGESTION_TABLES = frozenset(
         "translation_unit_symbols",
         "symbol_variants",
         "occurrences",
-        "edges",
+        "edge_records",
+        "edge_provenance",
+        "edge_symbols",
         "cfg_graphs",
         "cfg_blocks",
         "cfg_elements",
@@ -931,6 +933,118 @@ class SQLiteStore:
             self._migrate_v21()
         if current <= 21:
             self._migrate_v22()
+        if current <= 22:
+            self._migrate_v23()
+
+    def _migrate_v23(self) -> None:
+        """Intern repeated graph endpoints and exact TU/configuration provenance."""
+
+        connection = self._connection
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='edges'"
+            ).fetchone():
+                connection.execute("PRAGMA user_version=23")
+                return
+            connection.execute("ALTER TABLE edges RENAME TO edges_v22")
+            _execute_script(
+                connection,
+                """
+                CREATE TABLE edge_provenance (
+                    key INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    translation_unit_id TEXT NOT NULL,
+                    build_configuration_id TEXT NOT NULL,
+                    UNIQUE(project_id, translation_unit_id, build_configuration_id),
+                    UNIQUE(project_id, key),
+                    FOREIGN KEY(project_id, translation_unit_id)
+                        REFERENCES translation_units(project_id, id) ON DELETE CASCADE
+                );
+                CREATE TABLE edge_symbols (
+                    key INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    UNIQUE(project_id, symbol_id),
+                    UNIQUE(project_id, key),
+                    FOREIGN KEY(project_id, symbol_id)
+                        REFERENCES symbols(project_id, id) ON DELETE CASCADE
+                );
+                CREATE TABLE edge_records (
+                    project_id INTEGER NOT NULL,
+                    id TEXT NOT NULL,
+                    provenance_key INTEGER NOT NULL,
+                    build_variant TEXT NOT NULL,
+                    source_key INTEGER NOT NULL,
+                    target_key INTEGER NOT NULL,
+                    relation TEXT NOT NULL,
+                    PRIMARY KEY(project_id, id),
+                    FOREIGN KEY(project_id, provenance_key)
+                        REFERENCES edge_provenance(project_id, key) ON DELETE CASCADE,
+                    FOREIGN KEY(project_id, source_key)
+                        REFERENCES edge_symbols(project_id, key) ON DELETE CASCADE,
+                    FOREIGN KEY(project_id, target_key)
+                        REFERENCES edge_symbols(project_id, key) ON DELETE CASCADE
+                );
+                CREATE VIEW edges (
+                    project_id, id, translation_unit_id, build_configuration_id,
+                    build_variant, source_id, target_id, relation
+                ) AS SELECT e.project_id, e.id, p.translation_unit_id, p.build_configuration_id,
+                    e.build_variant, s.symbol_id, t.symbol_id, e.relation
+                    FROM edge_records e
+                    JOIN edge_provenance p ON p.project_id=e.project_id AND p.key=e.provenance_key
+                    JOIN edge_symbols s ON s.project_id=e.project_id AND s.key=e.source_key
+                    JOIN edge_symbols t ON t.project_id=e.project_id AND t.key=e.target_key;
+                """,
+            )
+            # Empty historical fixture schemas can omit FK parent tables.
+            if connection.execute("SELECT 1 FROM edges_v22 LIMIT 1").fetchone():
+                connection.execute(
+                    "INSERT INTO edge_provenance "
+                    "(project_id,translation_unit_id,build_configuration_id) "
+                    "SELECT DISTINCT project_id,translation_unit_id,build_configuration_id "
+                    "FROM edges_v22 ORDER BY project_id,translation_unit_id,build_configuration_id"
+                )
+                connection.execute(
+                    "INSERT INTO edge_symbols(project_id,symbol_id) "
+                    "SELECT project_id,source_id FROM edges_v22 UNION "
+                    "SELECT project_id,target_id FROM edges_v22 ORDER BY 1,2"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO edge_records
+                    SELECT e.project_id,e.id,p.key,e.build_variant,s.key,t.key,e.relation
+                    FROM edges_v22 e
+                    JOIN edge_provenance p ON p.project_id=e.project_id
+                        AND p.translation_unit_id=e.translation_unit_id
+                        AND p.build_configuration_id=e.build_configuration_id
+                    JOIN edge_symbols s ON s.project_id=e.project_id AND s.symbol_id=e.source_id
+                    JOIN edge_symbols t ON t.project_id=e.project_id AND t.symbol_id=e.target_id
+                    """
+                )
+            for source, destination in (("edges_v22", "edges"), ("edges", "edges_v22")):
+                if connection.execute(
+                    f"SELECT * FROM {source} EXCEPT SELECT * FROM {destination} LIMIT 1"
+                ).fetchone():
+                    raise RuntimeError("graph storage migration changed facts")
+            connection.execute("DROP TABLE edges_v22")
+            _execute_script(
+                connection,
+                """
+                CREATE INDEX edges_scope_source
+                    ON edge_records(project_id,source_key,build_variant,relation);
+                CREATE INDEX edges_scope_target
+                    ON edge_records(project_id,target_key,build_variant,relation);
+                CREATE INDEX edges_tu ON edge_records(project_id,provenance_key);
+                CREATE INDEX edges_overrides_scope
+                    ON edge_records(project_id,build_variant,target_key,source_key)
+                    WHERE relation='overrides';
+                """,
+            )
+            for table in ("edge_provenance", "edge_symbols", "edge_records"):
+                if connection.execute(f"PRAGMA foreign_key_check({table})").fetchone():
+                    raise RuntimeError("graph storage migration failed foreign-key check")
+            connection.execute("PRAGMA user_version=23")
 
     def _migrate_v22(self) -> None:
         """Store embedding attachments once, with one covering content lookup."""
@@ -4019,6 +4133,15 @@ class SQLiteStore:
         # Delete leaf facts in bulk before their parents. Letting SQLite walk
         # several overlapping ON DELETE CASCADE paths per TU scaled superlinearly
         # for a shared-header reindex of the measured 200-TU smoke workload.
+        self._connection.execute(
+            f"""
+            DELETE FROM edge_records WHERE project_id=? AND provenance_key IN (
+                SELECT key FROM edge_provenance
+                WHERE project_id=? AND translation_unit_id IN ({placeholders})
+            )
+            """,
+            (project_id, project_id, *ids),
+        )
         for table in _TRANSLATION_UNIT_DELETE_ORDER:
             self._connection.execute(
                 f"""
@@ -4505,6 +4628,16 @@ class SQLiteStore:
         recovery, or independently owned transactions. Unlike executemany, each
         chunk steps SQLite once instead of handing the GIL back per input row.
         """
+        placeholders = "(" + ",".join("?" for _ in range(columns)) + ")"
+        for pending in self._ingestion_row_batches(rows, columns=columns):
+            self._connection.execute(
+                sql.format(values=",".join([placeholders] * len(pending))),
+                tuple(value for row in pending for value in row),
+            )
+
+    def _ingestion_row_batches(
+        self, rows: Iterable[tuple[object, ...]], *, columns: int
+    ) -> Iterator[tuple[tuple[object, ...], ...]]:
         row_limit = max(
             1,
             min(
@@ -4512,16 +4645,8 @@ class SQLiteStore:
                 self._connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // columns,
             ),
         )
-        placeholders = "(" + ",".join("?" for _ in range(columns)) + ")"
         pending: list[tuple[object, ...]] = []
         payload_bytes = 0
-
-        def flush() -> None:
-            self._connection.execute(
-                sql.format(values=",".join([placeholders] * len(pending))),
-                tuple(value for row in pending for value in row),
-            )
-            pending.clear()
 
         for row in rows:
             # Four bytes/codepoint bounds UTF-8 without encoding/copying source
@@ -4535,15 +4660,17 @@ class SQLiteStore:
                 for value in row
             )
             if pending and payload_bytes + row_bytes > _INSERT_BATCH_BYTES:
-                flush()
+                yield tuple(pending)
+                pending.clear()
                 payload_bytes = 0
             pending.append(row)
             payload_bytes += row_bytes
             if len(pending) >= row_limit or payload_bytes >= _INSERT_BATCH_BYTES:
-                flush()
+                yield tuple(pending)
+                pending.clear()
                 payload_bytes = 0
         if pending:
-            flush()
+            yield tuple(pending)
 
     def _put_occurrences(self, project_id: int, occurrences: Iterable[SymbolOccurrence]) -> None:
         self._insert_rows(
@@ -4577,36 +4704,71 @@ class SQLiteStore:
         )
 
     def _put_edges(self, project_id: int, edges: Iterable[GraphEdge]) -> None:
-        self._insert_rows(
-            """
-            INSERT OR IGNORE INTO edges(
-                project_id, id, translation_unit_id, build_configuration_id,
-                build_variant, source_id, target_id, relation
-            ) VALUES {values}
-            """,
+        rows = (
             (
-                (
-                    project_id,
-                    edge.id
-                    or _stable_id(
-                        "edge",
-                        edge.build_variant,
-                        edge.translation_unit_id,
-                        edge.source_id,
-                        edge.target_id,
-                        edge.relation.value,
-                    ),
-                    edge.translation_unit_id,
-                    edge.build_configuration_id,
+                project_id,
+                edge.id
+                or _stable_id(
+                    "edge",
                     edge.build_variant,
+                    edge.translation_unit_id,
                     edge.source_id,
                     edge.target_id,
                     edge.relation.value,
-                )
-                for edge in edges
-            ),
-            columns=8,
+                ),
+                edge.translation_unit_id,
+                edge.build_configuration_id,
+                edge.build_variant,
+                edge.source_id,
+                edge.target_id,
+                edge.relation.value,
+            )
+            for edge in edges
         )
+        for chunk in self._ingestion_row_batches(rows, columns=8):
+            # Preserve INSERT OR IGNORE's first-ID-wins behavior, including
+            # duplicates with invalid new endpoints or TU identities.
+            unique = {}
+            for row in chunk:
+                unique.setdefault(row[1], row)
+            placeholders = ",".join("?" for _ in unique)
+            existing = {
+                row[0]
+                for row in self._connection.execute(
+                    f"SELECT id FROM edge_records WHERE project_id=? AND id IN ({placeholders})",
+                    (project_id, *unique),
+                )
+            }
+            pending = tuple(row for identity, row in unique.items() if identity not in existing)
+            if not pending:
+                continue
+            self._insert_rows(
+                "INSERT OR IGNORE INTO edge_provenance "
+                "(project_id,translation_unit_id,build_configuration_id) VALUES {values}",
+                dict.fromkeys((row[0], row[2], row[3]) for row in pending),
+                columns=3,
+            )
+            self._insert_rows(
+                "INSERT OR IGNORE INTO edge_symbols(project_id,symbol_id) VALUES {values}",
+                dict.fromkeys((row[0], row[column]) for row in pending for column in (5, 6)),
+                columns=2,
+            )
+            self._insert_rows(
+                """
+                WITH incoming(project_id,id,translation_unit_id,build_configuration_id,
+                    build_variant,source_id,target_id,relation) AS (VALUES {values})
+                INSERT INTO edge_records
+                SELECT e.project_id,e.id,p.key,e.build_variant,s.key,t.key,e.relation
+                FROM incoming e
+                JOIN edge_provenance p ON p.project_id=e.project_id
+                    AND p.translation_unit_id=e.translation_unit_id
+                    AND p.build_configuration_id=e.build_configuration_id
+                JOIN edge_symbols s ON s.project_id=e.project_id AND s.symbol_id=e.source_id
+                JOIN edge_symbols t ON t.project_id=e.project_id AND t.symbol_id=e.target_id
+                """,
+                pending,
+                columns=8,
+            )
 
     def _put_cfg_facts(
         self,

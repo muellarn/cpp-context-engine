@@ -470,3 +470,13 @@ variant lookups retain the primary key. The content index includes the remaining
 primary-key columns, so net savings include its increased width. Migration is
 transactional, checks exact row parity and foreign keys, and preserves all vector
 identities, configuration/dimension boundaries, cascades, cosine scores and ties.
+
+Schema v23 stores graph facts with project-local integer endpoint references and
+an interned exact TU/configuration pair. The `edges` read view exposes the same
+eight logical columns, including arbitrary historical evidence IDs and provenance;
+public graph ordering, scopes, duplicate-ID behavior and cascades are unchanged.
+The physical records retain the `(project_id, id)` primary key. Endpoint indexes
+use integer references, with a separate partial override index. Migration checks
+bidirectional exact row parity and all new foreign keys inside one transaction.
+Fresh writes intern bounded batches, and TU replacement removes leaf facts before
+their provenance rows. This layout does not deduplicate or discard edge evidence.

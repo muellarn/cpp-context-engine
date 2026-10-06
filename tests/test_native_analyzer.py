@@ -1625,6 +1625,8 @@ def test_navigation_index_matches_full_navigation_tables_embeddings_and_ranking(
             order = (
                 "project_id, variant_id, model, configuration_id"
                 if table == "variant_embeddings"
+                else "project_id, id"
+                if table == "edges"
                 else "rowid"
             )
             assert (

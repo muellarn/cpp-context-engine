@@ -877,7 +877,7 @@ def test_v13_migration_upgrades_real_v12_profile_and_coverage_rows(tmp_path: Pat
         }.isdisjoint(row[1] for row in legacy.execute("PRAGMA table_info(translation_units)"))
 
     with SQLiteStore(database, project_root=root) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 22  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 23  # noqa: SLF001
         assert "vector_encoding" in {  # noqa: SLF001
             row[1] for row in migrated._connection.execute("PRAGMA table_info(embedding_vectors)")
         }
@@ -1031,7 +1031,7 @@ def test_translation_unit_cascade_tables_have_v9_lookup_indexes(tmp_path: Path) 
     root = tmp_path / "project"
     root.mkdir()
     expected = {
-        "edges": "edges_tu",
+        "edge_records": "edges_tu",
         "symbol_variants": "symbol_variants_tu",
         "cfg_blocks": "cfg_blocks_tu",
         "cfg_elements": "cfg_elements_tu",
@@ -1204,8 +1204,8 @@ def test_bidirectional_neighbors_seek_both_endpoints(tmp_path: Path) -> None:
         query = next(sql for sql in statements if "relation FROM edges" in sql)
         details = [row[3] for row in store._connection.execute("EXPLAIN QUERY PLAN " + query)]
 
-    assert any("source_id=?" in detail for detail in details), details
-    assert any("target_id=?" in detail for detail in details), details
+    assert any("source_key=?" in detail for detail in details), details
+    assert any("target_key=?" in detail for detail in details), details
 
 
 @pytest.mark.parametrize("per_node_limit", [None, 1, 2, 5])
@@ -2326,7 +2326,7 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     legacy.close()
 
     with SQLiteStore(database, project_root=root) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 22  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 23  # noqa: SLF001
         assert store.embedding_count("fixture") == 2
         assert store.embedding_vector_count("fixture") == 1
         assert store.embedding_count("openai-compatible:legacy") == 0
@@ -2426,7 +2426,7 @@ def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 22  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 23  # noqa: SLF001
         assert "vector_encoding" in {
             row[1]
             for row in store._connection.execute(  # noqa: SLF001

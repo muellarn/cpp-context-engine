@@ -37,7 +37,7 @@ def test_v18_pool_migration_preserves_exact_legacy_snapshot(tmp_path: Path, lega
         )
         store._connection.commit()
     with SQLiteStore(database, project_root=tmp_path) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 23
         migrated = store._connection.execute(
             "SELECT * FROM symbol_variant_snapshots WHERE id=?", (row["id"],)
         ).fetchone()
