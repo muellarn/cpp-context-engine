@@ -13,6 +13,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -736,21 +737,49 @@ def semantic_snapshot(
 ) -> dict[str, Any]:
     """Hash stable semantic rows, excluding timestamps and artifact-location columns."""
 
+    return _semantic_snapshot_tables(database, _SEMANTIC_TABLES, _connection=_connection)
+
+
+def _available_semantic_tables(connection: sqlite3.Connection) -> dict[str, str]:
+    return dict(
+        connection.execute(
+            "SELECT name, type FROM sqlite_master "
+            "WHERE type='table' OR (type='view' AND name IN "
+            "('edges','occurrences','embedding_vectors','variant_embeddings')) ORDER BY name"
+        )
+    )
+
+
+@contextlib.contextmanager
+def _semantic_deadline(connection: sqlite3.Connection, deadline: float) -> Iterator[None]:
+    def expired() -> bool:
+        return not math.isfinite(deadline) or time.monotonic() >= deadline
+
+    if expired():
+        raise TimeoutError("semantic verification deadline exceeded")
+    connection.set_progress_handler(lambda: int(expired()), 100)
+    try:
+        yield
+        if expired():
+            raise TimeoutError("semantic verification deadline exceeded")
+    except sqlite3.OperationalError:
+        if expired():
+            raise TimeoutError("semantic verification deadline exceeded") from None
+        raise
+    finally:
+        connection.set_progress_handler(None, 0)
+
+
+def _semantic_snapshot_tables(
+    database: Path, tables: Sequence[str], *, _connection: sqlite3.Connection | None = None
+) -> dict[str, Any]:
     digest = hashlib.sha256()
     counts: dict[str, int] = {}
     table_digests: dict[str, str] = {}
     with _semantic_read_connection(database, _connection) as connection:
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        available = {
-            row[0]: row[1]
-            for row in connection.execute(
-                "SELECT name, type FROM sqlite_master "
-                "WHERE type='table' OR (type='view' AND name IN "
-                "('edges','occurrences','embedding_vectors','variant_embeddings')) "
-                "ORDER BY name"
-            )
-        }
-        for table in _SEMANTIC_TABLES:
+        available = _available_semantic_tables(connection)
+        for table in tables:
             if table not in available:
                 continue
             table_digest = hashlib.sha256()
@@ -815,6 +844,158 @@ def semantic_snapshot(
         "digest": digest.hexdigest(),
         "counts": counts,
         "schema_version": schema_version,
+        "table_digests": table_digests,
+    }
+
+
+def _semantic_reader(spec: Mapping[str, Any]) -> dict[str, Any]:
+    tables = spec["tables"]
+    if (
+        not isinstance(tables, list)
+        or not tables
+        or any(table not in _SEMANTIC_TABLES for table in tables)
+        or len(set(tables)) != len(tables)
+    ):
+        raise ValueError("invalid semantic reader tables")
+    deadline = float(spec["deadline_monotonic"])
+    if not math.isfinite(deadline) or time.monotonic() >= deadline:
+        raise TimeoutError("semantic verification deadline exceeded")
+    database = Path(spec["database"])
+    uri = database.resolve(strict=True).as_uri() + "?mode=ro"
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        with _semantic_deadline(connection, deadline):
+            return _semantic_snapshot_tables(database, tables, _connection=connection)
+
+
+def _parallel_semantic_snapshot(
+    database: Path, owner: sqlite3.Connection, *, deadline_monotonic: float
+) -> dict[str, Any]:
+    """Read disjoint tables under the caller's fresh, write-free BEGIN IMMEDIATE."""
+
+    with _semantic_deadline(owner, deadline_monotonic):
+        return _parallel_semantic_snapshot_locked(database, owner, deadline_monotonic)
+
+
+def _parallel_semantic_snapshot_locked(
+    database: Path, owner: sqlite3.Connection, deadline_monotonic: float
+) -> dict[str, Any]:
+    def check_deadline() -> None:
+        if not math.isfinite(deadline_monotonic) or time.monotonic() >= deadline_monotonic:
+            raise TimeoutError("semantic verification deadline exceeded")
+
+    check_deadline()
+    owner_path = next(row[2] for row in owner.execute("PRAGMA database_list") if row[1] == "main")
+    if (
+        not owner.in_transaction
+        or owner.total_changes
+        or Path(owner_path).resolve() != database.resolve()
+    ):
+        raise ValueError(
+            "parallel verification needs a fresh write-free owner on the same database"
+        )
+    available = _available_semantic_tables(owner)
+    tables = [table for table in _SEMANTIC_TABLES if table in available]
+    if len(tables) < 2:
+        return semantic_snapshot(database, _connection=owner)
+    counts = {}
+    widths = {}
+    for table in tables:
+        check_deadline()
+        counts[table] = int(owner.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
+        widths[table] = sum(
+            row[1] not in _VOLATILE_COLUMNS
+            and not (table == "symbol_snapshot_contents" and row[1] == "id")
+            for row in owner.execute(f'PRAGMA table_info("{table}")')
+        )
+    groups: list[list[str]] = [[], []]
+    weights = [0, 0]
+    for table in sorted(tables, key=lambda name: (-counts[name] * widths[name], name)):
+        slot = min(range(2), key=lambda index: (weights[index], len(groups[index])))
+        groups[slot].append(table)
+        weights[slot] += counts[table] * widths[table]
+    schema = int(owner.execute("PRAGMA user_version").fetchone()[0])
+    processes: list[subprocess.Popen[bytes]] = []
+    results = []
+    with contextlib.ExitStack() as stack:
+        outputs = []
+        try:
+            for group in groups:
+                check_deadline()
+                output = stack.enter_context(tempfile.TemporaryFile())
+                errors = stack.enter_context(tempfile.TemporaryFile())
+                outputs.append(output)
+                spec = {
+                    "database": str(database.resolve()),
+                    "tables": group,
+                    "deadline_monotonic": deadline_monotonic,
+                }
+                processes.append(
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "cpp_context_engine.kicad_canary",
+                            "--_semantic-spec",
+                            json.dumps(spec),
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=errors,
+                    )
+                )
+            while any(process.poll() is None for process in processes):
+                check_deadline()
+                if any(process.poll() not in (None, 0) for process in processes):
+                    raise RuntimeError("semantic reader failed")
+                time.sleep(0.02)
+            check_deadline()
+            for process, output, group in zip(processes, outputs, groups, strict=True):
+                if process.returncode != 0:
+                    raise RuntimeError("semantic reader failed")
+                output.seek(0)
+                payload = output.read(65537)
+                if len(payload) > 65536:
+                    raise RuntimeError("semantic reader output limit exceeded")
+                result = json.loads(payload)
+                if (
+                    not isinstance(result, dict)
+                    or set(result) != {"digest", "counts", "schema_version", "table_digests"}
+                    or result["schema_version"] != schema
+                    or result["counts"] != {table: counts[table] for table in group}
+                    or not isinstance(result["table_digests"], dict)
+                    or set(result["table_digests"]) != set(group)
+                ):
+                    raise RuntimeError("semantic reader coverage differs from locked database")
+                for value in result["table_digests"].values():
+                    if (
+                        not isinstance(value, str)
+                        or len(value) != 64
+                        or len(bytes.fromhex(value)) != 32
+                    ):
+                        raise RuntimeError("invalid semantic table digest")
+                results.append(result)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+            # Keep the writer exclusion until all readers are reaped. The enclosing
+            # canary supervisor also tracks these children and enforces total cleanup.
+            for process in processes:
+                process.wait()
+    table_digests = {
+        table: value for result in results for table, value in result["table_digests"].items()
+    }
+    digest = hashlib.sha256()
+    for table in tables:
+        if widths[table]:
+            digest.update(table.encode())
+            digest.update(bytes.fromhex(table_digests[table]))
+    return {
+        "digest": digest.hexdigest(),
+        "counts": counts,
+        "schema_version": schema,
         "table_digests": table_digests,
     }
 
@@ -1746,6 +1927,7 @@ def _revalidate_final_artifacts(
     queries: Sequence[str],
     generated_source_roots: tuple[Path, ...],
     child_result: Mapping[str, Any],
+    deadline_monotonic: float,
 ) -> _ValidatedArtifacts:
     try:
         subset_identity = _file_identity(subset)
@@ -1765,7 +1947,9 @@ def _revalidate_final_artifacts(
         with _database_writer_exclusion(database) as connection:
             database_artifact = _database_artifact_digest(database)
             integrity = _validate_database_integrity(connection)
-            snapshot = semantic_snapshot(database, _connection=connection)
+            snapshot = _parallel_semantic_snapshot(
+                database, connection, deadline_monotonic=deadline_monotonic
+            )
             provenance = database_provenance(database, _connection=connection)
 
         variant = BuildVariant("default", subset, generated_source_roots=generated_source_roots)
@@ -1902,9 +2086,13 @@ def _run_worker(spec_path: Path) -> int:
         rankings, public_orderings, summary_orderings = _ranking_canaries(
             config, tuple(spec["queries"])
         )
-        snapshot = semantic_snapshot(database)
-        provenance = database_provenance(database)
         with _database_writer_exclusion(database) as connection:
+            snapshot = _parallel_semantic_snapshot(
+                database,
+                connection,
+                deadline_monotonic=spec["gate_started_monotonic"] + spec["total_wall_seconds"],
+            )
+            provenance = database_provenance(database, _connection=connection)
             integrity = _validate_database_integrity(connection)
             database_artifact = _database_artifact_digest(database)
         analyzer_sha256 = _sha256(analyzer)
@@ -1960,6 +2148,7 @@ def _validate_gate_spec(spec: Mapping[str, Any]) -> None:
         queries=tuple(spec["queries"]),
         generated_source_roots=tuple(Path(root) for root in spec["generated_source_roots"]),
         child_result=gate_report,
+        deadline_monotonic=spec["gate_started_monotonic"] + spec["total_wall_seconds"],
     )
     _validate_profile_provenance(
         gate_report["database_provenance"], IndexProfile(spec["profile"]), spec["translation_units"]
@@ -2387,6 +2576,7 @@ def _parser() -> argparse.ArgumentParser:
         help="explicit generated-source directory for the all gate; repeat as needed",
     )
     parser.add_argument("--_worker-spec", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--_semantic-spec", help=argparse.SUPPRESS)
     return parser
 
 
@@ -2395,6 +2585,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args._worker_spec is not None:
         return _run_worker(args._worker_spec)
     try:
+        if args._semantic_spec is not None:
+            print(json.dumps(_semantic_reader(json.loads(args._semantic_spec))))
+            return 0
         if args.project_root is None or args.compile_commands is None:
             raise ValueError("--project-root and --compile-commands are required")
         if args.preflight_only:
