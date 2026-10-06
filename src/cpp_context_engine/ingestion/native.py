@@ -1427,6 +1427,9 @@ class NativeClangIngestor:
                                 error = future.exception()
                                 if error is not None:
                                     completed_failures.append((index, error))
+                        # Only the owning maps may retain results across scheduler waits.
+                        future = None
+                        completed_analysis.clear()
 
                         if completed_failures:
                             # Select the earliest CDB item among failures observed in
@@ -1451,6 +1454,7 @@ class NativeClangIngestor:
                             converted = converter_executor.submit(convert, index, registry)
                             conversion_futures[index] = converted
                             converted.add_done_callback(wake)
+                            del converted
 
                         while (
                             next_configuration < len(selected)
@@ -1521,6 +1525,8 @@ class NativeClangIngestor:
                     yield batch
                 finally:
                     with condition:
+                        # Release the generator's result/Future before waking the next converter.
+                        del batch, current
                         conversion_futures.pop(index, None)
                         conversion_registries.pop(index, None)
                         held_registries -= 1
@@ -1530,7 +1536,6 @@ class NativeClangIngestor:
                                 held_registries=held_registries,
                             )
                         condition.notify_all()
-                    del batch
             # A binary replacement must abort the still-uncommitted TU generation.
             if self.analyzer_identity != analyzer_identity:
                 raise RuntimeError("analyzer changed during indexing")
