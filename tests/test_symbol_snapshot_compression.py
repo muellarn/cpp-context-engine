@@ -281,7 +281,7 @@ def test_v17_migration_preserves_exact_snapshots_and_fts(tmp_path: Path) -> None
     database = tmp_path / "legacy.db"
     before = _legacy_database(database, tmp_path)
     with SQLiteStore(database, project_root=tmp_path) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 21  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 22  # noqa: SLF001
         after = tuple(
             (*tuple(row)[:7], storage._full_variant_snapshot(row))
             for row in store._connection.execute(  # noqa: SLF001

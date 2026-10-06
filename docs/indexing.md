@@ -462,3 +462,11 @@ Embeddings are stored by content, model/configuration identity, and dimension. `
 implementing `EmbeddingProvider`; `SQLiteStore.search_vector` computes true cosine
 similarity and rejects empty, non-finite, zero-magnitude, or dimension-mismatched
 vectors.
+
+Schema v22 stores each embedding attachment in its composite primary-key B-tree
+(`WITHOUT ROWID`) and keeps one covering content index. The former search index
+duplicated the content index's project/model/configuration/dimension prefix;
+variant lookups retain the primary key. The content index includes the remaining
+primary-key columns, so net savings include its increased width. Migration is
+transactional, checks exact row parity and foreign keys, and preserves all vector
+identities, configuration/dimension boundaries, cascades, cosine scores and ties.
