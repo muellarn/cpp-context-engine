@@ -1746,12 +1746,23 @@ class _ObservedIngestor:
     def iter_configuration_batches(
         self, project_root: Path, configurations: Iterable[Any]
     ) -> Iterable[Any]:
-        batches = self.delegate.iter_configuration_batches(project_root, configurations)
-        for completed, batch in enumerate(batches, start=1):
-            # This bounds the existing consumer wrapper, not only the SQLite call.
-            _worker_event("tu_staging", configuration_index=completed - 1)
-            yield batch
-            _worker_event("tu_staged", completed=completed, total=self.total)
+        batches = iter(self.delegate.iter_configuration_batches(project_root, configurations))
+        completed = 0
+        try:
+            # enumerate also retains its previous result tuple during producer advancement.
+            for batch in batches:
+                completed += 1
+                try:
+                    # This bounds the existing consumer wrapper, not only the SQLite call.
+                    _worker_event("tu_staging", configuration_index=completed - 1)
+                    yield batch
+                finally:
+                    del batch
+                _worker_event("tu_staged", completed=completed, total=self.total)
+        finally:
+            close = getattr(batches, "close", None)
+            if close is not None:
+                close()
 
 
 _WORKER_EVENT_LOCK = threading.Lock()
