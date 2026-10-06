@@ -413,6 +413,22 @@ redesign FTS. As with vector migration, existing files may need explicit offline
 compaction to reclaim freed pages; snapshot compression ratios are not whole-index
 size reductions or a guarantee that a full project fits a particular disk budget.
 
+Schema v19 shares identical immutable snapshot contents within each project.
+Every variant row and its public ID, build, configuration and translation-unit
+provenance remains separate. Four provenance fields move out of the shared JSON
+only when all are present, match the variant columns and use the canonical JSON
+serialization. A format flag identifies this split representation. Other legacy
+JSON remains byte-for-byte intact, including absent or differing provenance.
+Hash matches are checked against exact decoded content; collisions or corrupt
+payloads fail the transaction. Only new contents are compressed, in bounded
+batches capped at 128 records and 16 MiB of payload (one larger record is handled
+alone). Both encoded migration input and decoded content have byte bounds.
+Unreferenced contents are reclaimed during transactional orphan cleanup.
+Migration preserves foreign keys and existing FTS documents atomically; FTS itself
+is unchanged. Semantic acceptance hashes contents and content references, not
+insertion-order-dependent pool rowids. Pool payload savings alone are not a
+physical database-size estimate or a Whole-index capacity guarantee.
+
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by content, model/configuration identity, and dimension. `SQLiteVectorSearch` accepts any provider
 implementing `EmbeddingProvider`; `SQLiteStore.search_vector` computes true cosine

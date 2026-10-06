@@ -66,6 +66,7 @@ _SEMANTIC_TABLES = (
     "translation_unit_symbols",
     "build_variants",
     "symbol_variants",
+    "symbol_snapshot_contents",
     "occurrences",
     "edges",
     "cfg_graphs",
@@ -693,6 +694,20 @@ def semantic_snapshot(
             table_digest = hashlib.sha256()
             table_info = tuple(connection.execute(f'PRAGMA table_info("{table}")'))
             columns = tuple(row[1] for row in table_info if row[1] not in _VOLATILE_COLUMNS)
+            source = f'"{table}"'
+            if table == "symbol_snapshot_contents":
+                # Local pool rowids depend on insertion order, not semantic identity.
+                columns = tuple(column for column in columns if column != "id")
+            elif table == "symbol_variants" and "snapshot_id" in columns:
+                columns = tuple(
+                    "snapshot_hash" if column == "snapshot_id" else column for column in columns
+                )
+                source = (
+                    "(SELECT variants.*, contents.content_hash AS snapshot_hash "
+                    "FROM symbol_variants variants JOIN symbol_snapshot_contents contents "
+                    "ON contents.project_id=variants.project_id "
+                    "AND contents.id=variants.snapshot_id)"
+                )
             counts[table] = int(connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
             table_digest.update(table.encode())
             table_digest.update(b"\0")
@@ -703,9 +718,7 @@ def semantic_snapshot(
                 continue
             projection = ", ".join(f'"{column}"' for column in columns)
             ordering = ", ".join(str(position) for position in range(1, len(columns) + 1))
-            for row in connection.execute(
-                f'SELECT {projection} FROM "{table}" ORDER BY {ordering}'
-            ):
+            for row in connection.execute(f"SELECT {projection} FROM {source} ORDER BY {ordering}"):
                 for value in row:
                     table_digest.update(_encode_digest_value(value))
                 table_digest.update(b"\xff")

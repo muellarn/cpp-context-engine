@@ -250,8 +250,10 @@ def test_enforcement_restore_failure_closes_private_connection(tmp_path: Path):
     database = tmp_path / "index.db"
 
     class FailingStore(SQLiteStore):
+        fail_restore = False
+
         def _set_foreign_key_enforcement(self, enabled):
-            if enabled:
+            if enabled and self.fail_restore:
                 raise RuntimeError("injected enforcement restoration failure")
             super()._set_foreign_key_enforcement(enabled)
 
@@ -259,6 +261,7 @@ def test_enforcement_restore_failure_closes_private_connection(tmp_path: Path):
         pytest.raises(RuntimeError, match="injected enforcement"),
         FailingStore.indexing_generation(database) as store,
     ):
+        store.fail_restore = True
         _apply(store, root, (_batch(root),))
     assert not database.exists()
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):

@@ -39,7 +39,7 @@ def _snapshot(store: SQLiteStore, name: str) -> tuple[tuple[object, ...], ...]:
             """
             SELECT id, symbol_id, build_configuration_id, translation_unit_id,
                    is_definition, snapshot_json
-            FROM symbol_variants WHERE build_variant = ? ORDER BY id
+            FROM symbol_variant_snapshots WHERE build_variant = ? ORDER BY id
             """,
             (name,),
         )
@@ -330,9 +330,11 @@ def test_v2_migration_preserves_baseline_search_and_requests_reindex(tmp_path: P
 
 
 def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
+
     database = tmp_path / "v4.db"
-    with SQLiteStore(database):
-        pass
+    with SQLiteStore(database) as store:
+        _materialize_v18_snapshots(store)
     connection = sqlite3.connect(database)
     connection.executescript(
         """

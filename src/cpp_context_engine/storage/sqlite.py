@@ -73,8 +73,9 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
+_SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
 VECTOR_ENCODING_RAW_F64LE_V1 = 0
 VECTOR_ENCODING_ZLIB_F64LE_V1 = 1
@@ -892,6 +893,170 @@ class SQLiteStore:
             self._migrate_v17()
         if current <= 17:
             self._migrate_v18()
+        if current <= 18:
+            self._migrate_v19()
+
+    def _migrate_v19(self) -> None:
+        """Pool immutable snapshots without changing legacy provenance or FTS."""
+
+        connection = self._connection
+        if connection.in_transaction:
+            raise RuntimeError("snapshot pooling migration requires an idle connection")
+        try:
+            self._set_foreign_key_enforcement(False)
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(symbol_variants)")}
+            if columns:
+                indexes = [
+                    r[0]
+                    for r in connection.execute(
+                        "SELECT sql FROM sqlite_schema WHERE type='index' "
+                        "AND tbl_name='symbol_variants' AND sql IS NOT NULL"
+                    )
+                ]
+                _execute_script(
+                    connection,
+                    """
+                    CREATE TABLE symbol_snapshot_contents (
+                        id INTEGER PRIMARY KEY,
+                        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                        content_hash BLOB NOT NULL,
+                        provenance_removed INTEGER NOT NULL CHECK(provenance_removed IN (0,1)),
+                        snapshot_json BLOB NOT NULL,
+                        UNIQUE(project_id, content_hash),
+                        UNIQUE(project_id, id)
+                    );
+                    CREATE TABLE symbol_variants_v19 (
+                        project_id INTEGER NOT NULL,
+                        id TEXT NOT NULL,
+                        symbol_id TEXT NOT NULL,
+                        build_variant TEXT NOT NULL,
+                        build_configuration_id TEXT NOT NULL,
+                        translation_unit_id TEXT NOT NULL,
+                        is_definition INTEGER NOT NULL,
+                        snapshot_id INTEGER NOT NULL,
+                        PRIMARY KEY(project_id, id),
+                        UNIQUE(project_id, build_variant, translation_unit_id, symbol_id),
+                        FOREIGN KEY(project_id, symbol_id)
+                            REFERENCES symbols(project_id, id) ON DELETE CASCADE,
+                        FOREIGN KEY(project_id, translation_unit_id)
+                            REFERENCES translation_units(project_id, id) ON DELETE CASCADE,
+                        FOREIGN KEY(project_id, snapshot_id)
+                            REFERENCES symbol_snapshot_contents(project_id, id)
+                    );
+                """,
+                )
+                cursor = connection.execute("SELECT * FROM symbol_variants ORDER BY rowid")
+                for rows in _snapshot_batches(cursor, lambda row: row["snapshot_json"]):
+                    for project_id in {row["project_id"] for row in rows}:
+                        selected = [row for row in rows if row["project_id"] == project_id]
+                        snapshot_ids = self._intern_symbol_snapshots(
+                            project_id,
+                            (
+                                _split_symbol_snapshot(
+                                    _decode_symbol_snapshot(row["snapshot_json"]), row
+                                )
+                                for row in selected
+                            ),
+                        )
+                        connection.executemany(
+                            "INSERT INTO symbol_variants_v19 VALUES(?,?,?,?,?,?,?,?)",
+                            (
+                                (*tuple(row)[:7], snapshot_id)
+                                for row, snapshot_id in zip(selected, snapshot_ids, strict=True)
+                            ),
+                        )
+                    self._snapshot_pool_migration_checkpoint("row")
+                connection.execute("DROP TABLE symbol_variants")
+                connection.execute("ALTER TABLE symbol_variants_v19 RENAME TO symbol_variants")
+                for statement in indexes:
+                    connection.execute(statement)
+                _execute_script(
+                    connection,
+                    """
+                    CREATE INDEX symbol_variants_snapshot
+                        ON symbol_variants(project_id, snapshot_id);
+                    CREATE VIEW symbol_variant_snapshots AS
+                        SELECT variants.*, contents.snapshot_json, contents.provenance_removed
+                        FROM symbol_variants variants JOIN symbol_snapshot_contents contents
+                          ON contents.project_id=variants.project_id
+                         AND contents.id=variants.snapshot_id;
+                """,
+                )
+                if failures := connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise RuntimeError(f"snapshot pooling foreign-key failure: {failures[0]}")
+            self._snapshot_pool_migration_checkpoint("publication")
+            connection.execute("PRAGMA user_version = 19")
+            connection.commit()
+        except BaseException:
+            try:
+                connection.rollback()
+            except BaseException:
+                self.close()
+            raise
+        finally:
+            if not self._closed:
+                try:
+                    self._set_foreign_key_enforcement(True)
+                except BaseException:
+                    self.close()
+                    raise
+
+    def _snapshot_pool_migration_checkpoint(self, _stage: str) -> None:
+        """Failure-injection boundary for the atomic pool migration."""
+
+    def _intern_symbol_snapshots(
+        self, project_id: int, documents: Iterable[tuple[int, str]]
+    ) -> list[int]:
+        """Resolve bounded batches and compress only genuinely new immutable content."""
+
+        result: list[int] = []
+        for chunk in _snapshot_batches(documents, lambda document: document[1]):
+            keyed: dict[bytes, tuple[int, str]] = {}
+            keys = []
+            for split, content in chunk:
+                key = _symbol_content_hash(split, content)
+                if key in keyed and keyed[key] != (split, content):
+                    raise RuntimeError("symbol snapshot content hash collision")
+                keyed[key] = (split, content)
+                keys.append(key)
+            placeholders = ",".join("?" for _ in keyed)
+            found = {}
+            for row in self._connection.execute(
+                "SELECT id,content_hash,provenance_removed,snapshot_json "
+                "FROM symbol_snapshot_contents WHERE project_id=? "
+                f"AND content_hash IN ({placeholders})",
+                (project_id, *keyed),
+            ):
+                key = row["content_hash"]
+                if (
+                    row["provenance_removed"],
+                    _decode_symbol_snapshot(row["snapshot_json"]),
+                ) != keyed[key]:
+                    raise RuntimeError("symbol snapshot content hash collision or corrupt payload")
+                found[key] = row["id"]
+            missing = {key: document for key, document in keyed.items() if key not in found}
+            self._insert_rows(
+                "INSERT INTO symbol_snapshot_contents "
+                "(project_id,content_hash,provenance_removed,snapshot_json) VALUES {values}",
+                (
+                    (project_id, key, split, _encode_symbol_snapshot(content))
+                    for key, (split, content) in missing.items()
+                ),
+                columns=4,
+            )
+            if missing:
+                placeholders = ",".join("?" for _ in missing)
+                found.update(
+                    (row["content_hash"], row["id"])
+                    for row in self._connection.execute(
+                        "SELECT id,content_hash FROM symbol_snapshot_contents WHERE project_id=? "
+                        f"AND content_hash IN ({placeholders})",
+                        (project_id, *missing),
+                    )
+                )
+            result.extend(found[key] for key in keys)
+        return result
 
     def _migrate_v18(self) -> None:
         """Compress snapshots atomically without changing their JSON or memberships."""
@@ -2543,10 +2708,16 @@ class SQLiteStore:
     def _rebuild_variant_fts(self, *, clear: bool = True) -> None:
         if clear:
             self._connection.execute("DELETE FROM symbol_variant_fts")
+        # Older schema migrations invoke this helper before the pool exists.
+        source = (
+            "symbol_variant_snapshots"
+            if self._connection.execute("PRAGMA user_version").fetchone()[0] >= 19
+            else "symbol_variants"
+        )
         rows = self._connection.execute(
-            """
+            f"""
             SELECT project_id, id, symbol_id, build_variant, snapshot_json
-            FROM symbol_variants ORDER BY project_id, id
+            FROM {source} ORDER BY project_id, id
             """
         )
         for row in rows:
@@ -3086,7 +3257,7 @@ class SQLiteStore:
             (
                 "symbol_variants",
                 expected_symbols,
-                "SELECT id, snapshot_json FROM symbol_variants "
+                "SELECT * FROM symbol_variant_snapshots "
                 "WHERE project_id = ? AND translation_unit_id = ? ORDER BY id",
             ),
             (
@@ -3170,11 +3341,11 @@ class SQLiteStore:
         for family, expected, statement in checks:
             if request_control is not None:
                 request_control.check("navigation parity")
-            actual = [
-                tuple(row) for row in self._connection.execute(statement, (project_id, tu_id))
-            ]
+            rows = self._connection.execute(statement, (project_id, tu_id))
             if family == "symbol_variants":
-                actual = [(row[0], _decode_symbol_snapshot(row[1])) for row in actual]
+                actual = [(row["id"], _full_variant_snapshot(row)) for row in rows]
+            else:
+                actual = [tuple(row) for row in rows]
             if sorted(expected) != actual:
                 raise RuntimeError(
                     f"navigation index is stale: {family} differ for translation unit {tu_id}"
@@ -3701,6 +3872,16 @@ class SQLiteStore:
             """,
             (project_id,),
         )
+        self._connection.execute(
+            """
+            DELETE FROM symbol_snapshot_contents WHERE project_id=? AND NOT EXISTS (
+                SELECT 1 FROM symbol_variants variants
+                WHERE variants.project_id=symbol_snapshot_contents.project_id
+                  AND variants.snapshot_id=symbol_snapshot_contents.id
+            )
+            """,
+            (project_id,),
+        )
 
     def _delete_invalid_deep_materializations(self, project_id: int) -> None:
         """Drop tokens as soon as any exact closure-cache mapping disappears."""
@@ -3881,33 +4062,43 @@ class SQLiteStore:
         )
 
     @staticmethod
-    def _symbol_snapshot(symbol: CodeSymbol) -> str:
-        return json.dumps(
-            {
-                "id": symbol.id,
-                "qualified_name": symbol.qualified_name,
-                "kind": symbol.kind.value,
-                "path": str(symbol.span.path),
-                "start_line": symbol.span.start_line,
-                "end_line": symbol.span.end_line,
-                "start_column": symbol.span.start_column,
-                "end_column": symbol.span.end_column,
-                "signature": symbol.signature,
-                "documentation": symbol.documentation,
-                "source_hash": symbol.source_hash,
-                "source_text": symbol.source_text,
-                "build_configuration_id": symbol.build_configuration_id,
-                "translation_unit_id": symbol.translation_unit_id,
-                "build_variant": symbol.build_variant,
-                "variant_id": symbol.variant_id,
-                "metadata": dict(symbol.metadata),
-            },
-            sort_keys=True,
-        )
+    def _symbol_snapshot(symbol: CodeSymbol, *, provenance: bool = True) -> str:
+        document = {
+            "id": symbol.id,
+            "qualified_name": symbol.qualified_name,
+            "kind": symbol.kind.value,
+            "path": str(symbol.span.path),
+            "start_line": symbol.span.start_line,
+            "end_line": symbol.span.end_line,
+            "start_column": symbol.span.start_column,
+            "end_column": symbol.span.end_column,
+            "signature": symbol.signature,
+            "documentation": symbol.documentation,
+            "source_hash": symbol.source_hash,
+            "source_text": symbol.source_text,
+            "build_configuration_id": symbol.build_configuration_id,
+            "translation_unit_id": symbol.translation_unit_id,
+            "build_variant": symbol.build_variant,
+            "variant_id": symbol.variant_id,
+            "metadata": dict(symbol.metadata),
+        }
+        if not provenance:
+            for key in (
+                "build_configuration_id",
+                "translation_unit_id",
+                "build_variant",
+                "variant_id",
+            ):
+                del document[key]
+        return json.dumps(document, sort_keys=True)
 
     @staticmethod
-    def _snapshot_symbol(snapshot: str | bytes) -> CodeSymbol:
+    def _snapshot_symbol(
+        snapshot: str | bytes, provenance: Mapping[str, Any] | sqlite3.Row | None = None
+    ) -> CodeSymbol:
         data = json.loads(_decode_symbol_snapshot(snapshot))
+        if provenance is not None:
+            data.update(_variant_provenance(provenance))
         return CodeSymbol(
             id=data["id"],
             qualified_name=data["qualified_name"],
@@ -3963,10 +4154,10 @@ class SQLiteStore:
             chunk = variant_ids[offset : offset + 500]
             placeholders = ",".join("?" for _ in chunk)
             existing.update(
-                (row["id"], _decode_symbol_snapshot(row["snapshot_json"]))
+                (row["id"], _full_variant_snapshot(row))
                 for row in self._connection.execute(
                     f"""
-                    SELECT id, snapshot_json FROM symbol_variants
+                    SELECT * FROM symbol_variant_snapshots
                     WHERE project_id = ? AND id IN ({placeholders})
                     """,
                     (project_id, *chunk),
@@ -3995,11 +4186,15 @@ class SQLiteStore:
                 """,
                 (project_id, *chunk),
             )
+        snapshot_ids = self._intern_symbol_snapshots(
+            project_id,
+            ((1, self._symbol_snapshot(symbol, provenance=False)) for symbol, _, _ in records),
+        )
         self._insert_rows(
             """
             INSERT INTO symbol_variants(
                 project_id, id, symbol_id, build_variant, build_configuration_id,
-                translation_unit_id, is_definition, snapshot_json
+                translation_unit_id, is_definition, snapshot_id
             ) VALUES {values}
             ON CONFLICT(project_id, id) DO UPDATE SET
                 symbol_id = excluded.symbol_id,
@@ -4007,7 +4202,7 @@ class SQLiteStore:
                 build_configuration_id = excluded.build_configuration_id,
                 translation_unit_id = excluded.translation_unit_id,
                 is_definition = excluded.is_definition,
-                snapshot_json = excluded.snapshot_json
+                snapshot_id = excluded.snapshot_id
             """,
             (
                 (
@@ -4018,9 +4213,9 @@ class SQLiteStore:
                     symbol.build_configuration_id,
                     symbol.translation_unit_id,
                     int(bool(symbol.metadata.get("is_definition"))),
-                    _encode_symbol_snapshot(snapshot),
+                    snapshot_id,
                 )
-                for symbol, variant_id, snapshot in records
+                for (symbol, variant_id, _), snapshot_id in zip(records, snapshot_ids, strict=True)
             ),
             columns=8,
         )
@@ -4055,14 +4250,16 @@ class SQLiteStore:
             placeholders = ",".join("?" for _ in chunk)
             for row in self._connection.execute(
                 f"""
-                SELECT symbol_id, snapshot_json FROM symbol_variants
+                SELECT * FROM symbol_variant_snapshots
                 WHERE project_id = ? AND symbol_id IN ({placeholders})
                 ORDER BY symbol_id, is_definition DESC, build_variant, translation_unit_id
                 """,
                 (project_id, *chunk),
             ):
                 if row["symbol_id"] not in preferred:
-                    preferred[row["symbol_id"]] = self._snapshot_symbol(row["snapshot_json"])
+                    preferred[row["symbol_id"]] = self._snapshot_symbol(
+                        row["snapshot_json"], row if row["provenance_removed"] else None
+                    )
         self._put_canonical_symbols(project_id, preferred.values(), prefer_definition=False)
 
     def _insert_rows(self, sql: str, rows: Iterable[tuple[object, ...]], *, columns: int) -> None:
@@ -6387,7 +6584,7 @@ class SQLiteStore:
                 UNION
                 SELECT id FROM symbol_variants
                 WHERE project_id = ? AND id = ? AND build_variant IN ({placeholders})
-            ) matches CROSS JOIN symbol_variants variants
+            ) matches CROSS JOIN symbol_variant_snapshots variants
             WHERE variants.project_id = ? AND variants.id = matches.id
             ORDER BY is_definition DESC, build_variant, translation_unit_id, symbol_id LIMIT 1
             """,
@@ -6435,7 +6632,7 @@ class SQLiteStore:
                     SELECT id FROM symbol_variants
                     WHERE project_id = ? AND build_variant IN ({scope_placeholders})
                       AND symbol_id IN ({placeholders})
-                ) matches CROSS JOIN symbol_variants variants
+                ) matches CROSS JOIN symbol_variant_snapshots variants
                 WHERE variants.project_id = ? AND variants.id = matches.id
                 ORDER BY is_definition DESC, build_variant, translation_unit_id, variants.id
                 """,
@@ -6497,7 +6694,7 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in names)
         rows = self._connection.execute(
             f"""
-            SELECT * FROM symbol_variants
+            SELECT * FROM symbol_variant_snapshots
             WHERE project_id = ? AND build_variant IN ({placeholders})
             ORDER BY _cpp_context_snapshot_name(snapshot_json), build_variant, id
             """,
@@ -6551,7 +6748,9 @@ class SQLiteStore:
 
     @classmethod
     def _variant_row_to_symbol(cls, row: sqlite3.Row) -> CodeSymbol:
-        symbol = cls._snapshot_symbol(row["snapshot_json"])
+        symbol = cls._snapshot_symbol(
+            row["snapshot_json"], row if row["provenance_removed"] else None
+        )
         return CodeSymbol(
             id=symbol.id,
             qualified_name=symbol.qualified_name,
@@ -7413,7 +7612,7 @@ class SQLiteStore:
                    bm25(symbol_variant_fts, 0.0, 0.0, 0.0, 0.0, 8.0, 4.0, 2.0, 1.0)
                        AS rank
             FROM symbol_variant_fts
-            JOIN symbol_variants variants
+            JOIN symbol_variant_snapshots variants
               ON variants.project_id = CAST(symbol_variant_fts.project_id AS INTEGER)
              AND variants.id = symbol_variant_fts.variant_id
             WHERE symbol_variant_fts MATCH ? AND variants.project_id = ?
@@ -7464,7 +7663,7 @@ class SQLiteStore:
                    bm25(symbol_variant_fts, 0.0, 0.0, 0.0, 0.0, 12.0, 6.0, 0.0, 0.0)
                        AS rank
             FROM symbol_variant_fts
-            JOIN symbol_variants variants
+            JOIN symbol_variant_snapshots variants
               ON variants.project_id = CAST(symbol_variant_fts.project_id AS INTEGER)
              AND variants.id = symbol_variant_fts.variant_id
             WHERE symbol_variant_fts MATCH ? AND variants.project_id = ?
@@ -8153,7 +8352,7 @@ class SQLiteStore:
             rows = self._connection.execute(
                 f"""
                 SELECT variants.id, variants.snapshot_json
-                FROM symbol_variants variants
+                FROM symbol_variant_snapshots variants
                 LEFT JOIN variant_embeddings embeddings
                   ON embeddings.project_id = variants.project_id
                  AND embeddings.variant_id = variants.id
@@ -8456,6 +8655,66 @@ def _encode_symbol_snapshot(snapshot: str) -> str | bytes:
     encoded = _SYMBOL_SNAPSHOT_ZLIB_V1 + struct.pack(">I", len(raw)) + compressed
     # TEXT also remains the legacy encoding; do not expand tiny/incompressible rows.
     return encoded if len(encoded) < len(raw) else snapshot
+
+
+def _variant_provenance(row: Mapping[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    return {
+        "build_configuration_id": row["build_configuration_id"],
+        "translation_unit_id": row["translation_unit_id"],
+        "build_variant": row["build_variant"],
+        "variant_id": row["id"],
+    }
+
+
+def _snapshot_batches(
+    items: Iterable[Any], payload: Callable[[Any], str | bytes]
+) -> Iterator[list[Any]]:
+    pending = []
+    size = 0
+    for item in items:
+        content = payload(item)
+        # Bound strings without allocating an encoded copy; one large document
+        # is processed alone. The iterator retains at most one lookahead item.
+        item_size = len(content) * (4 if isinstance(content, str) else 1)
+        if pending and size + item_size > _SNAPSHOT_BATCH_BYTES:
+            yield pending
+            pending = []
+            size = 0
+        pending.append(item)
+        size += item_size
+        if len(pending) >= 128 or size >= _SNAPSHOT_BATCH_BYTES:
+            yield pending
+            pending = []
+            size = 0
+    if pending:
+        yield pending
+
+
+def _split_symbol_snapshot(raw: str, row: Mapping[str, Any] | sqlite3.Row) -> tuple[int, str]:
+    document = json.loads(raw)
+    provenance = _variant_provenance(row)
+    # Preserve legacy missing/different fields and noncanonical JSON verbatim.
+    # The explicit flag distinguishes absence from deliberate normalization.
+    if any(key not in document or document[key] != value for key, value in provenance.items()):
+        return 0, raw
+    if raw != json.dumps(document, sort_keys=True):
+        return 0, raw
+    for key in provenance:
+        del document[key]
+    return 1, json.dumps(document, sort_keys=True)
+
+
+def _symbol_content_hash(split: int, content: str) -> bytes:
+    return hashlib.sha256(bytes((split,)) + content.encode("utf-8")).digest()
+
+
+def _full_variant_snapshot(row: sqlite3.Row) -> str:
+    raw = _decode_symbol_snapshot(row["snapshot_json"])
+    if not row["provenance_removed"]:
+        return raw
+    document = json.loads(raw)
+    document.update(_variant_provenance(row))
+    return json.dumps(document, sort_keys=True)
 
 
 def _decode_symbol_snapshot(snapshot: str | bytes) -> str:

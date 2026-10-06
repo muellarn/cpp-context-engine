@@ -539,8 +539,10 @@ def test_schema_14_upgrades_generated_root_provenance_without_rewriting_old_buil
     project = tmp_path / "project"
     project.mkdir()
     database = tmp_path / "index.db"
-    with SQLiteStore(database, project_root=project):
-        pass
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
+
+    with SQLiteStore(database, project_root=project) as store:
+        _materialize_v18_snapshots(store)
     with sqlite3.connect(database) as connection:
         connection.executescript(
             """
@@ -571,7 +573,7 @@ def test_schema_14_upgrades_generated_root_provenance_without_rewriting_old_buil
         "deep_tu_cache",
         "deep_materialization_units",
     } <= tables
-    assert version == 18
+    assert version == 19
 
 
 @pytest.mark.parametrize("stage", ["column", "publication"])

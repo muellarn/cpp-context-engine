@@ -476,8 +476,7 @@ def test_streamed_build_variants_remain_isolated_during_stale_cleanup(tmp_path: 
         )
         beta_before = tuple(
             store._connection.execute(  # noqa: SLF001 - isolation snapshot
-                "SELECT id, snapshot_json FROM symbol_variants "
-                "WHERE build_variant = 'beta' ORDER BY id"
+                "SELECT * FROM symbol_variant_snapshots WHERE build_variant = 'beta' ORDER BY id"
             )
         )
 
@@ -497,8 +496,7 @@ def test_streamed_build_variants_remain_isolated_during_stale_cleanup(tmp_path: 
         }
         beta_after = tuple(
             store._connection.execute(  # noqa: SLF001 - isolation snapshot
-                "SELECT id, snapshot_json FROM symbol_variants "
-                "WHERE build_variant = 'beta' ORDER BY id"
+                "SELECT * FROM symbol_variant_snapshots WHERE build_variant = 'beta' ORDER BY id"
             )
         )
 
