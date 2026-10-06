@@ -6626,17 +6626,17 @@ class SQLiteStore:
                 f"""
                 SELECT variants.* FROM (
                     SELECT id FROM symbol_variants
-                    WHERE project_id = ? AND build_variant IN ({scope_placeholders})
-                      AND id IN ({placeholders})
+                    WHERE project_id = ? AND id IN ({placeholders})
                     UNION
                     SELECT id FROM symbol_variants
                     WHERE project_id = ? AND build_variant IN ({scope_placeholders})
                       AND symbol_id IN ({placeholders})
                 ) matches CROSS JOIN symbol_variant_snapshots variants
                 WHERE variants.project_id = ? AND variants.id = matches.id
+                  AND variants.build_variant IN ({scope_placeholders})
                 ORDER BY is_definition DESC, build_variant, translation_unit_id, variants.id
                 """,
-                (project_id, *names, *chunk, project_id, *names, *chunk, project_id),
+                (project_id, *chunk, project_id, *names, *chunk, project_id, *names),
             )
             chunk_ids = set(chunk)
             canonical_matches: dict[str, CodeSymbol] = {}

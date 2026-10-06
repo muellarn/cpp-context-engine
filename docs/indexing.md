@@ -348,6 +348,12 @@ vector, symbol and graph reads use `BuildScope`; union results retain their buil
 labels. `SQLiteStore.remove_build_variant` is the only operation that removes an
 entire named build.
 
+Bulk symbol lookup first seeks the requested variant IDs within the project, then
+filters those candidates to the requested builds before resolving identities.
+Applying the build filter inside the ID seek can make SQLite scan an entire build
+for as few as three requested IDs. Canonical-ID lookup retains its scoped index;
+exact-ID precedence, result order, and legacy default-build fallback are unchanged.
+
 Schema v5 adds build/TU-specific CFG graph, block, element, and edge tables.
 Replacing or removing a translation unit cascades only its CFG rows; other
 translation units and build variants remain intact.
