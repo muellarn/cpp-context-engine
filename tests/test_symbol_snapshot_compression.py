@@ -174,6 +174,38 @@ def _materialize_v18_snapshots(store: SQLiteStore | sqlite3.Connection) -> None:
     """Build a real pre-pool table, preserving all FKs, FTS and public contents."""
     connection = store if isinstance(store, sqlite3.Connection) else store._connection
     connection.row_factory = sqlite3.Row
+    if connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name='symbol_variant_fts_source'"
+    ).fetchone():
+        # Legacy fixtures must also have the old internally stored FTS content;
+        # keeping the new view would reference the tables this fixture replaces.
+        connection.create_function(
+            "_cpp_context_snapshot_field",
+            2,
+            lambda blob, field: json.loads(storage._decode_symbol_snapshot(blob))[field],
+        )
+        documents = [
+            tuple(row)
+            for row in connection.execute("SELECT rowid,* FROM symbol_variant_fts ORDER BY rowid")
+        ]
+        storage._execute_script(
+            connection,
+            """
+            DROP TABLE symbol_variant_fts;
+            DROP VIEW symbol_variant_fts_source;
+            DROP TABLE symbol_variant_fts_rows;
+            CREATE VIRTUAL TABLE symbol_variant_fts USING fts5(
+                project_id UNINDEXED,variant_id UNINDEXED,symbol_id UNINDEXED,
+                build_variant UNINDEXED,qualified_name,signature,documentation,source_text,
+                tokenize='unicode61');
+        """,
+        )
+        connection.executemany(
+            "INSERT INTO symbol_variant_fts(rowid,project_id,variant_id,symbol_id,build_variant,"
+            "qualified_name,signature,documentation,source_text) VALUES(?,?,?,?,?,?,?,?,?)",
+            documents,
+        )
+        connection.commit()
     columns = {row[1] for row in connection.execute("PRAGMA table_info(symbol_variants)")}
     if "snapshot_id" not in columns:
         assert "snapshot_json" in columns
@@ -249,7 +281,7 @@ def test_v17_migration_preserves_exact_snapshots_and_fts(tmp_path: Path) -> None
     database = tmp_path / "legacy.db"
     before = _legacy_database(database, tmp_path)
     with SQLiteStore(database, project_root=tmp_path) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 20  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 21  # noqa: SLF001
         after = tuple(
             (*tuple(row)[:7], storage._full_variant_snapshot(row))
             for row in store._connection.execute(  # noqa: SLF001

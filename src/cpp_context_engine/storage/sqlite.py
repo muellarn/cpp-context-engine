@@ -617,6 +617,13 @@ class SQLiteStore:
             self._execute_deferred_schema_step(f"create-index:{item.name}", item.create_sql)
 
     def _validate_fresh_generation(self) -> None:
+        if self._connection.execute(
+            "SELECT 1 FROM symbol_variants variants "
+            "LEFT JOIN symbol_variant_fts_rows documents "
+            "ON documents.project_id=variants.project_id AND documents.variant_id=variants.id "
+            "WHERE documents.record_id IS NULL LIMIT 1"
+        ).fetchone():
+            raise RuntimeError("fresh generation failed FTS document coverage validation")
         self._execute_deferred_schema_step(
             "fts:variant-integrity",
             "INSERT INTO symbol_variant_fts(symbol_variant_fts,rank) VALUES('integrity-check',1)",
@@ -972,15 +979,21 @@ class SQLiteStore:
                     CREATE VIEW symbol_variant_fts_source AS
                         SELECT documents.record_id, variants.project_id, variants.id AS variant_id,
                                variants.symbol_id, variants.build_variant,
-                               _cpp_context_snapshot_field(contents.snapshot_json,'qualified_name') AS qualified_name,
-                               _cpp_context_snapshot_field(contents.snapshot_json,'signature') AS signature,
-                               _cpp_context_snapshot_field(contents.snapshot_json,'documentation') AS documentation,
-                               _cpp_context_snapshot_field(contents.snapshot_json,'source_text') AS source_text
+                               _cpp_context_snapshot_field(contents.snapshot_json,'qualified_name')
+                                   AS qualified_name,
+                               _cpp_context_snapshot_field(contents.snapshot_json,'signature')
+                                   AS signature,
+                               _cpp_context_snapshot_field(contents.snapshot_json,'documentation')
+                                   AS documentation,
+                               _cpp_context_snapshot_field(contents.snapshot_json,'source_text')
+                                   AS source_text
                         FROM symbol_variant_fts_rows documents
                         JOIN symbol_variants variants
-                          ON variants.project_id=documents.project_id AND variants.id=documents.variant_id
+                          ON variants.project_id=documents.project_id
+                         AND variants.id=documents.variant_id
                         JOIN symbol_snapshot_contents contents
-                          ON contents.project_id=variants.project_id AND contents.id=variants.snapshot_id;
+                          ON contents.project_id=variants.project_id
+                         AND contents.id=variants.snapshot_id;
                 """,
                 )
                 counts = [
@@ -1015,7 +1028,8 @@ class SQLiteStore:
                     INSERT INTO symbol_variant_fts(rowid,project_id,variant_id,symbol_id,
                         build_variant,qualified_name,signature,documentation,source_text)
                         SELECT rowid,* FROM symbol_variant_fts_v20;
-                    INSERT INTO symbol_variant_fts(symbol_variant_fts,rank) VALUES('integrity-check',1);
+                    INSERT INTO symbol_variant_fts(symbol_variant_fts,rank)
+                        VALUES('integrity-check',1);
                     DROP TABLE symbol_variant_fts_v20;
                 """,
                 )

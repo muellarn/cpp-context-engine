@@ -445,8 +445,20 @@ only override edges, avoiding scans of unrelated builds or non-override evidence
 Index replacement is transactional. Existing database files retain freed pages
 for reuse; the index-byte reduction is not an automatic file-size reduction.
 
-FTS5 searches names, signatures, documentation, and exact source text. Embeddings
-are stored by content, model/configuration identity, and dimension. `SQLiteVectorSearch` accepts any provider
+FTS5 searches names, signatures, documentation, and exact source text.
+Schema v21 removes the variant FTS content copy: a narrow, stable integer document
+mapping connects each FTS row to the original variant snapshot. Every variant
+retains its own document, token positions, lengths and BM25 statistics. The eight
+columns, tokenizer and weights do not change. Migration compares every old content
+field and the complete document mapping before atomic replacement. FTS validation
+uses `integrity-check` with `rank=1`, including the external content. Updates remove
+old tokens before changing snapshots; fresh deferred rebuilds use `delete-all`.
+The content reader caches only one document up to 64 KiB encoded and 262,144 text
+characters; larger documents are decoded without retaining them in that cache.
+Existing files need compaction to shrink; occupied-page savings alone do not prove
+that a full index will fit available physical storage.
+
+Embeddings are stored by content, model/configuration identity, and dimension. `SQLiteVectorSearch` accepts any provider
 implementing `EmbeddingProvider`; `SQLiteStore.search_vector` computes true cosine
 similarity and rejects empty, non-finite, zero-magnitude, or dimension-mismatched
 vectors.
