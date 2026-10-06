@@ -4603,31 +4603,14 @@ class SQLiteStore:
         self._put_symbol_variants(project_id, (symbol,))
 
     def _put_symbol_variants(self, project_id: int, symbols: Iterable[CodeSymbol]) -> None:
-        records: list[tuple[CodeSymbol, str, str]] = []
+        records: list[tuple[CodeSymbol, str]] = []
         for symbol in symbols:
             variant_id = symbol.variant_id or _stable_id(
                 "variant", symbol.build_variant, symbol.translation_unit_id, symbol.id
             )
-            snapshot = self._symbol_snapshot(
-                CodeSymbol(
-                    id=symbol.id,
-                    qualified_name=symbol.qualified_name,
-                    kind=symbol.kind,
-                    span=symbol.span,
-                    signature=symbol.signature,
-                    documentation=symbol.documentation,
-                    source_hash=symbol.source_hash,
-                    source_text=symbol.source_text,
-                    build_configuration_id=symbol.build_configuration_id,
-                    translation_unit_id=symbol.translation_unit_id,
-                    build_variant=symbol.build_variant,
-                    variant_id=variant_id,
-                    metadata=symbol.metadata,
-                )
-            )
-            records.append((symbol, variant_id, snapshot))
+            records.append((symbol, variant_id))
         existing: dict[str, str] = {}
-        variant_ids = [variant_id for _, variant_id, _ in records]
+        variant_ids = [variant_id for _, variant_id in records]
         for offset in range(0, len(variant_ids), 500):
             chunk = variant_ids[offset : offset + 500]
             placeholders = ",".join("?" for _ in chunk)
@@ -4654,8 +4637,10 @@ class SQLiteStore:
                 )
         changed = [
             variant_id
-            for _, variant_id, snapshot in records
-            if variant_id in existing and existing[variant_id] != snapshot
+            for symbol, variant_id in records
+            if variant_id in existing
+            and existing[variant_id]
+            != self._symbol_snapshot(replace(symbol, variant_id=variant_id))
         ]
         for offset in range(0, len(changed), 500):
             chunk = changed[offset : offset + 500]
@@ -4669,7 +4654,7 @@ class SQLiteStore:
             )
         snapshot_ids = self._intern_symbol_snapshots(
             project_id,
-            ((1, self._symbol_snapshot(symbol, provenance=False)) for symbol, _, _ in records),
+            ((1, self._symbol_snapshot(symbol, provenance=False)) for symbol, _ in records),
         )
         self._insert_rows(
             """
@@ -4696,7 +4681,7 @@ class SQLiteStore:
                     int(bool(symbol.metadata.get("is_definition"))),
                     snapshot_id,
                 )
-                for (symbol, variant_id, _), snapshot_id in zip(records, snapshot_ids, strict=True)
+                for (symbol, variant_id), snapshot_id in zip(records, snapshot_ids, strict=True)
             ),
             columns=8,
         )
@@ -4704,7 +4689,7 @@ class SQLiteStore:
             self._connection.executemany(
                 "INSERT INTO symbol_variant_fts_rows(project_id,variant_id) VALUES(?,?) "
                 "ON CONFLICT(project_id,variant_id) DO NOTHING",
-                ((project_id, variant_id) for _, variant_id, _ in records),
+                ((project_id, variant_id) for _, variant_id in records),
             )
             document_ids = {}
             for offset in range(0, len(variant_ids), 500):
@@ -4737,7 +4722,7 @@ class SQLiteStore:
                         symbol.documentation,
                         symbol.source_text,
                     )
-                    for symbol, variant_id, _ in records
+                    for symbol, variant_id in records
                 ),
             )
 

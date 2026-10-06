@@ -420,6 +420,10 @@ compaction to reclaim freed pages; snapshot compression ratios are not whole-ind
 size reductions or a guarantee that a full project fits a particular disk budget.
 
 Schema v19 shares identical immutable snapshot contents within each project.
+New variant IDs serialize only the shared content. A complete provenance-bearing
+snapshot is constructed only when an existing ID needs its exact invalidation
+comparison; legacy JSON differences and intermediate duplicate updates still
+invalidate embeddings under the original rules.
 Every variant row and its public ID, build, configuration and translation-unit
 provenance remains separate. Four provenance fields move out of the shared JSON
 only when all are present, match the variant columns and use the canonical JSON
