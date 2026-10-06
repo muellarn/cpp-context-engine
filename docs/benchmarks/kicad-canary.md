@@ -75,6 +75,16 @@ forecast factors. `elapsed_seconds` retains worker/index time;
 verification cost and overall gate duration. Custom worker timeouts need a
 deliberate `--total-gate-timeouts` selection too.
 
+Producer and independent-validator semantic checks each use two fresh read-only
+Python processes for disjoint table groups. The parent holds a write-free
+`BEGIN IMMEDIATE` transaction until both readers have exited, so WAL and rollback
+journal databases cannot change between readers. Every row, field, table count
+and ordered digest is retained; results are combined in the original table order.
+Readers share the remaining gate deadline and resource supervision. Failed,
+incomplete or oversized results fail the gate, and all readers are killed and
+reaped before releasing the writer exclusion. The generic `semantic_snapshot`
+helper stays serial, including when called with an uncommitted connection.
+
 Each supervised stage also retains `phase-timings-index.json` or
 `phase-timings-validation.json`, including on a failed gate. The worker timestamps
 boundaries with the same host's monotonic clock; supervisor pipe-delivery delays
