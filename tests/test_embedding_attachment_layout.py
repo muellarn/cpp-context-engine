@@ -1,6 +1,7 @@
 import sqlite3
 
 import pytest
+from embedding_fixtures import materialize_v24_embeddings
 from test_sqlite_storage import _batch
 
 from cpp_context_engine.storage.sqlite import SQLiteStore
@@ -15,10 +16,11 @@ def test_attachment_layout_avoids_redundant_prefix_index(tmp_path):
     with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
         _seed(store, tmp_path)
         names = {
-            row[1] for row in store._connection.execute("PRAGMA index_list(variant_embeddings)")
+            row[1]
+            for row in store._connection.execute("PRAGMA index_list(embedding_attachment_records)")
         }
         assert "variant_embeddings_search" not in names
-        assert "variant_embeddings_content" in names
+        assert "embedding_attachments_content" in names
         assert store.embedding_count("fixture") == 2
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -29,12 +31,13 @@ def test_attachment_primary_key_is_the_only_table_storage(tmp_path):
         row = next(
             row
             for row in store._connection.execute("PRAGMA table_list")
-            if row[1] == "variant_embeddings"
+            if row[1] == "embedding_attachment_records"
         )
         assert row[4] == 1, "attachment rows duplicate their wide primary keys"
 
 
 def _legacy_layout(connection):
+    materialize_v24_embeddings(connection)
     definition = connection.execute(
         "SELECT sql FROM sqlite_schema WHERE name='variant_embeddings'"
     ).fetchone()[0]
@@ -121,17 +124,26 @@ def test_attachment_queries_ignore_unselected_configurations(tmp_path):
         for upper in (32, 1024):
             for index in range(0 if upper == 32 else 32, upper):
                 configuration = f"excluded-{index}"
+                project = store._project_id()
+                namespace = store._embedding_namespace(
+                    project, "fixture", configuration, create=True
+                )
+                source = store._embedding_namespace(project, "fixture", "fixture")
                 connection.execute(
-                    "INSERT INTO embedding_vectors SELECT project_id,model,?,dimensions,"
-                    "content_hash,content_text,magnitude,vector_encoding,vector "
-                    "FROM embedding_vectors WHERE configuration_id='fixture'",
-                    (configuration,),
+                    "INSERT INTO embedding_content_records(project_id,namespace_id,dimensions,"
+                    "content_hash,content_text,magnitude,vector_encoding,vector) "
+                    "SELECT project_id,?,dimensions,content_hash,content_text,magnitude,"
+                    "vector_encoding,vector FROM embedding_content_records WHERE namespace_id=?",
+                    (namespace, source),
                 )
                 connection.execute(
-                    "INSERT INTO variant_embeddings SELECT project_id,variant_id,model,?,"
-                    "dimensions,content_hash FROM variant_embeddings "
-                    "WHERE configuration_id='fixture'",
-                    (configuration,),
+                    "INSERT INTO embedding_attachment_records "
+                    "SELECT a.project_id,a.variant_id,?,c.id FROM embedding_attachment_records a "
+                    "JOIN embedding_content_records old ON old.id=a.content_id "
+                    "JOIN embedding_content_records c ON c.project_id=a.project_id "
+                    "AND c.namespace_id=? AND c.dimensions=old.dimensions "
+                    "AND c.content_hash=old.content_hash WHERE a.namespace_id=?",
+                    (namespace, namespace, source),
                 )
             connection.commit()
             steps = 0
@@ -185,7 +197,8 @@ def test_attachment_content_and_variant_lookups_are_indexed(tmp_path):
         ).fetchone()[0]
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
-                "INSERT INTO variant_embeddings SELECT * FROM variant_embeddings LIMIT 1"
+                "INSERT INTO embedding_attachment_records "
+                "SELECT * FROM embedding_attachment_records LIMIT 1"
             )
         connection.rollback()
         connection.execute("DELETE FROM symbol_variants WHERE id=?", (variant_id,))

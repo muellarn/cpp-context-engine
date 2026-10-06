@@ -877,7 +877,7 @@ def test_v13_migration_upgrades_real_v12_profile_and_coverage_rows(tmp_path: Pat
         }.isdisjoint(row[1] for row in legacy.execute("PRAGMA table_info(translation_units)"))
 
     with SQLiteStore(database, project_root=root) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 24  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 25  # noqa: SLF001
         assert "vector_encoding" in {  # noqa: SLF001
             row[1] for row in migrated._connection.execute("PRAGMA table_info(embedding_vectors)")
         }
@@ -1352,7 +1352,7 @@ def test_cosine_search_rejects_corrupt_stored_values(
         store.put_embedding("symbol-alpha", "fixture", [1.0, 1.0])
         store._connection.execute("PRAGMA ignore_check_constraints = ON")  # noqa: SLF001
         store._connection.execute(  # noqa: SLF001
-            "UPDATE embedding_vectors SET vector_encoding = ?, vector = ?, magnitude = ?",
+            "UPDATE embedding_content_records SET vector_encoding = ?, vector = ?, magnitude = ?",
             (encoding, blob, magnitude),
         )
 
@@ -1470,30 +1470,29 @@ def test_vector_dimension_witness_requires_matching_scoped_attachment(
         model = "other" if location == "other-model" else "fixture"
         configuration = "other" if location == "other-config" else "fixture"
         connection = store._connection
-        connection.execute(
-            "INSERT INTO embedding_vectors(project_id, model, configuration_id, dimensions, "
+        namespace = store._embedding_namespace(project, model, configuration, create=True)
+        content = connection.execute(
+            "INSERT INTO embedding_content_records(project_id, namespace_id, dimensions, "
             "content_hash, content_text, magnitude, vector_encoding, vector) "
-            "VALUES (?, ?, ?, ?, 'wrong', 'wrong', ?, ?, ?)",
+            "VALUES (?, ?, ?, 'wrong', 'wrong', ?, ?, ?)",
             (
                 project,
-                model,
-                configuration,
+                namespace,
                 dimension,
                 math.sqrt(dimension),
                 VECTOR_ENCODING_RAW_F64LE_V1,
                 struct.pack(f"<{dimension}d", *([1.0] * dimension)),
             ),
-        )
+        ).lastrowid
         if location != "orphan":
             if location == "alternate":
                 connection.execute(
                     "UPDATE symbol_variants SET build_variant='alternate' WHERE symbol_id='file-a'"
                 )
             connection.execute(
-                "UPDATE variant_embeddings SET model=?, configuration_id=?, dimensions=?, "
-                "content_hash='wrong' "
+                "UPDATE embedding_attachment_records SET namespace_id=?, content_id=? "
                 "WHERE variant_id IN (SELECT id FROM symbol_variants WHERE symbol_id='file-a')",
-                (model, configuration, dimension),
+                (namespace, content),
             )
         connection.commit()
         if location == "selected":
@@ -1577,17 +1576,20 @@ def test_shared_vector_search_excludes_unattached_and_foreign_corruption(tmp_pat
             "UPDATE symbol_variants SET build_variant='alternate' WHERE symbol_id='file-a'"
         )
         connection.execute(
-            "UPDATE embedding_vectors SET vector = zeroblob(dimensions * 8) "
-            "WHERE model != 'fixture' OR configuration_id != 'fixture' "
+            "UPDATE embedding_content_records SET vector = zeroblob(dimensions * 8) "
+            "WHERE namespace_id IN (SELECT id FROM embedding_namespaces "
+            "WHERE model != 'fixture' OR configuration_id != 'fixture') "
             "OR content_hash IN (SELECT e.content_hash FROM variant_embeddings e "
             "JOIN symbol_variants v ON v.project_id=e.project_id AND v.id=e.variant_id "
             "WHERE v.build_variant='alternate')"
         )
-        connection.execute("""INSERT INTO embedding_vectors
-            (project_id,model,configuration_id,dimensions,content_hash,content_text,magnitude,vector,vector_encoding)
-            SELECT project_id,model,configuration_id,dimensions,'orphan','orphan',
+        connection.execute("""INSERT INTO embedding_content_records
+            (project_id,namespace_id,dimensions,content_hash,content_text,magnitude,vector,vector_encoding)
+            SELECT project_id,namespace_id,dimensions,'orphan','orphan',
                    magnitude,zeroblob(dimensions * 8),vector_encoding
-            FROM embedding_vectors WHERE model='fixture' AND configuration_id='fixture'
+            FROM embedding_content_records WHERE namespace_id IN
+                (SELECT id FROM embedding_namespaces
+                 WHERE model='fixture' AND configuration_id='fixture')
             LIMIT 1""")
         connection.commit()
         assert len(store.search_vector([1.0, 0.0], model="fixture")) == 1
@@ -1672,13 +1674,17 @@ def test_embedding_dimension_validation_has_bounded_index_work(tmp_path: Path) -
         connection = store._connection  # noqa: SLF001
         work: list[int] = []
         statements: list[str] = []
+        namespace = store._embedding_namespace(project, "fixture", "config", create=True)
         for count in (256, 1024):
-            connection.execute("DELETE FROM embedding_vectors")
+            connection.execute("DELETE FROM embedding_content_records")
             connection.executemany(
-                "INSERT INTO embedding_vectors VALUES (?, 'fixture', 'config', 2, ?, ?, 2, ?, ?)",
+                "INSERT INTO embedding_content_records(project_id,namespace_id,dimensions,"
+                "content_hash,content_text,magnitude,vector_encoding,vector) "
+                "VALUES (?, ?, 2, ?, ?, 2, ?, ?)",
                 (
                     (
                         project,
+                        namespace,
                         str(index),
                         str(index),
                         VECTOR_ENCODING_RAW_F64LE_V1,
@@ -1713,7 +1719,13 @@ def test_embedding_dimension_validation_has_bounded_index_work(tmp_path: Path) -
             for statement in statements
             for row in connection.execute("EXPLAIN QUERY PLAN " + statement)
         ]
-        assert all("project_id=? AND model=? AND configuration_id=?" in plan for plan in plans)
+        assert any("project_id=? AND model=? AND configuration_id=?" in plan for plan in plans)
+        assert all(
+            "project_id=? AND namespace_id=?" in plan
+            for plan in plans
+            if "embedding_content_records" in plan
+        )
+        assert not any("SCAN " in plan for plan in plans)
         assert any("dimensions>?" in plan for plan in plans)
 
 
@@ -1734,13 +1746,15 @@ def test_embedding_dimension_states_preserve_both_callers_and_isolation(
             (project, "other-model", "config", (7, 8)),
             (project, "fixture", "other-config", (9, 10)),
         ):
+            namespace = store._embedding_namespace(owner, model, configuration, create=True)
             for dimension in selected:
                 connection.execute(
-                    "INSERT INTO embedding_vectors VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO embedding_content_records(project_id,namespace_id,dimensions,"
+                    "content_hash,content_text,magnitude,vector_encoding,vector) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         owner,
-                        model,
-                        configuration,
+                        namespace,
                         dimension,
                         sqlite_storage._embedding_content_hash("shared"),  # noqa: SLF001
                         "shared",
@@ -2044,7 +2058,7 @@ def test_no_miss_trusted_attach_immediately_releases_capability(tmp_path: Path) 
         ).fetchone()[0]
         with store._connection:  # noqa: SLF001
             store._connection.execute(  # noqa: SLF001
-                "DELETE FROM variant_embeddings WHERE variant_id = ?", (missing_variant,)
+                "DELETE FROM embedding_attachment_records WHERE variant_id = ?", (missing_variant,)
             )
 
         with store.embedding_write_session(root):
@@ -2326,7 +2340,7 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     legacy.close()
 
     with SQLiteStore(database, project_root=root) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 24  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 25  # noqa: SLF001
         assert store.embedding_count("fixture") == 2
         assert store.embedding_vector_count("fixture") == 1
         assert store.embedding_count("openai-compatible:legacy") == 0
@@ -2426,7 +2440,7 @@ def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 24  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 25  # noqa: SLF001
         assert "vector_encoding" in {
             row[1]
             for row in store._connection.execute(  # noqa: SLF001
@@ -2434,7 +2448,11 @@ def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
             )
         }
 
-    assert {"embedding_vectors", "variant_embeddings"} <= tables
+    assert {
+        "embedding_content_records",
+        "embedding_attachment_records",
+        "embedding_namespaces",
+    } <= tables
 
 
 def test_bulk_symbol_lookup_preserves_order_duplicates_and_missing(tmp_path: Path) -> None:

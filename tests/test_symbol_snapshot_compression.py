@@ -172,7 +172,10 @@ def test_compressed_bytes_are_not_semantic_identity(tmp_path: Path) -> None:
 
 def _materialize_v18_snapshots(store: SQLiteStore | sqlite3.Connection) -> None:
     """Build a real pre-pool table, preserving all FKs, FTS and public contents."""
+    from embedding_fixtures import materialize_v24_embeddings
+
     connection = store if isinstance(store, sqlite3.Connection) else store._connection
+    materialize_v24_embeddings(connection)
     connection.row_factory = sqlite3.Row
     if connection.execute(
         "SELECT 1 FROM sqlite_schema WHERE name='symbol_variant_fts_source'"
@@ -281,7 +284,7 @@ def test_v17_migration_preserves_exact_snapshots_and_fts(tmp_path: Path) -> None
     database = tmp_path / "legacy.db"
     before = _legacy_database(database, tmp_path)
     with SQLiteStore(database, project_root=tmp_path) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 24  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 25  # noqa: SLF001
         after = tuple(
             (*tuple(row)[:7], storage._full_variant_snapshot(row))
             for row in store._connection.execute(  # noqa: SLF001
