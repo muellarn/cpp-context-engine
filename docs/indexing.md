@@ -435,6 +435,14 @@ is unchanged. Semantic acceptance hashes contents and content references, not
 insertion-order-dependent pool rowids. Pool payload savings alone are not a
 physical database-size estimate or a Whole-index capacity guarantee.
 
+Schema v20 consolidates the four overlapping graph endpoint indexes into two:
+`(project_id, source_id, build_variant, relation)` and the matching target index.
+Their endpoint prefix supports foreign-key lookups without scanning a project,
+while scoped graph reads still seek endpoint, build and relation. The edge table,
+its primary key, TU index, evidence IDs and every provenance field are unchanged.
+Index replacement is transactional. Existing database files retain freed pages
+for reuse; the index-byte reduction is not an automatic file-size reduction.
+
 FTS5 searches names, signatures, documentation, and exact source text. Embeddings
 are stored by content, model/configuration identity, and dimension. `SQLiteVectorSearch` accepts any provider
 implementing `EmbeddingProvider`; `SQLiteStore.search_vector` computes true cosine

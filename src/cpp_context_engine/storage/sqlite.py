@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
 _SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
@@ -895,6 +895,22 @@ class SQLiteStore:
             self._migrate_v18()
         if current <= 18:
             self._migrate_v19()
+        if current <= 19:
+            self._migrate_v20()
+
+    def _migrate_v20(self) -> None:
+        """Share endpoint indexes between scoped graph queries and FK lookups."""
+
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            for endpoint in ("source", "target"):
+                self._connection.execute(f"DROP INDEX IF EXISTS edges_{endpoint}")
+                self._connection.execute(f"DROP INDEX IF EXISTS edges_scope_{endpoint}")
+                self._connection.execute(
+                    f"CREATE INDEX edges_scope_{endpoint} "
+                    f"ON edges(project_id, {endpoint}_id, build_variant, relation)"
+                )
+            self._connection.execute("PRAGMA user_version=20")
 
     def _migrate_v19(self) -> None:
         """Pool immutable snapshots without changing legacy provenance or FTS."""
