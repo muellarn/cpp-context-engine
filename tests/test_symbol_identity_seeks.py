@@ -111,7 +111,7 @@ def test_symbol_seeks_match_legacy_identity_preferences(tmp_path, bulk, scope):
         for identity in requested:
             rows = list(
                 store._connection.execute(
-                    "SELECT * FROM symbol_variants WHERE project_id = ? "
+                    "SELECT * FROM symbol_variant_snapshots WHERE project_id = ? "
                     f"AND build_variant IN ({placeholders}) AND (symbol_id = ? OR id = ?) "
                     "ORDER BY is_definition DESC, build_variant, translation_unit_id"
                     + (", id" if bulk else ""),

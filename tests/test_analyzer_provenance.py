@@ -147,12 +147,15 @@ def test_binary_change_during_generation_rolls_back(tmp_path: Path, monkeypatch)
 
 @pytest.mark.parametrize("deny_version_commit", [False, True])
 def test_v16_migration_preserves_unknown_tu_provenance(tmp_path: Path, deny_version_commit) -> None:
+    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+
     root = tmp_path / "project"
     root.mkdir()
     _navigation, deep = _two_tu_summary_batch(root)
     path = tmp_path / "index.db"
     with SQLiteStore(path, project_root=root) as store:
         store.apply_ingestion(root, deep)
+        _materialize_v18_snapshots(store)
         store._connection.execute("ALTER TABLE translation_units DROP COLUMN analyzer_identity")  # noqa: SLF001
         store._connection.execute("PRAGMA user_version = 16")  # noqa: SLF001
         store._connection.commit()  # noqa: SLF001
@@ -179,4 +182,4 @@ def test_v16_migration_preserves_unknown_tu_provenance(tmp_path: Path, deny_vers
         assert len(states) == 2
         assert all(state.analyzer_identity == "" for state in states.values())
         assert all(state.index_profile is IndexProfile.FULL for state in states.values())
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 18  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 19  # noqa: SLF001

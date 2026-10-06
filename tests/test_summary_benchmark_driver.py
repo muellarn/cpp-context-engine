@@ -74,7 +74,7 @@ def summary_input(tmp_path):
         "database_artifact_sha256": "a" * 64,
         "producer_pins": {
             "profile": "full",
-            "expected_fact_schema_version": 18,
+            "expected_fact_schema_version": 19,
             "engine_commit": "b" * 40,
             "project_commit": "c" * 40,
             "analyzer_sha256": "d" * 64,
@@ -82,7 +82,7 @@ def summary_input(tmp_path):
             "subset_cdb_sha256": "f" * 64,
         },
         "semantic_snapshot": {
-            "schema_version": 18,
+            "schema_version": 19,
             "digest": "a" * 64,
             "counts": {
                 **dict.fromkeys(_SEMANTIC_TABLES, 0),
@@ -278,7 +278,7 @@ def test_refresh_driver_marks_real_fixture_phases_without_completing_timeout(
     else:
         report = driver.run(manifest, tmp_path / "trial", None, 90)
         assert report["source_parity"] is True
-        assert len(report["after"]["table_digests"]) == 28
+        assert len(report["after"]["table_digests"]) == 29
     markers = [
         line.split()
         for line in capsys.readouterr().out.splitlines()

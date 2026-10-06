@@ -81,7 +81,7 @@ def test_large_unicode_snapshot_is_compressed_and_lossless(tmp_path: Path) -> No
     with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
         _put(store, tmp_path, batch)
         snapshot = store._connection.execute(  # noqa: SLF001 - persisted representation contract
-            "SELECT snapshot_json FROM symbol_variants WHERE symbol_id = 'shared-symbol'"
+            "SELECT snapshot_json FROM symbol_variant_snapshots WHERE symbol_id = 'shared-symbol'"
         ).fetchone()[0]
         assert isinstance(snapshot, bytes), "symbol snapshots must not retain full JSON TEXT"
         assert len(snapshot) < len(batch.symbols[0].source_text.encode("utf-8")) // 4
@@ -119,11 +119,14 @@ def test_variants_order_search_reopen_update_delete_and_deep_parity(tmp_path: Pa
         store._rebuild_variant_fts()  # noqa: SLF001 - exercise compressed FTS rebuild
         assert store.search(SearchQuery("repeated_value"), build_scope=scope) == hits
         rows = store._connection.execute(  # noqa: SLF001 - embedding extraction equality
-            "SELECT snapshot_json FROM symbol_variants"
+            "SELECT * FROM symbol_variant_snapshots"
         )
         for row in rows:
-            symbol = store._snapshot_symbol(row[0])  # noqa: SLF001
-            assert storage._embedding_text_from_snapshot(row[0]) == storage._embedding_text(symbol)
+            snapshot = storage._full_variant_snapshot(row)
+            symbol = store._snapshot_symbol(snapshot)  # noqa: SLF001
+            assert storage._embedding_text_from_snapshot(snapshot) == storage._embedding_text(
+                symbol
+            )
 
     with SQLiteStore(database, project_root=tmp_path) as store:
         assert store.symbols(build_scope=scope) == before
@@ -146,7 +149,8 @@ def test_compressed_bytes_are_not_semantic_identity(tmp_path: Path) -> None:
     with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
         _put(store, tmp_path, batch)
         row = store._connection.execute(  # noqa: SLF001
-            "SELECT id, snapshot_json FROM symbol_variants WHERE symbol_id = 'shared-symbol'"
+            "SELECT snapshot_id, snapshot_json FROM symbol_variant_snapshots "
+            "WHERE symbol_id = 'shared-symbol'"
         ).fetchone()
         raw = storage._decode_symbol_snapshot(row[1]).encode("utf-8")
         alternate = (
@@ -154,10 +158,11 @@ def test_compressed_bytes_are_not_semantic_identity(tmp_path: Path) -> None:
         )
         assert alternate != row[1]
         store._connection.execute(  # noqa: SLF001
-            "UPDATE symbol_variants SET snapshot_json = ? WHERE id = ?", (alternate, row[0])
+            "UPDATE symbol_snapshot_contents SET snapshot_json = ? WHERE id = ?",
+            (alternate, row[0]),
         )
         store._connection.commit()  # noqa: SLF001
-        store.put_embedding(row[0], "fixture", [1.0, 0.0])
+        store.put_embedding("shared-symbol", "fixture", [1.0, 0.0])
         store.validate_deep_navigation_parity(tmp_path, (batch,))
         project_id = store._project_id()  # noqa: SLF001
         with store._connection:  # noqa: SLF001
@@ -165,9 +170,64 @@ def test_compressed_bytes_are_not_semantic_identity(tmp_path: Path) -> None:
         assert store.embedding_count("fixture") == 1
 
 
+def _materialize_v18_snapshots(store: SQLiteStore | sqlite3.Connection) -> None:
+    """Build a real pre-pool table, preserving all FKs, FTS and public contents."""
+    connection = store if isinstance(store, sqlite3.Connection) else store._connection
+    connection.row_factory = sqlite3.Row
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(symbol_variants)")}
+    if "snapshot_id" not in columns:
+        assert "snapshot_json" in columns
+        return
+    rows = [
+        (*tuple(row)[:7], storage._full_variant_snapshot(row))
+        for row in connection.execute("SELECT * FROM symbol_variant_snapshots ORDER BY id")
+    ]
+    indexes = [
+        r[0]
+        for r in connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name='symbol_variants' "
+            "AND sql IS NOT NULL AND name != 'symbol_variants_snapshot'"
+        )
+    ]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("BEGIN IMMEDIATE")
+    storage._execute_script(
+        connection,
+        """
+        DROP VIEW symbol_variant_snapshots;
+        CREATE TABLE symbol_variants_v18 (
+            project_id INTEGER NOT NULL, id TEXT NOT NULL, symbol_id TEXT NOT NULL,
+            build_variant TEXT NOT NULL, build_configuration_id TEXT NOT NULL,
+            translation_unit_id TEXT NOT NULL, is_definition INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            PRIMARY KEY(project_id,id),
+            UNIQUE(project_id,build_variant,translation_unit_id,symbol_id),
+            FOREIGN KEY(project_id,symbol_id) REFERENCES symbols(project_id,id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id,translation_unit_id)
+                REFERENCES translation_units(project_id,id) ON DELETE CASCADE
+        );
+    """,
+    )
+    connection.executemany("INSERT INTO symbol_variants_v18 VALUES(?,?,?,?,?,?,?,?)", rows)
+    storage._execute_script(
+        connection,
+        """
+        DROP TABLE symbol_variants;
+        ALTER TABLE symbol_variants_v18 RENAME TO symbol_variants;
+        DROP TABLE symbol_snapshot_contents;
+    """,
+    )
+    for statement in indexes:
+        connection.execute(statement)
+    connection.execute("PRAGMA user_version=18")
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=ON")
+
+
 def _legacy_database(database: Path, root: Path) -> tuple[tuple[object, ...], ...]:
     with SQLiteStore(database, project_root=root) as store:
         _put(store, root, _batch(root, "one"))
+        _materialize_v18_snapshots(store)
         for row in store._connection.execute(  # noqa: SLF001
             "SELECT rowid, snapshot_json FROM symbol_variants"
         ):
@@ -189,17 +249,20 @@ def test_v17_migration_preserves_exact_snapshots_and_fts(tmp_path: Path) -> None
     database = tmp_path / "legacy.db"
     before = _legacy_database(database, tmp_path)
     with SQLiteStore(database, project_root=tmp_path) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 18  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 19  # noqa: SLF001
         after = tuple(
-            tuple(row)
+            (*tuple(row)[:7], storage._full_variant_snapshot(row))
             for row in store._connection.execute(  # noqa: SLF001
-                "SELECT * FROM symbol_variants ORDER BY rowid"
+                "SELECT * FROM symbol_variant_snapshots ORDER BY id"
             )
         )
-        assert all(isinstance(row[-1], bytes) for row in after)
-        assert (
-            tuple((*row[:-1], storage._decode_symbol_snapshot(row[-1])) for row in after) == before
+        assert all(
+            isinstance(row[0], bytes)
+            for row in store._connection.execute(
+                "SELECT snapshot_json FROM symbol_snapshot_contents"
+            )
         )
+        assert sorted(after) == sorted(before)
         store.validate_deep_navigation_parity(tmp_path, (_batch(tmp_path, "one"),))
         assert store.search(SearchQuery("repeated_value"))
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
@@ -292,7 +355,16 @@ def test_compression_reduces_physical_database_without_changing_rows(
                 patch.setattr(storage, "_encode_symbol_snapshot", lambda value: value)
             with SQLiteStore(database, project_root=tmp_path) as store:
                 for index in range(6):
-                    _put(store, tmp_path, _batch(tmp_path, str(index)))
+                    batch = _batch(tmp_path, str(index))
+                    # Isolate compression from the separately tested pool deduplication.
+                    batch = replace(
+                        batch,
+                        symbols=tuple(
+                            replace(symbol, metadata={**symbol.metadata, "distinct": index})
+                            for symbol in batch.symbols
+                        ),
+                    )
+                    _put(store, tmp_path, batch)
                 snapshots[name] = store.symbols()
                 store._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
                 store._connection.execute("VACUUM")  # noqa: SLF001 - fair physical comparison

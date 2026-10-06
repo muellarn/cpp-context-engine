@@ -157,7 +157,10 @@ def test_vector_storage_decoder_rejects_malformed_or_oversized_payloads(
 
 
 def _downgrade_embedding_schema_to_v13(database: Path) -> None:
+    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+
     connection = sqlite3.connect(database)
+    _materialize_v18_snapshots(connection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = OFF")
     vectors = connection.execute(
@@ -819,6 +822,9 @@ def _create_v12_profile_fixture(database: Path, root: Path) -> None:
     )
     with SQLiteStore(database, project_root=root) as store:
         store.apply_ingestion(root, replace(batch, translation_units=(native_unit,)))
+        from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+
+        _materialize_v18_snapshots(store)
         with store._connection:  # noqa: SLF001 - construct the legacy schema fixture
             store._connection.execute(  # noqa: SLF001
                 """
@@ -871,7 +877,7 @@ def test_v13_migration_upgrades_real_v12_profile_and_coverage_rows(tmp_path: Pat
         }.isdisjoint(row[1] for row in legacy.execute("PRAGMA table_info(translation_units)"))
 
     with SQLiteStore(database, project_root=root) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 18  # noqa: SLF001
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 19  # noqa: SLF001
         assert "vector_encoding" in {  # noqa: SLF001
             row[1] for row in migrated._connection.execute("PRAGMA table_info(embedding_vectors)")
         }
@@ -974,7 +980,7 @@ def test_symbol_refresh_lookup_uses_v9_preference_index(tmp_path: Path) -> None:
         plan = store._connection.execute(  # noqa: SLF001 - inspect SQLite planner evidence
             """
             EXPLAIN QUERY PLAN
-            SELECT symbol_id, snapshot_json FROM symbol_variants
+            SELECT symbol_id, snapshot_json FROM symbol_variant_snapshots
             WHERE project_id = ? AND symbol_id IN (?)
             ORDER BY symbol_id, is_definition DESC, build_variant, translation_unit_id
             """,
@@ -1001,11 +1007,7 @@ def test_symbol_refresh_batches_preference_reads(tmp_path: Path) -> None:
         assert store.get_symbol("symbol-alpha") is not None
 
     assert (
-        sum(
-            "SELECT symbol_id, snapshot_json FROM symbol_variants" in statement
-            for statement in statements
-        )
-        == 1
+        sum("SELECT * FROM symbol_variant_snapshots" in statement for statement in statements) == 1
     )
 
 
@@ -2275,6 +2277,9 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     duplicate = replace(batch.symbols[1], id="symbol-alpha-copy")
     with SQLiteStore(database, project_root=root) as store:
         store.apply_ingestion(root, replace(batch, symbols=(*batch.symbols, duplicate)))
+        from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+
+        _materialize_v18_snapshots(store)
         variants = tuple(
             row[0]
             for row in store._connection.execute(  # noqa: SLF001 - migration fixture
@@ -2321,7 +2326,7 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     legacy.close()
 
     with SQLiteStore(database, project_root=root) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 18  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 19  # noqa: SLF001
         assert store.embedding_count("fixture") == 2
         assert store.embedding_vector_count("fixture") == 1
         assert store.embedding_count("openai-compatible:legacy") == 0
@@ -2352,6 +2357,9 @@ def test_v12_migration_rejects_corrupt_legacy_vectors_atomically(
     database = tmp_path / "index.db"
     with SQLiteStore(database, project_root=root) as store:
         store.apply_ingestion(root, _batch(root))
+        from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+
+        _materialize_v18_snapshots(store)
         variant_id = store._connection.execute(  # noqa: SLF001 - migration fixture
             "SELECT id FROM symbol_variants WHERE symbol_id = 'symbol-alpha'"
         ).fetchone()[0]
@@ -2418,7 +2426,7 @@ def test_v12_migration_accepts_minimal_v11_database(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 18  # noqa: SLF001
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 19  # noqa: SLF001
         assert "vector_encoding" in {
             row[1]
             for row in store._connection.execute(  # noqa: SLF001
