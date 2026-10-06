@@ -1622,10 +1622,15 @@ def test_navigation_index_matches_full_navigation_tables_embeddings_and_ranking(
         sqlite3.connect(navigation_config.database_path) as navigation_db,
     ):
         for table in tables:
+            order = (
+                "project_id, variant_id, model, configuration_id"
+                if table == "variant_embeddings"
+                else "rowid"
+            )
             assert (
-                full_db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                full_db.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall()
                 == navigation_db.execute(  # noqa: S608
-                    f"SELECT * FROM {table} ORDER BY rowid"  # noqa: S608
+                    f"SELECT * FROM {table} ORDER BY {order}"  # noqa: S608
                 ).fetchall()
             )
 
