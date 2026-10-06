@@ -2537,7 +2537,9 @@ def test_parent_revalidation_accepts_exact_evidence_and_rejects_tampering(
             analyzer=analyzer,
             output_directory=output,
             gates=(1,),
-            gate_timeouts={"1": 1.0},
+            # This artifact-tampering test runs three real verification readers.
+            # Deadline failure and cleanup have separate bounded regression tests.
+            gate_timeouts={"1": 5.0},
             workers=1,
             analyzer_timeout_seconds=1,
             embedding_dimensions=1,
