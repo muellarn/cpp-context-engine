@@ -330,7 +330,7 @@ def test_v2_migration_preserves_baseline_search_and_requests_reindex(tmp_path: P
 
 
 def test_v4_database_migrates_cfg_tables_in_order(tmp_path: Path) -> None:
-    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
     database = tmp_path / "v4.db"
     with SQLiteStore(database) as store:

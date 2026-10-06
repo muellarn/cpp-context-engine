@@ -157,7 +157,7 @@ def test_vector_storage_decoder_rejects_malformed_or_oversized_payloads(
 
 
 def _downgrade_embedding_schema_to_v13(database: Path) -> None:
-    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
     connection = sqlite3.connect(database)
     _materialize_v18_snapshots(connection)
@@ -822,7 +822,7 @@ def _create_v12_profile_fixture(database: Path, root: Path) -> None:
     )
     with SQLiteStore(database, project_root=root) as store:
         store.apply_ingestion(root, replace(batch, translation_units=(native_unit,)))
-        from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+        from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
         _materialize_v18_snapshots(store)
         with store._connection:  # noqa: SLF001 - construct the legacy schema fixture
@@ -2277,7 +2277,7 @@ def test_v12_migrates_legacy_variant_vectors_into_shared_content_pool(tmp_path: 
     duplicate = replace(batch.symbols[1], id="symbol-alpha-copy")
     with SQLiteStore(database, project_root=root) as store:
         store.apply_ingestion(root, replace(batch, symbols=(*batch.symbols, duplicate)))
-        from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+        from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
         _materialize_v18_snapshots(store)
         variants = tuple(
@@ -2357,7 +2357,7 @@ def test_v12_migration_rejects_corrupt_legacy_vectors_atomically(
     database = tmp_path / "index.db"
     with SQLiteStore(database, project_root=root) as store:
         store.apply_ingestion(root, _batch(root))
-        from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+        from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
         _materialize_v18_snapshots(store)
         variant_id = store._connection.execute(  # noqa: SLF001 - migration fixture

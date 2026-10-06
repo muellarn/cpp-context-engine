@@ -147,7 +147,7 @@ def test_binary_change_during_generation_rolls_back(tmp_path: Path, monkeypatch)
 
 @pytest.mark.parametrize("deny_version_commit", [False, True])
 def test_v16_migration_preserves_unknown_tu_provenance(tmp_path: Path, deny_version_commit) -> None:
-    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
     root = tmp_path / "project"
     root.mkdir()

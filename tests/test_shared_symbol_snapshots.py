@@ -1,9 +1,10 @@
 from dataclasses import replace
 from pathlib import Path
 
+from test_symbol_snapshot_compression import _batch, _put
+
 from cpp_context_engine.models import BuildScope, SearchQuery
 from cpp_context_engine.storage.sqlite import SQLiteStore
-from tests.test_symbol_snapshot_compression import _batch, _put
 
 
 def test_shared_contents_preserve_each_variant_and_fts_parity(tmp_path: Path):

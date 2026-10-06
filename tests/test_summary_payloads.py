@@ -67,7 +67,7 @@ def _solution_rows(store: SQLiteStore) -> tuple[tuple[object, ...], ...]:
 
 
 def _insert_legacy_propagated_rows(store: SQLiteStore) -> None:
-    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
     _materialize_v18_snapshots(store)
     project_id = store._project_id()  # noqa: SLF001 - construct a real v10 database
@@ -151,7 +151,7 @@ def _insert_legacy_propagated_rows(store: SQLiteStore) -> None:
 
 
 def _downgrade_embedding_schema_to_v11(store: SQLiteStore) -> None:
-    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
     _materialize_v18_snapshots(store)
     store._connection.executescript(  # noqa: SLF001 - construct a real v11 boundary

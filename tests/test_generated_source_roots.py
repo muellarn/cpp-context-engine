@@ -539,7 +539,7 @@ def test_schema_14_upgrades_generated_root_provenance_without_rewriting_old_buil
     project = tmp_path / "project"
     project.mkdir()
     database = tmp_path / "index.db"
-    from tests.test_symbol_snapshot_compression import _materialize_v18_snapshots
+    from test_symbol_snapshot_compression import _materialize_v18_snapshots
 
     with SQLiteStore(database, project_root=project) as store:
         _materialize_v18_snapshots(store)

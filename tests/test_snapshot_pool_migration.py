@@ -4,12 +4,12 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from test_symbol_snapshot_compression import _batch, _materialize_v18_snapshots, _put
 
 import cpp_context_engine.storage.sqlite as storage
 from cpp_context_engine.kicad_canary import semantic_snapshot
 from cpp_context_engine.models import BuildScope, SearchQuery
 from cpp_context_engine.storage.sqlite import SQLiteStore
-from tests.test_symbol_snapshot_compression import _batch, _materialize_v18_snapshots, _put
 
 
 @pytest.mark.parametrize("legacy", ("canonical", "mismatch", "missing", "format"))
