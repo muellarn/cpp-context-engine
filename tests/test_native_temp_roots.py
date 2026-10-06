@@ -1,5 +1,5 @@
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 from native_cache import NativeFixtureCache
 
@@ -22,8 +22,11 @@ def test_native_cache_preserves_configured_temporary_project_and_siblings(tmp_pa
     directory = cache.directory
     try:
         configuration = BuildConfiguration(
-            id="temp-roots", source_path=source, directory=project,
-            arguments=("clang++", "-c", str(source)), command_hash="temp-roots",
+            id="temp-roots",
+            source_path=source,
+            directory=project,
+            arguments=("clang++", "-c", str(source)),
+            command_hash="temp-roots",
             generated_source_roots=(generated,),
         )
         staged_root, staged_configuration = cache.stage(project, configuration)

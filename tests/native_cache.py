@@ -117,7 +117,7 @@ class NativeFixtureCache:
     """Store immutable pickles and deserialize a private result for every consumer."""
 
     def __init__(self) -> None:
-        self._directory = Path(tempfile.mkdtemp(prefix="cpp-context-native-tests-", dir="/tmp"))
+        self._directory = Path(tempfile.mkdtemp(prefix="cpp-context-native-tests-"))
         self._lock = threading.Lock()
         self._key_locks: dict[str, threading.Lock] = {}
         self._loads = 0
@@ -223,8 +223,8 @@ class NativeFixtureCache:
 
     def stage_project(self, project_root: Path) -> Path:
         root = project_root.resolve(strict=True)
-        temporary_root = Path("/tmp").resolve()
-        if root == temporary_root or temporary_root in root.parents:
+        temporary_roots = (Path("/tmp").resolve(), Path(tempfile.gettempdir()).resolve())
+        if any(root == temporary or temporary in root.parents for temporary in temporary_roots):
             return root
         identity = hashlib.sha256((str(root) + "\0" + _project_digest(root)).encode()).hexdigest()
         staged_root = self._directory / f"project-{identity}"

@@ -17,7 +17,11 @@ Native tests use a session-local fixture cache. Its key includes the analyzer
 binary and protocol, the complete fixture and compilation-database contents,
 the normalized build configuration, relevant environment, resource limits, and
 transport mode. Immutable projects stored on the WSL-mounted Windows filesystem
-are copied to `/tmp` for analysis; fact paths are restored before validation.
+are copied beneath the configured Python temporary directory for analysis; fact
+paths are restored before validation. Projects already within that temporary
+directory (or the legacy `/tmp` tree) remain in place, preserving relative sibling
+headers and generated roots. The session cache lives under the same temporary
+directory so an isolated run can account for all of its own temporary artifacts.
 Cached artifacts are read-only, deserialized for each consumer, and removed at
 session end.
 
