@@ -73,7 +73,7 @@ from cpp_context_engine.models import (
 if TYPE_CHECKING:
     from cpp_context_engine.ingestion.protocols import IngestionBatch
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 SYMBOL_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
 _SNAPSHOT_BATCH_BYTES = 16 * 1024 * 1024
 _SYMBOL_SNAPSHOT_ZLIB_V1 = b"CSS\x01"
@@ -895,6 +895,30 @@ class SQLiteStore:
             self._migrate_v18()
         if current <= 18:
             self._migrate_v19()
+        if current <= 19:
+            self._migrate_v20()
+
+    def _migrate_v20(self) -> None:
+        """Share endpoint indexes between scoped graph queries and FK lookups."""
+
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            if self._connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='edges'"
+            ).fetchone():
+                for endpoint in ("source", "target"):
+                    self._connection.execute(f"DROP INDEX IF EXISTS edges_{endpoint}")
+                    self._connection.execute(f"DROP INDEX IF EXISTS edges_scope_{endpoint}")
+                    self._connection.execute(
+                        f"CREATE INDEX edges_scope_{endpoint} "
+                        f"ON edges(project_id, {endpoint}_id, build_variant, relation)"
+                    )
+                self._connection.execute(
+                    "CREATE INDEX IF NOT EXISTS edges_overrides_scope "
+                    "ON edges(project_id, build_variant, target_id, source_id) "
+                    "WHERE relation='overrides'"
+                )
+            self._connection.execute("PRAGMA user_version=20")
 
     def _migrate_v19(self) -> None:
         """Pool immutable snapshots without changing legacy provenance or FTS."""
@@ -7790,7 +7814,13 @@ class SQLiteStore:
                 # UNION deduplicates self-loops before the global ordering and limit.
                 query += " UNION " + select_sql + "target_id = ?" + relation_sql
                 parameters *= 2
-            query += " ORDER BY relation, source_id, target_id, build_variant, id"
+            # Isolate endpoint selection from ordering: otherwise SQLite can
+            # scan the opposite endpoint index merely to satisfy the sort.
+            query = (
+                f"WITH endpoint_edges AS MATERIALIZED ({query}) "
+                "SELECT * FROM endpoint_edges "
+                "ORDER BY relation, source_id, target_id, build_variant, id"
+            )
             if per_node_limit is not None:
                 query += " LIMIT ?"
                 parameters.append(per_node_limit)
