@@ -7814,7 +7814,13 @@ class SQLiteStore:
                 # UNION deduplicates self-loops before the global ordering and limit.
                 query += " UNION " + select_sql + "target_id = ?" + relation_sql
                 parameters *= 2
-            query += " ORDER BY relation, source_id, target_id, build_variant, id"
+            # Isolate endpoint selection from ordering: otherwise SQLite can
+            # scan the opposite endpoint index merely to satisfy the sort.
+            query = (
+                f"WITH endpoint_edges AS MATERIALIZED ({query}) "
+                "SELECT * FROM endpoint_edges "
+                "ORDER BY relation, source_id, target_id, build_variant, id"
+            )
             if per_node_limit is not None:
                 query += " LIMIT ?"
                 parameters.append(per_node_limit)

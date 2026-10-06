@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 from test_symbol_snapshot_compression import _batch, _put
 
-from cpp_context_engine.models import GraphEdge, GraphRelation
+from cpp_context_engine.models import GraphDirection, GraphEdge, GraphRelation
 from cpp_context_engine.storage.sqlite import SQLiteStore
 
 
@@ -189,3 +189,69 @@ def test_override_seed_avoids_excluded_build_edges(tmp_path):
             assert rows == [("A", "B")]
             costs.append(steps)
     assert costs[1] <= costs[0] + 100, costs
+
+
+@pytest.mark.parametrize("direction", list(GraphDirection))
+@pytest.mark.parametrize(
+    "relations", [None, frozenset({GraphRelation.CALLS}), frozenset({GraphRelation.OVERRIDES})]
+)
+@pytest.mark.parametrize("limit", [None, 100])
+def test_ordered_neighbors_keep_endpoint_seeks(tmp_path, direction, relations, limit):
+    with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
+        _seed_graph(store, tmp_path)
+        statements = []
+        store._connection.set_trace_callback(statements.append)
+        try:
+            store.neighbors("B", direction=direction, relations=relations, per_node_limit=limit)
+        finally:
+            store._connection.set_trace_callback(None)
+        query = next(sql for sql in statements if "relation FROM edges" in sql)
+        plan = [row[3] for row in store._connection.execute("EXPLAIN QUERY PLAN " + query)]
+        assert not any("SCAN edges" in step for step in plan), plan
+        edges = [step for step in plan if "edges USING" in step]
+        assert edges
+        assert all("source_id=?" in step or "target_id=?" in step for step in edges), plan
+
+
+@pytest.mark.parametrize("direction", list(GraphDirection))
+@pytest.mark.parametrize(
+    "relations", [None, frozenset({GraphRelation.CALLS}), frozenset({GraphRelation.OVERRIDES})]
+)
+def test_neighbor_work_does_not_grow_with_unrelated_edges(tmp_path, direction, relations):
+    with SQLiteStore(tmp_path / "index.db", project_root=tmp_path) as store:
+        _seed_graph(store, tmp_path)
+        costs = []
+        results = []
+        for count in (32, 1024):
+            store.put_edges(
+                tuple(
+                    GraphEdge(
+                        "A",
+                        "A",
+                        GraphRelation.CALLS,
+                        "unit",
+                        id=f"noise{index}",
+                        build_configuration_id="configuration-unit",
+                    )
+                    for index in range(count)
+                )
+            )
+            steps = 0
+
+            def progress():
+                nonlocal steps
+                steps += 1
+                return 0
+
+            store._connection.set_progress_handler(progress, 1)
+            try:
+                results.append(
+                    store.neighbors(
+                        "B", direction=direction, relations=relations, per_node_limit=100
+                    )
+                )
+            finally:
+                store._connection.set_progress_handler(None, 0)
+            costs.append(steps)
+        assert results[0] == results[1]
+        assert costs[1] <= costs[0] + 100, costs
